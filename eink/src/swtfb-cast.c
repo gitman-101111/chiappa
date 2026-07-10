@@ -16,8 +16,13 @@
  * Env (REQUIRED, same convention as einkbridge):
  *   SWTFB_WIDTH / SWTFB_HEIGHT   panel size in pixels
  * Env (optional):
- *   SWTFB_CAST_WAVEFORM   rm2fb waveform id for updates (default 2 = GC16;
- *                         1 = DU is faster for text/UI at 2-level quality)
+ *   SWTFB_CAST_WAVEFORM   rm2fb waveform id for updates (default 2 = GC16)
+ *   SWTFB_CAST_WAVEFORM_FAST
+ *                         waveform for SMALL damage rects — key flashes,
+ *                         cursors, typed characters (default 1 = DU, fast
+ *                         2-level; set equal to SWTFB_CAST_WAVEFORM to
+ *                         disable the distinction). "Small" = damage area
+ *                         under 1/16 of the panel.
  *   WAYLAND_DISPLAY       which compositor to mirror (standard Wayland)
  *
  * Build: needs wayland-client plus scanner-generated screencopy glue:
@@ -67,7 +72,8 @@ static struct zwlr_screencopy_manager_v1 *g_mgr;
 static int g_panel_w, g_panel_h;
 static uint16_t *g_fb;          /* mmap of /dev/shm/swtfb (RGB565) */
 static int g_ipc = -1;
-static uint32_t g_waveform = 2; /* GC16 */
+static uint32_t g_waveform = 2;      /* GC16 */
+static uint32_t g_waveform_fast = 1; /* DU — small-damage updates */
 
 /* current capture buffer */
 static struct wl_buffer *g_buf;
@@ -82,7 +88,14 @@ static rect_t g_damage;
 static int g_have_damage;
 
 static void ipc_send(rect_t r) {
-    update_t u = { r, g_waveform, 0 };
+    /* Vendor-style feel: small updates (key flashes, cursors) refresh with
+     * the fast waveform; large ones (page loads, scrolls) at full quality. */
+    uint32_t wf =
+        ((uint64_t)r.width * r.height <
+         (uint64_t)g_panel_w * g_panel_h / 16)
+            ? g_waveform_fast
+            : g_waveform;
+    update_t u = { r, wf, 0 };
     if (write(g_ipc, &u, sizeof u) != (ssize_t)sizeof u) {
         /* bridge restarted: reconnect once */
         close(g_ipc);
@@ -217,6 +230,8 @@ int main(void) {
     g_panel_h = env_dim("SWTFB_HEIGHT");
     const char *wf = getenv("SWTFB_CAST_WAVEFORM");
     if (wf && atoi(wf) > 0) g_waveform = (uint32_t)atoi(wf);
+    const char *wff = getenv("SWTFB_CAST_WAVEFORM_FAST");
+    if (wff && atoi(wff) > 0) g_waveform_fast = (uint32_t)atoi(wff);
 
     int fbfd = open(SHM_PATH, O_RDWR);
     if (fbfd < 0) { perror("swtfb-cast: open " SHM_PATH " (is einkbridge running?)"); return 1; }
