@@ -1,0 +1,13 @@
+uuu_version 1.5.165
+
+# @_wic     | wic image burn to emmc.
+# @_option  | flash option
+
+FB: ucmd setenv fastboot_dev mmc
+FB: ucmd setenv mmcdev ${emmc_dev}
+FB: ucmd mmc dev ${emmc_dev}
+
+FB[-t 300000]: flash _option all _wic
+
+FB: acmd reset
+FB: Done

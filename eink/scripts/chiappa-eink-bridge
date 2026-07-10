@@ -1,0 +1,44 @@
+#!/bin/sh
+# chiappa-eink-bridge — launcher for einkbridge with the vendor e-ink bundle environment.
+# Mirrors the env setup from /opt/eink/run.sh but runs einkbridge instead of qquick_m3.
+# Before starting, kills any process that has /dev/dri/card0 open; otherwise SWTCON
+# fails to initialize with "Couldn't create signalfd socketpair".
+HERE=/opt/eink
+
+# Kill anything holding the DRM device open — stale from previous unclean exits
+for pid in $(ls /proc 2>/dev/null | grep '^[0-9]'); do
+    fddir=/proc/$pid/fd
+    [ -d "$fddir" ] || continue
+    for fd in $fddir/*; do
+        target=$(readlink "$fd" 2>/dev/null)
+        case "$target" in
+            */dri/*)
+                kill -9 "$pid" 2>/dev/null
+                break
+                ;;
+        esac
+    done
+done
+
+# Clean stale IPC state (but keep /tmp/epd.lock — SWTCON needs it)
+rm -f /tmp/epframebuffer.lock /tmp/swtfb.ipc /dev/shm/swtfb
+
+# Ensure epd.lock exists (SWTCON requires this zero-byte placeholder)
+[ -f /tmp/epd.lock ] || { touch /tmp/epd.lock; chmod +x /tmp/epd.lock; }
+
+KERNEL=$(uname -r 2>/dev/null || echo "unknown")
+QML=/tmp/welcome.qml
+sed "s/KERNEL_VERSION/$KERNEL/" "${1:-/usr/share/chiappa-eink/bridge.qml}" > "$QML"
+
+export LD_LIBRARY_PATH="$HERE/lib"
+export QT_PLUGIN_PATH="$HERE/plugins"
+export QML2_IMPORT_PATH="$HERE/qml"
+export QML_IMPORT_PATH="$HERE/qml"
+export QT_QPA_PLATFORM_PLUGIN_PATH="$HERE/plugins/platforms"
+export QT_QPA_FONTDIR="$HERE/fonts"
+export QT_QUICK_BACKEND=epaper
+export QT_QPA_PLATFORM=epaper
+export RM_WAVEFORM_DIR="$HERE/waveforms"
+export PATH="$HERE/bin:$PATH"
+
+exec "$HERE/einkbridge" "$QML"

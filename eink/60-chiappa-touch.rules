@@ -1,0 +1,7 @@
+# elants_spi touch controller: keep runtime PM on.
+# Runtime-suspend disables the touch IRQ and sends the controller to idle;
+# the driver's resume path does not reliably bring it back to scan mode
+# (observed: controller stops reporting touches entirely until manually
+# poked). Pin it active — the panel's touch scan draw is negligible next to
+# the display engine.
+ACTION=="add", SUBSYSTEM=="spi", DRIVERS=="elants_spi", ATTR{power/control}="on"

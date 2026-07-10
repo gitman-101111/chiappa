@@ -1,0 +1,51 @@
+uuu_version 1.5.165
+
+# Flash a rootfs image to SLOT A (root_a / p2) over SDP-booted fastboot, with
+# STOCK libuuu. Verified mechanism (reMarkable uboot-imx-rm source):
+#
+#  - fastboot `ucmd` only accepts an exact-string allowlist
+#    (board/reMarkable/chiappa/chiappa.c). `setenv fastboot_dev mmc` is on it,
+#    and on success U-Boot re-runs fastboot_setup(), which loads the real eMMC
+#    GPT into the fastboot partition table. Without this step EVERY partition
+#    name fails ("Wrong partition name." / "failed to flash device") because
+#    the USB-boot path never sets fastboot_dev.
+#  - Flashing is NOT lock-gated (CONFIG_FASTBOOT_LOCK is off). No unlock needed.
+#  - The allowlist only contains the partconf string for SLOT A
+#    ("mmc partconf ${emmc_dev} ${emmc_ack} 1 0") — fastboot canNOT switch the
+#    boot select to slot B. So over SDP, flash the slot that partconf already
+#    points at (normally A), or switch to A with that string. Slot B deploys
+#    are an SSH-from-booted-Linux job.
+#  - In SDP mode nothing is mounted, so writing the "active" slot is safe here
+#    (the never-write-the-active-slot rule is about a RUNNING system).
+#
+# Files (copy next to this script):
+#   imxboot.bin  — production imx-boot
+#   rootfs.img   — raw ext4 rootfs image (chiappa-nixos rootfsImage, etc.)
+# Run:  sudo uuu -v /path/to/this-script.uuu
+# After first boot, grow the fs: resize2fs /dev/mmcblk0p2 (image-sized otherwise).
+
+CFG: SDPS: -chip MX93 -compatible MX815 -vid 0x2edd -pid 0x0140
+CFG: SDPV: -chip SPL1 -compatible SPL -vid 0x2edd -pid 0x0141
+CFG: FB: -vid 0x2edd -pid 0x0142
+
+SDPS: boot -scanterm -f imxboot.bin -scanlimited 0x800000
+
+SDPV: delay 1000
+SDPV: write -f imxboot.bin -skipspl -scanterm -scanlimited 0x800000
+SDPV: jump -scanlimited 0x800000
+
+# Prime the fastboot partition table (exact allowlisted strings — do not edit)
+FB: ucmd setenv mmcdev ${emmc_dev}
+FB: ucmd mmc dev 0
+FB: ucmd setenv fastboot_dev mmc
+
+# Sanity: this must now return a size, not "Wrong partition name."
+FB: getvar partition-size:root_a
+
+# Point the boot select at slot A (allowlisted; boot0 = slot A) and flash
+FB: ucmd if env exists emmc_ack; then ; else setenv emmc_ack 0; fi;
+FB: ucmd mmc partconf ${emmc_dev} ${emmc_ack} 1 0
+FB[-t 1800000]: flash -raw2sparse root_a rootfs.img
+
+FB: reboot
+FB: done

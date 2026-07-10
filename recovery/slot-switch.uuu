@@ -1,0 +1,19 @@
+uuu_version 1.4.149
+
+# Non-destructive slot switch to slot A via U-Boot fastboot (vendor pattern).
+# @_imxboot | bootloader
+
+SDPS: boot -scanterm -f _imxboot -scanlimited 0x800000
+
+SDPV: delay 1000
+SDPV: write -f _imxboot -skipspl -scanterm -scanlimited 0x800000
+SDPV: jump -scanlimited 0x800000
+
+FB: ucmd setenv fastboot_dev mmc
+FB: ucmd setenv mmcdev ${emmc_dev}
+FB: ucmd mmc dev ${emmc_dev}
+FB: ucmd if env exists emmc_ack; then ; else setenv emmc_ack 0; fi;
+FB: ucmd mmc partconf ${emmc_dev} ${emmc_ack} 1 0
+FB: ucmd reset
+
+FB: done

@@ -1,0 +1,40 @@
+uuu_version 1.5.165
+
+# ############################################################################
+# #  WARNING — DESTRUCTIVE. "oem unlock" IS the dev-mode enable: it wipes.  #
+# ############################################################################
+#
+# What it really does (reMarkable uboot-imx-rm source,
+# board/reMarkable/common/imx93/{imx93_fastboot.c,unlock.c}):
+#   1. `oem unlock` refuses if the BBNSM secure state is already unlocked
+#      ("already unlocked" — uuu shows a Fail; that means you're DONE, and
+#      nothing was touched). Otherwise it writes REBOOT_UNLOCK to BBNSM_GPR0
+#      and RESETS the board.
+#   2. On the next boot, secure SPL prompts "Please, double-press the power
+#      key to unlock" (30 s window). On the double-press it runs
+#      factory_reset() — WIPING KEYS AND USER DATA — then persists the
+#      unlocked state. Same semantics as enabling Developer Mode in the UI.
+#
+# You do NOT need this to flash: this U-Boot has CONFIG_FASTBOOT_LOCK off, so
+# fastboot flash/erase are never lock-gated (see sdp-flash-root-a.uuu — the
+# only real prerequisite is priming fastboot_dev). The ONLY reason to run this
+# is a factory-locked device that was never put in Developer Mode.
+#
+# (`getvar unlocked` always answers "no" on this build — it's hardcoded when
+# FASTBOOT_LOCK is off and reads a different thing entirely. Ignore it.)
+#
+# Copy the production imx-boot next to this script as `imxboot.bin`.
+# Run:  sudo uuu -v -t 20 fb-unlock.uuu
+
+CFG: SDPS: -chip MX93 -compatible MX815 -vid 0x2edd -pid 0x0140
+CFG: SDPV: -chip SPL1 -compatible SPL -vid 0x2edd -pid 0x0141
+CFG: FB: -vid 0x2edd -pid 0x0142
+
+SDPS: boot -scanterm -f imxboot.bin -scanlimited 0x800000
+
+SDPV: delay 1000
+SDPV: write -f imxboot.bin -skipspl -scanterm -scanlimited 0x800000
+SDPV: jump -scanlimited 0x800000
+
+FB[-t 90000]: oem unlock
+FB: done

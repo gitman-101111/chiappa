@@ -1,0 +1,25 @@
+# Vendor-extracted proprietary blobs — do not redistribute.
+# Re-extract from your own firmware image (see docs/obtaining-vendor-blobs.md,
+# firmware/extract.sh, firmware/MANIFEST.md).
+firmware/images/
+firmware/lib/
+firmware/share/
+firmware/waveforms/
+
+# Generated locally (large): prebuilt binaries + the glibc/Qt6 runtime bundle.
+# Build them with eink/scripts/build-bridge.sh and build-bundle.sh.
+eink/bin/
+eink/bundle/
+
+# Vendor recovery binaries (uuu-scripts + slot-switch.uuu ARE tracked).
+recovery/rm_recover
+recovery/remarkable-production-image-*
+recovery/vendor-*
+
+*.log
+
+# Vendor-image-extracted device trees: the shipped DTB does not correspond to
+# the published kernel source (the tree-built one does not boot), so its GPL
+# corresponding-source obligation cannot be met — do not redistribute. Extract
+# your own: docs/fitimage.md.
+dtb/

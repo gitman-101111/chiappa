@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] drm/vkms: allow cloning the virtual and writeback encoders
+
+VKMS leaves possible_clones unset on both its virtual output encoder and
+the writeback connector's internal encoder. drm_mode_config_validate()
+then fixes each up to its own bit only, so any atomic modeset that puts
+both connectors on the CRTC (encoder_mask 0x3) fails the valid-clone
+check in drm_atomic_helper_check_modeset() with EINVAL:
+
+  [drm:drm_atomic_helper_check_modeset] crtc38 failed valid clone check for mask 0x3
+
+This makes it impossible to capture the CRTC via the writeback connector
+while a client drives the virtual output - the exact use case of a
+writeback-based display bridge (compositor renders to VKMS, bridge
+forwards frames to a physical display).
+
+Declare the two encoders as clones of each other so both connectors can
+be active on the CRTC at the same time.
+
+Applies on top of 0002 (default mode patch).
+
+--- a/drivers/gpu/drm/vkms/vkms_output.c
++++ b/drivers/gpu/drm/vkms/vkms_output.c
+@@ -128,8 +128,24 @@
+ 
+ 	if (vkmsdev->config->writeback) {
+ 		writeback = vkms_enable_writeback_connector(vkmsdev);
+-		if (writeback)
++		if (writeback) {
+ 			DRM_ERROR("Failed to init writeback connector\n");
++		} else {
++			/* Allow the virtual and writeback encoders to be
++			 * active on the CRTC simultaneously, so a writeback
++			 * capture can run while a client drives the output.
++			 * Without this, drm_mode_config_validate() fixes up
++			 * possible_clones to self-only and any modeset with
++			 * both connectors attached fails the valid-clone
++			 * check in drm_atomic_helper_check_modeset().
++			 */
++			struct drm_encoder *wb_enc = &output->wb_connector.encoder;
++			u32 clones = drm_encoder_mask(encoder) |
++				     drm_encoder_mask(wb_enc);
++
++			encoder->possible_clones = clones;
++			wb_enc->possible_clones = clones;
++		}
+ 	}
+ 
+ 	drm_mode_config_reset(dev);

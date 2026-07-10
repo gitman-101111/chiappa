@@ -1,0 +1,26 @@
+From: chiappa port <chiappa@localhost>
+Date: Mon, 11 May 2026 00:00:00 +0000
+Subject: [PATCH] drm/panel: remarkable-cumulus: select VIDEOMODE_HELPERS
+
+panel-rm-cumulus uses of_get_drm_display_mode() which is compiled only
+when CONFIG_VIDEOMODE_HELPERS=y (it sits inside
+#ifdef CONFIG_VIDEOMODE_HELPERS in drm_modes.c).  Without this select the
+symbol is absent from Module.symvers and modpost rejects the driver.
+
+Every other panel driver that calls of_get_drm_display_mode() already
+carries this select; this was simply omitted from the vendor Kconfig.
+
+Signed-off-by: chiappa port <chiappa@localhost>
+---
+ drivers/gpu/drm/panel/Kconfig | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/drivers/gpu/drm/panel/Kconfig
++++ b/drivers/gpu/drm/panel/Kconfig
+@@ -623,6 +623,7 @@ config DRM_PANEL_REMARKABLE_CUMULUS
+ 	tristate "reMarkable cumulus LVDS panel"
+ 	depends on OF
++	select VIDEOMODE_HELPERS
+ 	help
+ 	   Say Y here if you want to enable support for reMarkable
+ 	   cumulus LVDS panel.

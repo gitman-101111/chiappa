@@ -1,0 +1,12 @@
+uuu_version 1.4.149
+
+# @_part    | partition name
+# @_img     | wic image burn to emmc.
+# @_option  | flash option
+
+FB: ucmd setenv fastboot_dev mmc
+FB: ucmd setenv mmcdev ${emmc_dev}
+FB: ucmd mmc dev ${emmc_dev}
+FB[-t 60000]: flash _option _part _img
+
+FB: Done

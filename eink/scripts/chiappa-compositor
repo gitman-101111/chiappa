@@ -1,0 +1,46 @@
+#!/bin/sh
+# chiappa-compositor — launch any Wayland compositor on the e-ink panel
+#
+# Injects the VKMS DRM lease (from vkms_bridge) into the compositor via
+# libfakekms.so so it drives the VKMS primary plane without needing global
+# DRM master.  vkms_bridge captures the plane output via the writeback
+# connector and pushes it to the e-ink panel.
+#
+# Usage:
+#   chiappa-compositor sway
+#   chiappa-compositor gnome-shell --wayland
+#   chiappa-compositor startplasma-wayland
+#
+# Prerequisites (started automatically by chiappa-eink + chiappa-vkms services):
+#   chiappa-eink  — einkbridge (rm2fb IPC host, drives e-ink waveform engine)
+#   chiappa-vkms  — loads vkms module + starts vkms_bridge (DRM master + lease)
+#
+# The compositor sees a single 1024×768 DRM output (Virtual-1 on card1).
+# vkms_bridge scales its frames to 954×1696 (panel native) before display.
+
+set -e
+
+if [ $# -eq 0 ]; then
+    echo "Usage: chiappa-compositor <compositor> [args...]" >&2
+    exit 1
+fi
+
+FAKEKMS=/usr/lib/libfakekms.so
+
+if [ ! -f "$FAKEKMS" ]; then
+    echo "chiappa-compositor: $FAKEKMS not found — is device-remarkable-chiappa installed?" >&2
+    exit 1
+fi
+
+if [ ! -S /tmp/vkms-lease.sock ]; then
+    echo "chiappa-compositor: /tmp/vkms-lease.sock not found — is chiappa-vkms running?" >&2
+    exit 1
+fi
+
+export WLR_DRM_DEVICES=/dev/dri/card1   # wlroots: only use VKMS card
+export WLR_NO_HARDWARE_CURSORS=1        # VKMS has no hardware cursor plane
+export WLR_RENDERER=pixman              # software renderer (no GPU on VKMS)
+export LD_PRELOAD="$FAKEKMS${LD_PRELOAD:+:$LD_PRELOAD}"
+
+echo "chiappa-compositor: launching $* with $FAKEKMS" >&2
+exec "$@"

@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] drm/vkms: set default mode to 954x1696 for chiappa panel
+
+The reMarkable Paper Pro Move (chiappa) uses a 954x1696 portrait e-ink
+panel (E Ink Gallery 3). VKMS's default 1024x768 mode is the wrong
+aspect ratio for Wayland compositors on this device.
+
+drm_add_modes_noedid() only adds standard VESA landscape resolutions, so
+954x1696 must be injected explicitly. Use drm_mode_create() with explicit
+timing fields rather than drm_cvt_mode() — the latter rounds hdisplay to
+a multiple of 8 (954 → 952), causing drm_set_preferred_mode() to find no
+matching mode and leaving the connector without a preferred mode set.
+
+Change XRES_DEF/YRES_DEF so drm_set_preferred_mode() marks 954x1696
+preferred. Timing values are arbitrary (VKMS is virtual).
+
+--- a/drivers/gpu/drm/vkms/vkms_drv.h
++++ b/drivers/gpu/drm/vkms/vkms_drv.h
+@@ -15,8 +15,8 @@
+ #define XRES_MIN    10
+ #define YRES_MIN    10
+ 
+-#define XRES_DEF  1024
+-#define YRES_DEF   768
++#define XRES_DEF   954
++#define YRES_DEF  1696
+ 
+ #define XRES_MAX  8192
+ #define YRES_MAX  8192
+--- a/drivers/gpu/drm/vkms/vkms_output.c
++++ b/drivers/gpu/drm/vkms/vkms_output.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ 
+ #include "vkms_drv.h"
++#include <drm/drm_modes.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_edid.h>
+ #include <drm/drm_probe_helper.h>
+@@ -20,8 +21,30 @@
+ static int vkms_conn_get_modes(struct drm_connector *connector)
+ {
+ 	int count;
++	struct drm_display_mode *mode;
+ 
+ 	count = drm_add_modes_noedid(connector, XRES_MAX, YRES_MAX);
++
++	/* drm_add_modes_noedid only has standard VESA landscape modes; inject
++	 * the panel native portrait resolution with exact dimensions.
++	 * drm_cvt_mode() rounds hdisplay to a multiple of 8 (954 -> 952) so
++	 * use drm_mode_create() with explicit fields instead. */
++	mode = drm_mode_create(connector->dev);
++	if (mode) {
++		mode->hdisplay    = XRES_DEF;
++		mode->hsync_start = XRES_DEF + 24;
++		mode->hsync_end   = XRES_DEF + 56;
++		mode->htotal      = XRES_DEF + 104;
++		mode->vdisplay    = YRES_DEF;
++		mode->vsync_start = YRES_DEF + 4;
++		mode->vsync_end   = YRES_DEF + 9;
++		mode->vtotal      = YRES_DEF + 45;
++		mode->clock       = 110500;
++		mode->type        = DRM_MODE_TYPE_DRIVER;
++		drm_mode_set_name(mode);
++		drm_mode_probed_add(connector, mode);
++		count++;
++	}
+ 	drm_set_preferred_mode(connector, XRES_DEF, YRES_DEF);
+ 
+ 	return count;

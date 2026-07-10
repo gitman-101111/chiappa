@@ -1,0 +1,9 @@
+# @_imxboot    | bootloader
+# @_partition  | target partition
+
+FB: ucmd setenv fastboot_dev mmc
+FB: ucmd setenv mmcdev ${emmc_dev}
+FB: ucmd mmc dev ${emmc_dev}
+FB: flash -scanterm -scanlimited 0x800000 _partition _imxboot
+
+FB: Done

@@ -1,0 +1,32 @@
+uuu_version 1.5.165
+
+# Boot the device from SDP (boot-ROM serial download) into U-Boot fastboot,
+# WITHOUT flashing anything. Verified working against the production imx-boot
+# (3.27.1.0) with stock libuuu 1.5.243.
+#
+# reMarkable fuses a custom USB VID (2edd, not NXP's 1fc9), so stock libuuu
+# needs the CFG mappings below; reMarkable's bundled uuu is patched instead.
+#   2edd:0140 = boot-ROM SDP ("OC Blank 93")
+#   2edd:0141 = SPL serial download (SDPV)
+#   2edd:0142 = U-Boot fastboot
+# The -compatible chips matter: libuuu resolves ROM quirks via the compatible
+# entry (MX93 -> MX815, SPL1 -> SPL); -chip alone fails "can't get rom info".
+#
+# NOTE: stock uuu does NOT substitute _placeholders in user scripts (only in
+# built-in ones), and resolves file paths relative to THIS script's directory.
+# Copy the production imx-boot next to this script as `imxboot.bin`:
+#   cp remarkable-production-image-*-imx-boot imxboot.bin
+# Run:  sudo uuu -v -t 20 sdp-to-fastboot.uuu
+
+CFG: SDPS: -chip MX93 -compatible MX815 -vid 0x2edd -pid 0x0140
+CFG: SDPV: -chip SPL1 -compatible SPL -vid 0x2edd -pid 0x0141
+CFG: FB: -vid 0x2edd -pid 0x0142
+
+SDPS: boot -scanterm -f imxboot.bin -scanlimited 0x800000
+
+SDPV: delay 1000
+SDPV: write -f imxboot.bin -skipspl -scanterm -scanlimited 0x800000
+SDPV: jump -scanlimited 0x800000
+
+FB: getvar version
+FB: done

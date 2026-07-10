@@ -1,0 +1,21 @@
+uuu_version 1.5.165
+
+# Set the boot select to SLOT A and reboot — no flashing. For escaping a
+# broken slot B when the errcnt rollback can't trip (e.g. B's stage-1 clears
+# its own error counter). partconf→A is the one allowlisted fastboot string.
+
+CFG: SDPS: -chip MX93 -compatible MX815 -vid 0x2edd -pid 0x0140
+CFG: SDPV: -chip SPL1 -compatible SPL -vid 0x2edd -pid 0x0141
+CFG: FB: -vid 0x2edd -pid 0x0142
+
+SDPS: boot -scanterm -f imxboot.bin -scanlimited 0x800000
+
+SDPV: delay 1000
+SDPV: write -f imxboot.bin -skipspl -scanterm -scanlimited 0x800000
+SDPV: jump -scanlimited 0x800000
+
+FB: ucmd setenv fastboot_dev mmc
+FB: ucmd if env exists emmc_ack; then ; else setenv emmc_ack 0; fi;
+FB: ucmd mmc partconf ${emmc_dev} ${emmc_ack} 1 0
+FB: reboot
+FB: done

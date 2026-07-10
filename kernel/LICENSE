@@ -1,0 +1,7 @@
+The contents of this directory (kernel patches and the kernel configuration)
+are derived from and apply to the Linux kernel, and are therefore licensed
+under the GNU General Public License, version 2 (GPL-2.0-only), the same
+license as the kernel itself. See the Linux kernel's COPYING file for the
+full text: https://www.kernel.org/doc/html/latest/process/license-rules.html
+
+The rest of this repository is MIT-licensed — see ../LICENSE.

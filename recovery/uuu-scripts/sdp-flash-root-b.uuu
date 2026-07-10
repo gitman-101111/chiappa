@@ -1,0 +1,23 @@
+uuu_version 1.5.165
+
+# Flash rootfs.img to SLOT B ONLY (root_b / p3) over SDP-booted fastboot.
+# Mechanism identical to sdp-flash-root-a.uuu; partconf is NOT touched, so the
+# device keeps booting slot A until switched from Linux:
+#   mmc bootpart enable 2 0 /dev/mmcblk0   (2 = boot1 = slot B)
+
+CFG: SDPS: -chip MX93 -compatible MX815 -vid 0x2edd -pid 0x0140
+CFG: SDPV: -chip SPL1 -compatible SPL -vid 0x2edd -pid 0x0141
+CFG: FB: -vid 0x2edd -pid 0x0142
+
+SDPS: boot -scanterm -f imxboot.bin -scanlimited 0x800000
+
+SDPV: delay 1000
+SDPV: write -f imxboot.bin -skipspl -scanterm -scanlimited 0x800000
+SDPV: jump -scanlimited 0x800000
+
+FB: ucmd setenv fastboot_dev mmc
+FB: getvar partition-size:root_b
+FB[-t 1800000]: flash -raw2sparse root_b rootfs.img
+
+FB: reboot
+FB: done
