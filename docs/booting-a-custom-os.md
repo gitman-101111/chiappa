@@ -106,16 +106,33 @@ sync && reboot
 - A distro initramfs that expects its own boot-partition layout won't fit this
   whole-partition A/B scheme and may panic-loop. The reliable method is a
   **no-ramdisk** boot (kernel mounts `root=` directly).
-- USB networking: the gadget is **CDC ECM** (device `10.11.99.1`). Bring up the *one*
-  host iface by exact name and give it `10.11.99.2/24`. Don't loop an IP across all
-  USB ifaces (a duplicate `10.11.99.2` poisons routing).
-- Every gadget re-enumeration (device reboot, replug, SDP round-trip) recreates the
-  host iface, and it can come back **administratively down with no address** — the
-  device then looks dead while it's actually up and reachable. Check `lsusb` for the
-  composite gadget first; if it's there, `ip link set <iface> up` and re-add
-  `10.11.99.2/24` before assuming a failed boot. A host-side hotplug rule
-  (udev/networkd/dispatcher — whatever your distro uses) that does this
-  automatically makes the link self-healing.
+- USB networking: the gadget is **CDC ECM** (device `10.11.99.1`, holds its address
+  on its own — the device side needs nothing). All the flakiness is host-side, from
+  one fact: **the gadget gets a new interface NAME on every enumeration** (device
+  reboot, replug, SDP round-trip) because the name is USB-path-derived
+  (`enp0s20f0u7`, `enp0s20f0u5u1u2`, …). Two failure modes follow, both host-only:
+  - **Stale duplicate address.** If you manually `ip addr add 10.11.99.2/24` to the
+    live iface, the address lingers on the previous (now-dead) iface too. Two ifaces
+    with `10.11.99.2/24` = duplicate connected route; the kernel may send device
+    traffic out the dead one (`ip route get 10.11.99.1` reveals it). Delete the stale
+    address (or don't hand-assign — see below).
+  - **Admin-down on reappear.** A freshly re-enumerated iface can come back down with
+    no address; the device looks dead while it's up. Check `lsusb` for the composite
+    gadget; if present, the link is fine and it's purely host config.
+- **The clean fix (do this once, stop hand-fixing):** let your host's network manager
+  own `10.11.99.2/24`, matched by the *stable* CDC ECM **driver** rather than the
+  shifting name, so any enumeration gets exactly one config and the address is removed
+  when the link goes away. With systemd-networkd:
+  ```ini
+  # /etc/systemd/network/30-remarkable-usb.network
+  [Match]
+  Driver=cdc_ether
+  [Network]
+  Address=10.11.99.2/24
+  ```
+  On NetworkManager, match a name glob instead (`[match] interface-name=enp0s20f0u*`)
+  or hand these ifaces to networkd. This makes the link self-healing across replugs
+  and renames.
 - If a custom boot gets stuck, **power-cycle ~3×**: the error counter hits the limit and
   U-Boot rolls back to the good vendor slot. Worst case: [recovery.md](recovery.md).
 - U-Boot appends `dm-mod.create=`/`dm-mod.waitfor=` args that crypt-map **p4 by

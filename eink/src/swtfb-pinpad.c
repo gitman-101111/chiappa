@@ -10,21 +10,29 @@
  * no lock). This is an access deterrent, NOT encryption: the data on disk is
  * readable by anyone with SDP or physical eMMC access.
  *
- * Rendering: numeric 3x4 grid (1-9, backspace, 0, OK) drawn as filled
- * rectangles + seven-segment digits into /dev/shm/swtfb (RGB565), refreshed
- * via the rm2fb socket. Touch: first evdev device advertising
+ * There is no submit key: the entry is verified after every digit from
+ * MIN_PIN on and unlocks on match. Reaching MAX_PIN without a match clears
+ * the entry, shows a fail mark, and adds a 2 s delay after every 3rd failure.
+ *
+ * Rendering: compact centered 3x4 grid (1-9 / 0 / backspace) as hairline
+ * circles with seven-segment digits; entry dots above. Keypresses update
+ * only the dots band with a fast DU waveform — the full-quality refresh
+ * happens once, at first draw. Touch: first evdev device advertising
  * ABS_MT_POSITION_X, coordinates scaled from the device's ABS ranges to the
- * panel. Wrong entries clear the input and add a 2 s delay after every 3rd
- * failure.
+ * panel; keys register on touch-DOWN.
  *
  * Env (REQUIRED): SWTFB_WIDTH / SWTFB_HEIGHT (same convention as einkbridge).
+ * Env (optional): SWTFB_PINPAD_DEBUG=1 traces taps and verify attempts to
+ * stderr (journal) — never the PIN itself.
  * Build: cc -O2 -o swtfb-pinpad swtfb-pinpad.c -lcrypt
+ *        (-DPREVIEW_ONLY: draw once and exit — design preview, no touch)
  */
 #define _GNU_SOURCE
 #include <crypt.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +49,9 @@
 #define MAX_PIN 12
 #define MIN_PIN 4
 
+#define WF_GC16 2
+#define WF_DU   1
+
 #define WHITE 0xFFFF
 #define BLACK 0x0000
 #define GREY  0xC618 /* light grey in RGB565 */
@@ -51,6 +62,7 @@ typedef struct { rect_t region; uint32_t waveform; uint32_t flags; } update_t;
 static int W, H;
 static uint16_t *fb;
 static int ipc = -1;
+static int debug;
 
 static int env_dim(const char *name) {
     const char *v = getenv(name);
@@ -64,8 +76,8 @@ static int env_dim(const char *name) {
     return n;
 }
 
-static void refresh(void) {
-    update_t u = { {0, 0, (uint32_t)W, (uint32_t)H}, 2 /* GC16 */, 0 };
+static void refresh(rect_t r, uint32_t wf) {
+    update_t u = { r, wf, 0 };
     if (write(ipc, &u, sizeof u) != (ssize_t)sizeof u) { /* bridge gone */ }
 }
 
@@ -80,19 +92,7 @@ static void fill(int x, int y, int w, int h, uint16_t c) {
     }
 }
 
-/* ── seven-segment digits ───────────────────────────────────────────────────
- * Segment layout (classic):  _a_
- *                           f| g |b     each glyph fits a (s x 2s) box,
- *                            |_ _|      stroke = s/5.
- *                           e|   |c
- *                            |_d_|                                          */
-static const uint8_t SEG[10] = {
-    /*0*/ 0b0111111, /*1*/ 0b0000110, /*2*/ 0b1011011, /*3*/ 0b1001111,
-    /*4*/ 0b1100110, /*5*/ 0b1101101, /*6*/ 0b1111101, /*7*/ 0b0000111,
-    /*8*/ 0b1111111, /*9*/ 0b1101111,
-};
-
-/* Hairline ring (key outline), drawn by radial distance. */
+/* Hairline ring / filled disc (w = r), drawn by radial distance. */
 static void ring(int cx, int cy, int r, int w, uint16_t c) {
     for (int j = -r; j <= r; j++)
         for (int i = -r; i <= r; i++) {
@@ -105,8 +105,20 @@ static void ring(int cx, int cy, int r, int w, uint16_t c) {
         }
 }
 
+/* ── seven-segment digits ───────────────────────────────────────────────────
+ * Segment layout (classic):  _a_
+ *                           f| g |b     each glyph fits a (s wide × 2s tall)
+ *                            |_ _|      box; stroke = s/6.
+ *                           e|   |c
+ *                            |_d_|                                          */
+static const uint8_t SEG[10] = {
+    /*0*/ 0b0111111, /*1*/ 0b0000110, /*2*/ 0b1011011, /*3*/ 0b1001111,
+    /*4*/ 0b1100110, /*5*/ 0b1101101, /*6*/ 0b1111101, /*7*/ 0b0000111,
+    /*8*/ 0b1111111, /*9*/ 0b1101111,
+};
+
 static void draw_digit(int digit, int x, int y, int s, uint16_t c) {
-    int t = s / 7;              /* thin stroke */
+    int t = s / 6;
     if (t < 3) t = 3;
     uint8_t m = SEG[digit % 10];
     if (m & 0x01) fill(x, y, s, t, c);                     /* a */
@@ -118,67 +130,67 @@ static void draw_digit(int digit, int x, int y, int s, uint16_t c) {
     if (m & 0x40) fill(x, y + s - t / 2, s, t, c);         /* g */
 }
 
-/* ── keypad geometry ────────────────────────────────────────────────────── */
-static int pad_x, pad_y, cell_w, cell_h;
+/* ── keypad geometry (compact, vendor-like) ─────────────────────────────────
+ * key index 0..8 = digits 1-9; 10 = 0 (bottom middle); 11 = backspace
+ * (bottom right); bottom-left cell is empty.                               */
+static int pad_x, pad_y, cell;   /* square touch cells */
+static int dots_y;
 
 static void layout(void) {
-    int pad_w = W * 8 / 10;
-    cell_w = pad_w / 3;
-    cell_h = cell_w * 3 / 4;
-    pad_x = (W - 3 * cell_w) / 2;
-    pad_y = H / 2 - cell_h;
+    cell = W * 3 / 16;                 /* compact cells (r25 sizing) */
+    pad_x = (W - 3 * cell) / 2;
+    pad_y = H * 36 / 100;
+    dots_y = H * 30 / 100;
 }
 
-/* key index 0..11 = 1 2 3 / 4 5 6 / 7 8 9 / back 0 ok */
-static void key_rect(int k, int *x, int *y) {
-    *x = pad_x + (k % 3) * cell_w;
-    *y = pad_y + (k / 3) * cell_h;
+static void key_center(int k, int *cx, int *cy) {
+    int col = (k == 10) ? 1 : (k == 11) ? 2 : k % 3;
+    int row = (k >= 9) ? 3 : k / 3;
+    *cx = pad_x + col * cell + cell / 2;
+    *cy = pad_y + row * cell + cell / 2;
 }
 
 static void draw_key(int k) {
-    int x, y;
-    key_rect(k, &x, &y);
-    int cx = x + cell_w / 2, cy = y + cell_h / 2;
-    int r = (cell_w < cell_h ? cell_w : cell_h) * 42 / 100;
+    int cx, cy;
+    key_center(k, &cx, &cy);
+    int r = W * 9 / 200;                /* ~43 px ring radius (r25 sizing) */
+    int s = r * 3 / 5;                  /* seven-segment glyph unit */
 
-    int s = cell_h / 5;
-    int gx = cx - s / 2, gy = cy - s;
+    ring(cx, cy, r, 2, GREY);
     if (k <= 8 || k == 10) {
-        ring(cx, cy, r, 2, GREY); /* hairline outline, digits only */
-        draw_digit(k == 10 ? 0 : k + 1, gx, gy, s, BLACK);
-    } else if (k == 9) { /* backspace: left-pointing chevron */
-        int t = s / 6 < 3 ? 3 : s / 6;
-        for (int i = 0; i < s; i++) {
-            fill(cx - s / 2 + i, cy - i, t, t, BLACK);
-            fill(cx - s / 2 + i, cy + i, t, t, BLACK);
-        }
-    } else { /* submit: right-pointing arrow */
-        int t = s / 6 < 3 ? 3 : s / 6;
-        fill(cx - s, cy - t / 2, 3 * s / 2, t, BLACK);
-        for (int i = 0; i < s * 2 / 3; i++) {
-            fill(cx + s / 2 - i, cy - i, t, t, BLACK);
-            fill(cx + s / 2 - i, cy + i, t, t, BLACK);
+        draw_digit(k == 10 ? 0 : k + 1, cx - s / 2, cy - s, s, BLACK);
+    } else { /* backspace: X */
+        int t = s / 5 < 3 ? 3 : s / 5;
+        for (int i = -s / 2; i <= s / 2; i++) {
+            fill(cx + i, cy + i, t, t, BLACK);
+            fill(cx + i, cy - i, t, t, BLACK);
         }
     }
+}
+
+static rect_t dots_band(void) {
+    int r = W / 80;
+    return (rect_t){ (uint32_t)(dots_y - 4 * r), 0, (uint32_t)W, (uint32_t)(8 * r) };
 }
 
 static void draw_dots(int n, int fail) {
-    int r = W / 70;
-    int y = pad_y - 6 * r;
-    fill(0, y - 2 * r, W, 6 * r, WHITE);
+    int r = W / 80;
+    rect_t b = dots_band();
+    fill(b.left, b.top, b.width, b.height, WHITE);
     for (int i = 0; i < MAX_PIN && i < n; i++) {
         int x = W / 2 + (2 * i - n + 1) * 2 * r;
-        ring(x, y, r, r, BLACK); /* filled dot */
+        ring(x, dots_y, r, r, BLACK);
     }
-    if (fail) /* thin line under the dots signals a wrong entry */
-        fill(W / 2 - W / 8, y + 3 * r, W / 4, 2, BLACK);
+    if (fail)
+        fill(W / 2 - W / 10, dots_y + 3 * r, W / 5, 2, BLACK);
 }
 
-static void draw_all(int ndots, int fail) {
+static void draw_all(void) {
     for (size_t i = 0; i < (size_t)W * H; i++) fb[i] = WHITE;
-    for (int k = 0; k < 12; k++) draw_key(k);
-    draw_dots(ndots, fail);
-    refresh();
+    for (int k = 0; k <= 11; k++)
+        if (k != 9) draw_key(k);
+    draw_dots(0, 0);
+    refresh((rect_t){0, 0, (uint32_t)W, (uint32_t)H}, WF_GC16);
 }
 
 /* ── touch input ────────────────────────────────────────────────────────── */
@@ -205,6 +217,12 @@ static int open_touch(void) {
             t_minx = ai.minimum; t_maxx = ai.maximum;
             ioctl(f, EVIOCGABS(ABS_MT_POSITION_Y), &ai);
             t_miny = ai.minimum; t_maxy = ai.maximum;
+            if (debug) {
+                char nm[80] = "?";
+                ioctl(f, EVIOCGNAME(sizeof nm), nm);
+                fprintf(stderr, "swtfb-pinpad: touch %s (%s) X %d..%d Y %d..%d\n",
+                        path, nm, t_minx, t_maxx, t_miny, t_maxy);
+            }
             closedir(d);
             return f;
         }
@@ -214,31 +232,55 @@ static int open_touch(void) {
     return -1;
 }
 
-/* Block until a tap (touch-up) and return the key index, or -1 if outside. */
+/* Key hit at panel coords, or -1. */
+static int hit(int x, int y) {
+    if (x < pad_x || x >= pad_x + 3 * cell || y < pad_y || y >= pad_y + 4 * cell)
+        return -1;
+    int col = (x - pad_x) / cell, row = (y - pad_y) / cell;
+    if (row < 3) return row * 3 + col;
+    if (col == 1) return 10;
+    if (col == 2) return 11;
+    return -1;
+}
+
+/* Block until a NEW contact's first coordinates (touch-DOWN), return the key
+ * hit (or -1), then swallow events until the contact lifts. */
 static int read_tap(void) {
     struct input_event ev;
-    int x = -1, y = -1, down = 0;
+    int x = -1, y = -1, active = 0;
     for (;;) {
         if (read(t_fd, &ev, sizeof ev) != (ssize_t)sizeof ev) return -1;
-        if (ev.type == EV_ABS && ev.code == ABS_MT_POSITION_X) {
+        if (ev.type == EV_ABS && ev.code == ABS_MT_TRACKING_ID) {
+            active = (ev.value >= 0);
+            if (active) { x = -1; y = -1; }
+        } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
+            active = (ev.value != 0);
+            if (active && x >= 0 && y >= 0) goto have; /* protocol-A style */
+        } else if (ev.type == EV_ABS && ev.code == ABS_MT_POSITION_X) {
             x = (int)((int64_t)(ev.value - t_minx) * (W - 1) / (t_maxx - t_minx));
-            down = 1;
         } else if (ev.type == EV_ABS && ev.code == ABS_MT_POSITION_Y) {
             y = (int)((int64_t)(ev.value - t_miny) * (H - 1) / (t_maxy - t_miny));
-            down = 1;
-        } else if (down && x >= 0 && y >= 0 &&
-                   ((ev.type == EV_ABS && ev.code == ABS_MT_TRACKING_ID && ev.value == -1) ||
-                    (ev.type == EV_KEY && ev.code == BTN_TOUCH && ev.value == 0))) {
-            if (x < pad_x || x >= pad_x + 3 * cell_w ||
-                y < pad_y || y >= pad_y + 4 * cell_h)
-                return -1;
-            return ((y - pad_y) / cell_h) * 3 + (x - pad_x) / cell_w;
+        }
+        if (active && x >= 0 && y >= 0) {
+        have:;
+            int k = hit(x, y);
+            if (debug)
+                fprintf(stderr, "swtfb-pinpad: tap (%d,%d) -> key %d\n", x, y, k);
+            /* swallow until lift so a held finger is one keypress */
+            while (read(t_fd, &ev, sizeof ev) == (ssize_t)sizeof ev) {
+                if ((ev.type == EV_ABS && ev.code == ABS_MT_TRACKING_ID && ev.value < 0) ||
+                    (ev.type == EV_KEY && ev.code == BTN_TOUCH && ev.value == 0))
+                    break;
+            }
+            return k;
         }
     }
 }
 
 /* ── main ───────────────────────────────────────────────────────────────── */
 int main(int argc, char **argv) {
+    debug = getenv("SWTFB_PINPAD_DEBUG") != NULL;
+
     if (argc == 4 && !strcmp(argv[1], "--set")) {
         size_t len = strlen(argv[3]);
         if (len < MIN_PIN || len > MAX_PIN ||
@@ -255,7 +297,10 @@ int main(int argc, char **argv) {
         if (!hash || hash[0] == '*') { perror("crypt"); return 1; }
         FILE *f = fopen(argv[2], "w");
         if (!f) { perror(argv[2]); return 1; }
-        fprintf(f, "%s\n", hash);
+        /* line 1: digit count (lets the pad verify + clear at the exact
+         * length, vendor-style — this is not a meaningful secret). line 2:
+         * the salted hash. */
+        fprintf(f, "%zu\n%s\n", len, hash);
         fclose(f);
         chmod(argv[2], 0600);
         printf("swtfb-pinpad: PIN set in %s\n", argv[2]);
@@ -267,12 +312,19 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    char stored[256];
+    /* pin file is two lines: digit count, then the salted hash. Anything
+     * else (missing, malformed) means no valid PIN → no lock. */
+    char l1[256], stored[256];
+    int pin_len = 0;
     FILE *pf = fopen(argv[1], "r");
-    if (!pf) return 0; /* no PIN set: no lock */
-    if (!fgets(stored, sizeof stored, pf)) { fclose(pf); return 0; }
+    if (!pf) return 0;
+    if (fgets(l1, sizeof l1, pf) && fgets(stored, sizeof stored, pf)) {
+        pin_len = atoi(l1);
+        stored[strcspn(stored, "\n")] = 0;
+    }
     fclose(pf);
-    stored[strcspn(stored, "\n")] = 0;
+    if (pin_len < MIN_PIN || pin_len > MAX_PIN || stored[0] != '$')
+        return 0;
 
     W = env_dim("SWTFB_WIDTH");
     H = env_dim("SWTFB_HEIGHT");
@@ -295,7 +347,7 @@ int main(int argc, char **argv) {
 #ifdef PREVIEW_ONLY
     /* Design preview build (-DPREVIEW_ONLY): draw once into the framebuffer
      * and exit — no touch device needed. */
-    draw_all(0, 0);
+    draw_all();
     return 0;
 #endif
 
@@ -307,27 +359,40 @@ int main(int argc, char **argv) {
 
     char pin[MAX_PIN + 1];
     int n = 0, fails = 0, fail_flag = 0;
-    draw_all(0, 0);
+    draw_all();
+    time_t last = time(NULL);
     for (;;) {
         int k = read_tap();
         if (k < 0) continue;
+
+        /* A tap after a long idle → the panel may have been blanked by an
+         * external refresh; the pad only repaints the dots band per key, so
+         * redraw the whole thing before handling this tap. */
+        time_t now = time(NULL);
+        if (now - last > 20) { draw_all(); n = 0; fail_flag = 0; }
+        last = now;
+
         if (k <= 8 || k == 10) {           /* digit */
-            if (n < MAX_PIN) pin[n++] = (k == 10) ? '0' : (char)('1' + k);
+            if (n < pin_len) pin[n++] = (k == 10) ? '0' : (char)('1' + k);
             fail_flag = 0;
-        } else if (k == 9) {               /* backspace */
-            if (n > 0) n--;
-        } else {                           /* ok */
-            pin[n] = 0;
-            char *h = crypt(pin, stored);
-            if (h && !strcmp(h, stored)) {
-                memset(pin, 0, sizeof pin);
-                return 0;
+            if (n == pin_len) {           /* full entry: verify + clear */
+                pin[n] = 0;
+                char *h = crypt(pin, stored);
+                if (debug)
+                    fprintf(stderr, "swtfb-pinpad: verify -> %s\n",
+                            (h && !strcmp(h, stored)) ? "MATCH" : "no");
+                if (h && !strcmp(h, stored)) {
+                    memset(pin, 0, sizeof pin);
+                    return 0;
+                }
+                n = 0;
+                fail_flag = 1;
+                if (++fails % 3 == 0) sleep(2);
             }
-            n = 0;
-            fail_flag = 1;
-            if (++fails % 3 == 0) sleep(2);
+        } else if (k == 11) {              /* backspace */
+            if (n > 0) n--;
         }
         draw_dots(n, fail_flag);
-        refresh();
+        refresh(dots_band(), WF_DU);
     }
 }
