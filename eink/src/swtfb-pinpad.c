@@ -168,6 +168,29 @@ static void draw_key(int k) {
     }
 }
 
+/* Momentary press feedback: filled disc over the key (DU), restored after the
+ * tap is processed. */
+static rect_t key_rect(int k) {
+    int cx, cy;
+    key_center(k, &cx, &cy);
+    return (rect_t){ (uint32_t)(cy - cell / 2), (uint32_t)(cx - cell / 2),
+                     (uint32_t)cell, (uint32_t)cell };
+}
+
+static void flash_key(int k) {
+    int cx, cy;
+    key_center(k, &cx, &cy);
+    ring(cx, cy, W * 9 / 200, W * 9 / 200, BLACK);
+    refresh(key_rect(k), WF_DU);
+}
+
+static void unflash_key(int k) {
+    rect_t r = key_rect(k);
+    fill((int)r.left, (int)r.top, (int)r.width, (int)r.height, WHITE);
+    draw_key(k);
+    refresh(r, WF_DU);
+}
+
 static rect_t dots_band(void) {
     int r = W / 80;
     return (rect_t){ (uint32_t)(dots_y - 4 * r), 0, (uint32_t)W, (uint32_t)(8 * r) };
@@ -196,13 +219,31 @@ static void draw_all(void) {
 /* ── touch input ────────────────────────────────────────────────────────── */
 static int t_fd = -1;
 static int t_minx, t_maxx, t_miny, t_maxy;
+static int mt_slots = 0, cur_slot = 0; /* MT protocol B slot state */
 
+/* Per-slot value via EVIOCGMTSLOTS: the singleton EVIOCGABS state is not
+ * maintained for ABS_MT_* axes. Returns -1 on failure. */
+static int mt_slot_val(unsigned code, int slot) {
+    struct { unsigned code; int v[64]; } req;
+    if (slot < 0 || slot >= mt_slots || mt_slots > 64) return -1;
+    req.code = code;
+    if (ioctl(t_fd, EVIOCGMTSLOTS(sizeof(unsigned) + (size_t)mt_slots * sizeof(int)), &req) < 0)
+        return -1;
+    return req.v[slot];
+}
+
+/* EVIOCGRAB touch + pen while the pad is up: the SIGSTOPped reader app's
+ * evdev fds still queue events, and on SIGCONT the PIN taps replay into it
+ * as page turns. The pen fd is held open, never read; grabs die with the
+ * process. */
 static int open_touch(void) {
     DIR *d = opendir("/dev/input");
     if (!d) return -1;
     struct dirent *e;
     char path[300];
     unsigned long absbit[(ABS_MAX / (8 * sizeof(long))) + 1];
+    unsigned long keybit[(KEY_MAX / (8 * sizeof(long))) + 1];
+    int fd = -1;
     while ((e = readdir(d))) {
         if (strncmp(e->d_name, "event", 5)) continue;
         snprintf(path, sizeof path, "/dev/input/%s", e->d_name);
@@ -210,26 +251,46 @@ static int open_touch(void) {
         if (f < 0) continue;
         memset(absbit, 0, sizeof absbit);
         ioctl(f, EVIOCGBIT(EV_ABS, sizeof absbit), absbit);
-        if (absbit[ABS_MT_POSITION_X / (8 * sizeof(long))] &
-            (1UL << (ABS_MT_POSITION_X % (8 * sizeof(long))))) {
+        memset(keybit, 0, sizeof keybit);
+        ioctl(f, EVIOCGBIT(EV_KEY, sizeof keybit), keybit);
+        if (fd < 0 &&
+            (absbit[ABS_MT_POSITION_X / (8 * sizeof(long))] &
+             (1UL << (ABS_MT_POSITION_X % (8 * sizeof(long)))))) {
             struct input_absinfo ai;
             ioctl(f, EVIOCGABS(ABS_MT_POSITION_X), &ai);
             t_minx = ai.minimum; t_maxx = ai.maximum;
             ioctl(f, EVIOCGABS(ABS_MT_POSITION_Y), &ai);
             t_miny = ai.minimum; t_maxy = ai.maximum;
+            if (ioctl(f, EVIOCGABS(ABS_MT_SLOT), &ai) >= 0) {
+                mt_slots = ai.maximum + 1;
+                cur_slot = ai.value;
+            }
             if (debug) {
                 char nm[80] = "?";
                 ioctl(f, EVIOCGNAME(sizeof nm), nm);
                 fprintf(stderr, "swtfb-pinpad: touch %s (%s) X %d..%d Y %d..%d\n",
                         path, nm, t_minx, t_maxx, t_miny, t_maxy);
             }
-            closedir(d);
-            return f;
+            if (ioctl(f, EVIOCGRAB, 1) < 0 && debug)
+                fprintf(stderr, "swtfb-pinpad: touch grab failed: %s\n",
+                        strerror(errno));
+            fd = f;
+            continue; /* keep scanning: the pen may come after the touch dev */
+        }
+        if (keybit[BTN_TOOL_PEN / (8 * sizeof(long))] &
+            (1UL << (BTN_TOOL_PEN % (8 * sizeof(long))))) {
+            if (debug) {
+                char nm[80] = "?";
+                ioctl(f, EVIOCGNAME(sizeof nm), nm);
+                fprintf(stderr, "swtfb-pinpad: grabbing pen %s (%s)\n", path, nm);
+            }
+            ioctl(f, EVIOCGRAB, 1);
+            continue; /* fd intentionally held open, never read */
         }
         close(f);
     }
     closedir(d);
-    return -1;
+    return fd;
 }
 
 /* Key hit at panel coords, or -1. */
@@ -243,34 +304,46 @@ static int hit(int x, int y) {
     return -1;
 }
 
-/* Block until a NEW contact's first coordinates (touch-DOWN), return the key
- * hit (or -1), then swallow events until the contact lifts. */
+static int scale_x(int v) { return (int)((int64_t)(v - t_minx) * (W - 1) / (t_maxx - t_minx)); }
+static int scale_y(int v) { return (int)((int64_t)(v - t_miny) * (H - 1) / (t_maxy - t_miny)); }
+
+/* Coordinates persist across contacts (t_x/t_y): evdev suppresses ABS events
+ * whose value is unchanged, so a same-spot tap emits no X/Y — the last-seen
+ * value IS the current one. Seeded once at startup from the quiescent slot
+ * state (see open_touch). */
+static int t_x = -1, t_y = -1;
+
+/* Block until a new contact's packet completes (SYN_REPORT after touch-DOWN),
+ * return the key hit (or -1), then swallow events until the contact lifts.
+ * Registration at SYN, not at the down event: the packet's own X/Y must be
+ * consumed first (queue-consistent even under event backlog). */
 static int read_tap(void) {
     struct input_event ev;
-    int x = -1, y = -1, active = 0;
+    int down = 0;
     for (;;) {
         if (read(t_fd, &ev, sizeof ev) != (ssize_t)sizeof ev) return -1;
-        if (ev.type == EV_ABS && ev.code == ABS_MT_TRACKING_ID) {
-            active = (ev.value >= 0);
-            if (active) { x = -1; y = -1; }
-        } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
-            active = (ev.value != 0);
-            if (active && x >= 0 && y >= 0) goto have; /* protocol-A style */
+        if (ev.type == EV_ABS && ev.code == ABS_MT_SLOT) {
+            cur_slot = ev.value;
+        } else if (ev.type == EV_ABS && ev.code == ABS_MT_TRACKING_ID) {
+            if (ev.value >= 0) down = 1;
+        } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH && ev.value == 1) {
+            down = 1; /* protocol-A style */
         } else if (ev.type == EV_ABS && ev.code == ABS_MT_POSITION_X) {
-            x = (int)((int64_t)(ev.value - t_minx) * (W - 1) / (t_maxx - t_minx));
+            t_x = scale_x(ev.value);
         } else if (ev.type == EV_ABS && ev.code == ABS_MT_POSITION_Y) {
-            y = (int)((int64_t)(ev.value - t_miny) * (H - 1) / (t_maxy - t_miny));
-        }
-        if (active && x >= 0 && y >= 0) {
-        have:;
-            int k = hit(x, y);
+            t_y = scale_y(ev.value);
+        } else if (ev.type == EV_SYN && ev.code == SYN_REPORT && down) {
+            if (t_x < 0 || t_y < 0) { down = 0; continue; } /* no position known yet */
+            int k = hit(t_x, t_y);
             if (debug)
-                fprintf(stderr, "swtfb-pinpad: tap (%d,%d) -> key %d\n", x, y, k);
+                fprintf(stderr, "swtfb-pinpad: tap (%d,%d) -> key %d\n", t_x, t_y, k);
             /* swallow until lift so a held finger is one keypress */
             while (read(t_fd, &ev, sizeof ev) == (ssize_t)sizeof ev) {
                 if ((ev.type == EV_ABS && ev.code == ABS_MT_TRACKING_ID && ev.value < 0) ||
                     (ev.type == EV_KEY && ev.code == BTN_TOUCH && ev.value == 0))
                     break;
+                if (ev.type == EV_ABS && ev.code == ABS_MT_POSITION_X) t_x = scale_x(ev.value);
+                if (ev.type == EV_ABS && ev.code == ABS_MT_POSITION_Y) t_y = scale_y(ev.value);
             }
             return k;
         }
@@ -356,9 +429,23 @@ int main(int argc, char **argv) {
         fprintf(stderr, "swtfb-pinpad: no touch device — cannot lock, letting boot proceed\n");
         return 0;
     }
+    /* Seed the persisted position from the (quiescent) slot state, covering a
+     * first tap whose coordinates the kernel suppresses as unchanged. */
+    {
+        int v;
+        if ((v = mt_slot_val(ABS_MT_POSITION_X, cur_slot)) >= 0) t_x = scale_x(v);
+        if ((v = mt_slot_val(ABS_MT_POSITION_Y, cur_slot)) >= 0) t_y = scale_y(v);
+    }
+
+    /* Snapshot the frame the pad paints over and restore it on unlock: the
+     * reader app is not told a suspend happened (button-path suspends bypass
+     * it), so nothing else repaints — without this the dead pad image stays
+     * on the panel while the app runs live underneath. */
+    uint16_t *saved = malloc((size_t)W * H * 2);
+    if (saved) memcpy(saved, fb, (size_t)W * H * 2);
 
     char pin[MAX_PIN + 1];
-    int n = 0, fails = 0, fail_flag = 0;
+    int n = 0, fails = 0, fail_flag = 0, flashed = -1;
     draw_all();
     time_t last = time(NULL);
     for (;;) {
@@ -369,8 +456,14 @@ int main(int argc, char **argv) {
          * external refresh; the pad only repaints the dots band per key, so
          * redraw the whole thing before handling this tap. */
         time_t now = time(NULL);
-        if (now - last > 20) { draw_all(); n = 0; fail_flag = 0; }
+        if (now - last > 20) { draw_all(); n = 0; fail_flag = 0; flashed = -1; }
         last = now;
+
+        /* Press highlight held until the NEXT tap: an immediate restore races
+         * the engine's framebuffer sampling and the flash never renders. */
+        if (flashed >= 0) unflash_key(flashed);
+        flash_key(k);
+        flashed = k;
 
         if (k <= 8 || k == 10) {           /* digit */
             if (n < pin_len) pin[n++] = (k == 10) ? '0' : (char)('1' + k);
@@ -383,6 +476,10 @@ int main(int argc, char **argv) {
                             (h && !strcmp(h, stored)) ? "MATCH" : "no");
                 if (h && !strcmp(h, stored)) {
                     memset(pin, 0, sizeof pin);
+                    if (saved) {
+                        memcpy(fb, saved, (size_t)W * H * 2);
+                        refresh((rect_t){0, 0, (uint32_t)W, (uint32_t)H}, WF_GC16);
+                    }
                     return 0;
                 }
                 n = 0;
@@ -392,6 +489,7 @@ int main(int argc, char **argv) {
         } else if (k == 11) {              /* backspace */
             if (n > 0) n--;
         }
+        if (fail_flag) { unflash_key(k); flashed = -1; } /* wrong PIN: clear the highlight */
         draw_dots(n, fail_flag);
         refresh(dots_band(), WF_DU);
     }

@@ -23,8 +23,8 @@
 //              source fires on any cover edge, so closing the cover over a
 //              sleeping device wakes it; the SW_LID close event lands inside
 //              the debounce window and, being a switch state, never re-fires.
-// A generous fallback timeout re-arms from SUSPENDING if no resume edge ever
-// arrives (e.g. logind restarted mid-flight).
+// A generous fallback timeout re-arms from SUSPENDING (via RESUME_DEBOUNCE)
+// if no resume edge ever arrives (e.g. logind restarted mid-flight).
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
@@ -220,13 +220,18 @@ int main(void) {
             }
             break;
         case SUSPENDING:
-            // Input discarded. Leave on the resume edge or the fallback timeout.
+            // Input discarded. Leave on the resume edge or the fallback
+            // timeout. The timeout fires at thaw after any sleep longer than
+            // itself (CLOCK_BOOTTIME advances across suspend); it must land in
+            // RESUME_DEBOUNCE, not AWAKE, or the replayed wake press
+            // re-suspends the device.
             if (resumed_edge) {
                 resumed_edge = 0;
                 st = RESUME_DEBOUNCE;
                 state_since = t;
             } else if (t - state_since >= SUSPENDING_TIMEOUT_MS) {
-                st = AWAKE;
+                st = RESUME_DEBOUNCE;
+                state_since = t;
             }
             break;
         case RESUME_DEBOUNCE:
