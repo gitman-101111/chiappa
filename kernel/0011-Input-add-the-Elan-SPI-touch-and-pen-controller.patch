@@ -1,4 +1,4 @@
-From f2daed2e11938a17018ae73189334d4de5be5436 Mon Sep 17 00:00:00 2001
+From d198394c3c400b20ff33a8809904bbb1e4871f34 Mon Sep 17 00:00:00 2001
 From: gitman-101111 <development@spamfolder.xyz>
 Date: Mon, 12 Oct 2026 10:23:08 -0600
 Subject: [PATCH] Input: add the Elan SPI touch and pen controller

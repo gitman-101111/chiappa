@@ -21,11 +21,14 @@ make -C "$src" -s O="$out" defconfig
 make -C "$src" -s O="$out" olddefconfig
 
 # Options the fragment asked for that the merged result dropped are a mistake
-# somewhere (misspelt symbol, unmet dependency); refuse to publish them.
+# somewhere (misspelt symbol, unmet dependency); refuse to publish them. A
+# symbol this kernel does not define at all is only reported: the fragment
+# may name options that exist on one supported kernel series and not another.
 status=0
+defined() { grep -rqE "^(menu)?config ${1#CONFIG_}$" --include="Kconfig*" "$src"; }
 while IFS= read -r line; do
   case $line in
-    CONFIG_*=*) grep -qxF "$line" "$out/.config" || { echo "lost: $line" >&2; status=1; } ;;
+    CONFIG_*=*) grep -qxF "$line" "$out/.config" || { if defined "${line%%=*}"; then echo "lost: $line" >&2; status=1; else echo "not in this kernel: $line" >&2; fi; } ;;
     "# CONFIG_"*" is not set") sym=${line#\# }; sym=${sym% is not set}; grep -qE "^$sym=" "$out/.config" && { echo "still set: $sym" >&2; status=1; } ;;
   esac
 done < "$here/chiappa-mainline.config"

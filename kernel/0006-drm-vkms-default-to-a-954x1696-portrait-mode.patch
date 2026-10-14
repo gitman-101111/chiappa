@@ -1,4 +1,4 @@
-From c5e4566a68a2d7ac1b723a25edd35665baf62e12 Mon Sep 17 00:00:00 2001
+From 794ebf4b867ac5908b9909115b7fbffc4759c3a6 Mon Sep 17 00:00:00 2001
 From: gitman-101111 <development@spamfolder.xyz>
 Date: Mon, 12 Oct 2026 10:23:07 -0600
 Subject: [PATCH] drm/vkms: default to a 954x1696 portrait mode

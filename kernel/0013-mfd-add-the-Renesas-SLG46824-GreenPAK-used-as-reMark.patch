@@ -1,4 +1,4 @@
-From 7340e1b86dba38958c3fc6a75a7f6a0564ca989d Mon Sep 17 00:00:00 2001
+From 582df9e88ec6ce299c3217b2badbfa318fdb58b0 Mon Sep 17 00:00:00 2001
 From: gitman-101111 <development@spamfolder.xyz>
 Date: Mon, 12 Oct 2026 10:23:09 -0600
 Subject: [PATCH] mfd: add the Renesas SLG46824 GreenPAK used as reMarkable's

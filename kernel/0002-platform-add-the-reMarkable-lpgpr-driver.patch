@@ -1,4 +1,4 @@
-From 6a48c394927b0c0feade37465fd766557945580d Mon Sep 17 00:00:00 2001
+From b1a22bc34242e9744fbdb83c44ac68573b07529f Mon Sep 17 00:00:00 2001
 From: gitman-101111 <development@spamfolder.xyz>
 Date: Mon, 12 Oct 2026 10:23:07 -0600
 Subject: [PATCH] platform: add the reMarkable lpgpr driver

@@ -1,4 +1,4 @@
-From 215747474e70ac602f2fb0533aaf77788f885833 Mon Sep 17 00:00:00 2001
+From b3945d036221db093870b748a66a6f9ef618e09f Mon Sep 17 00:00:00 2001
 From: gitman-101111 <development@spamfolder.xyz>
 Date: Mon, 12 Oct 2026 10:23:09 -0600
 Subject: [PATCH] hwmon: ntc_thermistor: add the TDK NTCG103JF103FT1

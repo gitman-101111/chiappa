@@ -1,4 +1,4 @@
-From d6ba7767762d799e22a72f6b72c9db5d0b5c34bb Mon Sep 17 00:00:00 2001
+From 7dd0544a3c916a418616a918a9adb28b7fc7ed9a Mon Sep 17 00:00:00 2001
 From: gitman-101111 <development@spamfolder.xyz>
 Date: Mon, 12 Oct 2026 10:23:07 -0600
 Subject: [PATCH] drm/panel: add the reMarkable cumulus e-paper panel

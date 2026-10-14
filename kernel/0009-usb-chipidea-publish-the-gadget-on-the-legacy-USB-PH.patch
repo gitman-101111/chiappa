@@ -1,4 +1,4 @@
-From a09b61358d2f3145489f4797514014b3c2b45f80 Mon Sep 17 00:00:00 2001
+From c7274cfa218ba2841f00287d64f8a63c8a644de5 Mon Sep 17 00:00:00 2001
 From: gitman-101111 <development@spamfolder.xyz>
 Date: Mon, 12 Oct 2026 10:23:08 -0600
 Subject: [PATCH] usb: chipidea: publish the gadget on the legacy USB PHY

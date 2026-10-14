@@ -148,8 +148,8 @@ chiappa/
 
 ### 1. Kernel
 
-Mainline Linux (currently **7.2.10**, from kernel.org) plus the patch series
-in [`kernel/`](kernel/): apply `0001-…` to `0016-…` in order, build with
+Mainline Linux (the series is validated on **7.2.10** and meant to follow the
+latest stable kernel) plus the patch series in [`kernel/`](kernel/): apply `0001-…` to `0016-…` in order, build with
 `kernel/config-chiappa-mainline.aarch64` as your complete `.config` (it is
 generated from `kernel/chiappa-mainline.config` by `regenerate-config.sh`;
 do not run `olddefconfig` on the fragment alone, it drops `CONFIG_ARCH_MXC`

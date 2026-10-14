@@ -1,4 +1,4 @@
-From 62c6e56570119f92fae37c07c00e4ce77bf19b62 Mon Sep 17 00:00:00 2001
+From 89652103c8c43be016bee314811247d2e8924929 Mon Sep 17 00:00:00 2001
 From: gitman-101111 <development@spamfolder.xyz>
 Date: Mon, 12 Oct 2026 10:23:07 -0600
 Subject: [PATCH] regulator: add the GMT G2194 e-paper PMIC

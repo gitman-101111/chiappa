@@ -1,4 +1,4 @@
-From a430b9192350b843d5202f80c9f6c1c8d7cc63cb Mon Sep 17 00:00:00 2001
+From b5d5165ec5814f8eb32f3c4a0692a8bd7262d451 Mon Sep 17 00:00:00 2001
 From: gitman-101111 <development@spamfolder.xyz>
 Date: Mon, 12 Oct 2026 10:23:09 -0600
 Subject: [PATCH] nfc: add reMarkable's NXP CTN730 marker charger driver

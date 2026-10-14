@@ -1,0 +1,88 @@
+From aaaecefd3f14b8803302487cb19eb1699d816c3c Mon Sep 17 00:00:00 2001
+From: gitman-101111 <development@spamfolder.xyz>
+Date: Wed, 14 Oct 2026 07:34:59 -0600
+Subject: [PATCH] drm/bridge: imx93-pdfc: park the display pads while the
+ output is disabled
+
+Let a board describe a second, "gpio", pinctrl state for the parallel
+display pads and select it whenever the bridge is disabled (and before the
+first enable), switching back to the default state on enable. The
+reMarkable Paper Pro Move drives an e-paper panel over this bus and parks
+the pads between refreshes to avoid leakage through the panel; the vendor
+driver did the same. Boards without the state are unaffected.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/bridge/imx/imx93-pdfc.c | 31 +++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/drivers/gpu/drm/bridge/imx/imx93-pdfc.c b/drivers/gpu/drm/bridge/imx/imx93-pdfc.c
+index bf168ad69..0a1711dd0 100644
+--- a/drivers/gpu/drm/bridge/imx/imx93-pdfc.c
++++ b/drivers/gpu/drm/bridge/imx/imx93-pdfc.c
+@@ -11,6 +11,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_graph.h>
++#include <linux/pinctrl/consumer.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ 
+@@ -28,6 +29,8 @@ struct imx93_pdfc {
+ 	struct device *dev;
+ 	struct regmap *regmap;
+ 	u32 phy_bus_width;
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *parked_state;
+ };
+ 
+ static struct imx93_pdfc *bridge_to_imx93_pdfc(struct drm_bridge *bridge)
+@@ -74,6 +77,18 @@ static void imx93_pdfc_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	}
+ 
+ 	regmap_update_bits(pdfc->regmap, IMX93_DISPLAY_MUX_REG, mask, val);
++
++	if (pdfc->parked_state)
++		pinctrl_pm_select_default_state(pdfc->dev);
++}
++
++static void imx93_pdfc_bridge_atomic_disable(struct drm_bridge *bridge,
++					     struct drm_atomic_commit *state)
++{
++	struct imx93_pdfc *pdfc = bridge_to_imx93_pdfc(bridge);
++
++	if (pdfc->parked_state)
++		pinctrl_select_state(pdfc->pinctrl, pdfc->parked_state);
+ }
+ 
+ /* TODO: Add YUV formats */
+@@ -150,6 +165,7 @@ static int imx93_pdfc_bridge_atomic_check(struct drm_bridge *bridge,
+ static const struct drm_bridge_funcs funcs = {
+ 	.attach			= imx93_pdfc_bridge_attach,
+ 	.atomic_enable		= imx93_pdfc_bridge_atomic_enable,
++	.atomic_disable		= imx93_pdfc_bridge_atomic_disable,
+ 	.atomic_duplicate_state	= drm_atomic_helper_bridge_duplicate_state,
+ 	.atomic_destroy_state	= drm_atomic_helper_bridge_destroy_state,
+ 	.atomic_get_input_bus_fmts	= imx93_pdfc_bridge_atomic_get_input_bus_fmts,
+@@ -174,6 +190,21 @@ static int imx93_pdfc_bridge_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, PTR_ERR(pdfc->regmap),
+ 				     "failed to get regmap\n");
+ 
++	/*
++	 * Boards may describe a "gpio" pinctrl state that parks the display
++	 * pads while the output is disabled (an e-paper panel left with a
++	 * driven clock pad leaks); select it until the first enable.
++	 */
++	pdfc->pinctrl = devm_pinctrl_get(dev);
++	if (IS_ERR(pdfc->pinctrl))
++		return dev_err_probe(dev, PTR_ERR(pdfc->pinctrl),
++				     "failed to get pinctrl\n");
++	pdfc->parked_state = pinctrl_lookup_state(pdfc->pinctrl, "gpio");
++	if (IS_ERR(pdfc->parked_state))
++		pdfc->parked_state = NULL;
++	else
++		pinctrl_select_state(pdfc->pinctrl, pdfc->parked_state);
++
+ 	/* No limits per default */
+ 	pdfc->phy_bus_width = 24;
+ 

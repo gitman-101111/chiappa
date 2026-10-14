@@ -1,4 +1,4 @@
-From cb5b81c3c818cfcaf7afcd94efa92a8708fda8d5 Mon Sep 17 00:00:00 2001
+From a63335609a6d1abdcf06a055b69009475ef776ab Mon Sep 17 00:00:00 2001
 From: gitman-101111 <development@spamfolder.xyz>
 Date: Mon, 12 Oct 2026 10:23:08 -0600
 Subject: [PATCH] usb: typec: add the ON Semiconductor FUSB303B port controller

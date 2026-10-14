@@ -1,4 +1,4 @@
-From 8058a660bcfb6258c95562911d3be4aa50521137 Mon Sep 17 00:00:00 2001
+From e5af55d3e67200445f038bb481af14e56efd29c9 Mon Sep 17 00:00:00 2001
 From: gitman-101111 <development@spamfolder.xyz>
 Date: Mon, 12 Oct 2026 10:23:07 -0600
 Subject: [PATCH] nvmem: snvs_lpgpr: support the i.MX93 BBNSM general purpose

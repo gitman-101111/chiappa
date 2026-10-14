@@ -1,4 +1,4 @@
-From cf4915487b549b9f4527a1121bb45940511bf1c6 Mon Sep 17 00:00:00 2001
+From 0b4b5789437d38ffd080308bc17f19d284026ba1 Mon Sep 17 00:00:00 2001
 From: gitman-101111 <development@spamfolder.xyz>
 Date: Mon, 12 Oct 2026 17:36:09 -0600
 Subject: [PATCH] pmdomain: imx93-blk-ctrl: hold the bus domain across system

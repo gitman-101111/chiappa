@@ -45,7 +45,7 @@ derived from the fuse lifecycle at normal boot, so no action should be needed.)
 
 ## Stock libuuu works (no rm_recover needed for SDP access)
 
-Stock libuuu (tested 1.5.243, e.g. `nixpkgs#uuu`) can drive the device if you map
+Stock libuuu (tested 1.5.243) can drive the device if you map
 the custom USB IDs with `CFG:` lines at the top of the script — see
 [`recovery/uuu-scripts/sdp-to-fastboot.uuu`](../recovery/uuu-scripts/sdp-to-fastboot.uuu):
 
