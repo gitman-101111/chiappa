@@ -12,8 +12,6 @@ produces them all):
   e-ink driver reads them (the vendor keeps them in `/usr/share/remarkable/`)
 - **the 8 KB AHAB header** from the vendor fitImage → prepended to any FIT you
   build ([fitimage.md](fitimage.md))
-- **the vendor device trees** (rev F–K, byte-identical) → embedded in your FIT;
-  the kernel-tree-built DTB does not boot this device ([fitimage.md](fitimage.md))
 
 > None of these files are in this repo. The steps below produce them on **your** machine.
 

@@ -121,7 +121,6 @@ chiappa/
 │   ├── eink.md                # e-ink pipeline + low-level frame format
 │   ├── power.md               # charging budget, idle draw, low-battery pitfalls
 │   └── recovery.md            # SDP unbrick + non-destructive slot switch
-├── dtb/                # vendor device trees, rev F–K (firmware/extract-vendor-data.sh)
 ├── kernel/             # Mainline kernel: patch series, config fragment + full config, README
 ├── eink/               # e-ink toolkit — see eink/README.md
 │   ├── src/            # einkbridge.cpp, vkms_bridge.c, libfakekms.c, swtfb_fill.c, RE tools
@@ -143,7 +142,7 @@ chiappa/
 > **not** committed — the paths above are populated by extracting them from
 > your own device / firmware image (see
 > [docs/obtaining-vendor-blobs.md](docs/obtaining-vendor-blobs.md) and
-> [docs/fitimage.md](docs/fitimage.md) for the DTB + AHAB header).
+> [docs/fitimage.md](docs/fitimage.md) for the AHAB header).
 
 ## Quick start for distro porters
 
@@ -184,10 +183,8 @@ Then install `firmware/lib/firmware/` → `/lib/firmware/` and
 ### 3. Device tree
 
 The kernel build produces `freescale/imx93-remarkable-chiappa.dtb` from the
-series' DTS; one DTB serves all PCBA revisions (the vendor firmware ships
-six byte-identical DTBs for rev F–K, extracted into `dtb/` for reference by
-`firmware/extract-vendor-data.sh`). The vendor DTB only boots the vendor
-kernel: it describes vendor bindings.
+series' DTS; one DTB serves all PCBA revisions (the vendor firmware ships six
+byte-identical DTBs for rev F–K, which only boot the vendor kernel).
 
 ### 4. FIT image
 

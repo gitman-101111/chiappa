@@ -17,9 +17,3 @@ recovery/remarkable-production-image-*
 recovery/vendor-*
 
 *.log
-
-# Vendor-image-extracted device trees: the shipped DTB does not correspond to
-# the published kernel source (the tree-built one does not boot), so its GPL
-# corresponding-source obligation cannot be met — do not redistribute. Extract
-# your own: docs/fitimage.md.
-dtb/

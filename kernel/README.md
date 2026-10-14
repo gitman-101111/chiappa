@@ -1,10 +1,8 @@
 # Kernel — reMarkable Paper Pro Move (chiappa)
 
 Upstream Linux for chiappa: a patch series on top of a stable mainline
-release, a config fragment, and the complete config generated from it. This is
-the "v2 track" sketched in [`../docs/mainline-feasibility.md`](../docs/mainline-feasibility.md).
-The vendor 6.12.49 BSP kernel this replaced was retired from the tree on
-2026-10-14; its last state is in the git history before that date.
+release, a config fragment, and the complete config generated from it. The
+vendor 6.12.49 BSP kernel this replaced lives on the `vendor` branch.
 
 > **Status: runs the full system on hardware** (brought up 2026-10-12/13):
 > display through the PDFC bridge, touch/pen, front light, accelerometer,

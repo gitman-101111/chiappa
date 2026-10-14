@@ -12,22 +12,19 @@ Offset 0x2000 – EOF      : FIT image (standard FDT/FIT format, magic 0xd00dfee
 
 ### Extracting pieces from a vendor fitImage.ahab
 
-A custom-OS build needs two artifacts out of the vendor file (get it from your
+A custom-OS build needs one artifact out of the vendor file (get it from your
 device's `/boot` or the recovery image — see
-[obtaining-vendor-blobs.md](obtaining-vendor-blobs.md)).
-`firmware/extract-vendor-data.sh` does all of the below automatically; the
-manual steps:
+[obtaining-vendor-blobs.md](obtaining-vendor-blobs.md)): the 8 KB AHAB header,
+prepended verbatim to any FIT you build. `firmware/extract-vendor-data.sh`
+does it automatically; by hand:
 
 ```sh
-# the 8 KB AHAB header (prepended verbatim to any FIT you build):
 dd if=vendor-fitImage.ahab of=ahab-header.bin bs=8192 count=1
-
-# the bare FIT (for dumpimage), then the vendor DTB out of it — use the
-# fdt image index matching your PCBA revision from `dumpimage -l`:
-dd if=vendor-fitImage.ahab of=vendor-fit.itb bs=8192 skip=1
-dumpimage -l vendor-fit.itb
-dumpimage -T flat_dt -p <fdt-image-index> -o vendor.dtb vendor-fit.itb
 ```
+
+The vendor device trees inside the FIT are not needed (they only boot the
+vendor kernel); `dumpimage -l` on the bare FIT (`bs=8192 skip=1`) lists them
+if you want them as reference.
 
 With the mainline kernel the FIT carries the kernel-tree
 `freescale/imx93-remarkable-chiappa.dtb`; the vendor DTB describes vendor
