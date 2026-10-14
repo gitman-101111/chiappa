@@ -1,0 +1,907 @@
+From cb5b81c3c818cfcaf7afcd94efa92a8708fda8d5 Mon Sep 17 00:00:00 2001
+From: gitman-101111 <development@spamfolder.xyz>
+Date: Mon, 12 Oct 2026 10:23:08 -0600
+Subject: [PATCH] usb: typec: add the ON Semiconductor FUSB303B port controller
+
+Autonomous (non-PD) Type-C port controller: drives the USB role switch
+from the attach state, negotiates the charger input current from the
+detected source capability and hands it to the MAX77818, and exposes
+queue_charging_negotiation to re-run that negotiation from userspace.
+Ported from reMarkable's linux-imx-rm 6.12 tree.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/usb/typec/Kconfig    |  12 +
+ drivers/usb/typec/Makefile   |   1 +
+ drivers/usb/typec/fusb303b.c | 848 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 861 insertions(+)
+ create mode 100644 drivers/usb/typec/fusb303b.c
+
+diff --git a/drivers/usb/typec/Kconfig b/drivers/usb/typec/Kconfig
+index 2f80c2792..8834f8f6c 100644
+--- a/drivers/usb/typec/Kconfig
++++ b/drivers/usb/typec/Kconfig
+@@ -100,6 +100,18 @@ config TYPEC_STUSB160X
+ 	  If you choose to build this driver as a dynamically linked module, the
+ 	  module will be called stusb160x.ko.
+ 
++config TYPEC_FUSB303B
++	tristate "ON Semiconductor FUSB303B Type-C Port Controller driver"
++	depends on USB_ROLE_SWITCH || !USB_ROLE_SWITCH
++	depends on I2C
++	select REGMAP_I2C
++	help
++	  Say Y or M here if your system has ON Semiconductor FUSB303B
++	  Type-C Port Controller.
++
++	  If you choose to build this driver as a dynamically linked module, the
++	  module will be called fusb303b.ko.
++
+ config TYPEC_WUSB3801
+ 	tristate "Willsemi WUSB3801 Type-C port controller driver"
+ 	depends on I2C
+diff --git a/drivers/usb/typec/Makefile b/drivers/usb/typec/Makefile
+index 8a6a1c663..2542adffc 100644
+--- a/drivers/usb/typec/Makefile
++++ b/drivers/usb/typec/Makefile
+@@ -10,5 +10,6 @@ obj-$(CONFIG_TYPEC_ANX7411)	+= anx7411.o
+ obj-$(CONFIG_TYPEC_HD3SS3220)	+= hd3ss3220.o
+ obj-$(CONFIG_TYPEC_STUSB160X) 	+= stusb160x.o
+ obj-$(CONFIG_TYPEC_RT1719)	+= rt1719.o
++obj-$(CONFIG_TYPEC_FUSB303B)	+= fusb303b.o
+ obj-$(CONFIG_TYPEC_WUSB3801)	+= wusb3801.o
+ obj-$(CONFIG_TYPEC)		+= mux/
+diff --git a/drivers/usb/typec/fusb303b.c b/drivers/usb/typec/fusb303b.c
+new file mode 100644
+index 000000000..71fa6fbd3
+--- /dev/null
++++ b/drivers/usb/typec/fusb303b.c
+@@ -0,0 +1,848 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ON Semiconductor FUSB303B Autonomous USB Type-C Port Controller driver
++ *
++ * Copyright (C) 2022, reMarkable AS - http://www.remarkable.com
++ */
++
++#include <linux/bitfield.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/timer.h>
++#include <linux/usb/ch9.h>
++#include <linux/usb/gadget.h>
++#include <linux/usb/otg.h>
++#include <linux/usb/phy.h>
++#include <linux/usb/role.h>
++#include <linux/usb/typec.h>
++
++#define FUSB303B_DEVICE_ID		0x01
++#define FUSB303B_DEVICE_TYPE		0x02
++#define FUSB303B_PORTROLE		0x03
++#define FUSB303B_PORTROLE_TRY		GENMASK(5, 4)
++#define FUSB303B_PORTROLE_TYPE		GENMASK(2, 0)
++#define FUSB303B_PORTROLE_AUDIOACC	BIT(3)
++#define FUSB303B_CONTROL		0x04
++#define FUSB303B_CONTROL_INT_MASK	BIT(0)
++#define FUSB303B_CONTROL1		0x05
++#define FUSB303B_CONTROL1_ENABLE	BIT(3)
++#define FUSB303B_MANUAL			0x09
++#define FUSB303B_MANUAL_FORCE_SRC	BIT(5)
++#define FUSB303B_MANUAL_FORCE_SNK	BIT(4)
++#define FUSB303B_MANUAL_ERROR_REC	BIT(0)
++#define FUSB303B_RESET			0x0a
++#define FUSB303B_RESET_SW_RES		BIT(0)
++#define FUSB303B_MASK			0x0e
++#define FUSB303B_MASK1			0x0f
++#define FUSB303B_STATUS			0x11
++#define FUSB303B_STATUS_ATTACH		BIT(0)
++#define FUSB303B_STATUS_BC_LVL		GENMASK(2, 1)
++#define FUSB303B_STATUS_ORIENT		GENMASK(5, 4)
++#define FUSB303B_STATUS1		0x12
++#define FUSB303B_TYPE			0x13
++#define FUSB303B_TYPE_DEBUGSRC		BIT(6)
++#define FUSB303B_TYPE_DEBUGSNK		BIT(5)
++#define FUSB303B_TYPE_SINK		BIT(4)
++#define FUSB303B_TYPE_SOURCE		BIT(3)
++#define FUSB303B_TYPE_AUDIOVBUS		BIT(1)
++#define FUSB303B_TYPE_AUDIO		BIT(0)
++#define FUSB303B_INTERRUPT		0x14
++#define FUSB303B_INTERRUPT_BC_LVL	BIT(2)
++#define FUSB303B_INTERRUPT_DETACH	BIT(1)
++#define FUSB303B_INTERRUPT_ATTACH	BIT(0)
++#define FUSB303B_INTERRUPT1		0x15
++
++/*
++ * The USB specification lists different timing requirements for how quickly a
++ * device must adjust its current draw if the host port changes its advertised
++ * current. We immediately switch to 100mA on any change, so we are safe from
++ * violating any standard. By waiting 1000ms, we are not only waiting longer
++ * than required by the specification, but we also avoid spurious negotiations
++ * due to the numerous interrupts that are usually triggered on any change.
++ */
++#define USB_DEBOUNCE_DURATION_MS	1000
++
++enum fusb303b_portrole_try {
++	PORTROLE_TRY_DISABLE,
++	PORTROLE_TRY_SNK,
++	PORTROLE_TRY_SRC,
++};
++
++enum fusb303b_portrole_type {
++	PORTROLE_TYPE_SRC = BIT(0),
++	PORTROLE_TYPE_SNK = BIT(1),
++	PORTROLE_TYPE_DRP = BIT(2),
++};
++
++enum fusb303b_bc_lvl {
++	BC_LVL_UNATTACHED,
++	BC_LVL_DEFAULT,
++	BC_LVL_1_5A,
++	BC_LVL_3_0A,
++};
++
++enum fusb303b_orient {
++	ORIENT_UNRESOLVED,
++	ORIENT_CC1,
++	ORIENT_CC2,
++	ORIENT_FAULT
++};
++
++struct fusb303b {
++	struct device *dev;
++	struct regmap *regmap;
++	struct typec_port *port;
++	struct typec_partner *partner;
++	bool irq_disabled_by_pm;
++	struct usb_role_switch *role_sw;
++	struct gpio_desc *en_gpio;
++	struct power_supply *vbus_psy;
++	struct power_supply *fg_psy;
++	bool vbus_on;
++	enum typec_accessory accessory;
++	struct usb_phy *usbphy;
++	struct notifier_block usbphy_nb;
++	unsigned int usbphy_current;
++	struct delayed_work negotiate_work;
++	struct work_struct negotiate_entry_work;
++	unsigned int usb_safe_current_ma;
++
++	enum fusb303b_portrole_try porttry_stored;
++	enum fusb303b_portrole_type porttype_stored;
++
++	struct gpio_desc *vbus_switch_latch;
++};
++
++static int fusb303b_try_role(struct typec_port *port, int role)
++{
++	struct fusb303b *chip = typec_get_drvdata(port);
++	enum fusb303b_portrole_try try;
++
++	switch (role) {
++	case TYPEC_SINK:
++		try = PORTROLE_TRY_SNK;
++		break;
++	case TYPEC_SOURCE:
++		try = PORTROLE_TRY_SRC;
++		break;
++	case TYPEC_NO_PREFERRED_ROLE:
++		try = PORTROLE_TRY_DISABLE;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return regmap_update_bits(chip->regmap, FUSB303B_PORTROLE,
++				  FUSB303B_PORTROLE_TRY,
++				  FIELD_PREP(FUSB303B_PORTROLE_TRY, try));
++}
++
++static int fusb303b_dr_set(struct typec_port *port, enum typec_data_role role)
++{
++	struct fusb303b *chip = typec_get_drvdata(port);
++	u32 force;
++
++	if (role == TYPEC_DEVICE)
++		force = FUSB303B_MANUAL_FORCE_SNK;
++	else
++		force = FUSB303B_MANUAL_FORCE_SRC;
++
++	/* The bits are write one self clearing */
++	return regmap_update_bits(chip->regmap, FUSB303B_MANUAL,
++				  force, force);
++}
++
++static int fusb303b_port_type_set(struct typec_port *port,
++				  enum typec_port_type type)
++{
++	struct fusb303b *chip = typec_get_drvdata(port);
++	enum fusb303b_portrole_type fpt;
++
++	switch (type) {
++	case TYPEC_PORT_SRC:
++		fpt = PORTROLE_TYPE_SRC;
++		break;
++	case TYPEC_PORT_SNK:
++		fpt = PORTROLE_TYPE_SNK;
++		break;
++	default:
++		fpt = PORTROLE_TYPE_DRP;
++		break;
++	}
++
++	dev_info(chip->dev, "updating PORTROLE to 0x%02x\n", fpt);
++
++	return regmap_update_bits(chip->regmap, FUSB303B_PORTROLE,
++				  FUSB303B_PORTROLE_TYPE, fpt);
++}
++
++static const struct typec_operations fusb303b_ops = {
++	.try_role = fusb303b_try_role,
++	.dr_set = fusb303b_dr_set,
++	.port_type_set = fusb303b_port_type_set,
++};
++
++static bool fusb303b_no_battery(struct fusb303b *chip)
++{
++	int err;
++	union power_supply_propval pval;
++
++	/* fuelgauge takes precedence */
++	if (chip->fg_psy) {
++		err = power_supply_get_property(chip->fg_psy,
++					POWER_SUPPLY_PROP_PRESENT,
++					&pval);
++		if (err) {
++			dev_err_once(chip->dev, "failed to get battery present (err %d)\n", err);
++			return false;
++		}
++
++		return (pval.intval == 0);
++	}
++
++	if (!chip->vbus_psy)
++		return false;
++
++	err = power_supply_get_property(chip->vbus_psy,
++					POWER_SUPPLY_PROP_HEALTH,
++					&pval);
++	if (err) {
++		dev_err_once(chip->dev, "failed to get POWER_SUPPLY_PROP_HEALTH (err %d)\n", err);
++		return false;
++	}
++	return (pval.intval == POWER_SUPPLY_HEALTH_NO_BATTERY);
++}
++
++static void fusb303b_set_charging_current(struct fusb303b *chip, unsigned int mA)
++{
++	union power_supply_propval propval;
++	int ret;
++
++	if (fusb303b_no_battery(chip) && mA < 1500) {
++		dev_warn(chip->dev, "Battery absent; increasing current\n");
++		mA = 1500;
++	}
++
++	/* To microamps. */
++	propval.intval = mA * 1000;
++	ret = power_supply_set_property(chip->vbus_psy,
++					POWER_SUPPLY_PROP_CURRENT_MAX,
++					&propval);
++	if (ret)
++		dev_err(chip->dev, "Regulator failed to adjust current draw\n");
++}
++
++static void fusb303b_negotiate_work(struct work_struct *work)
++{
++	struct fusb303b *chip = container_of(to_delayed_work(work),
++					     struct fusb303b,
++					     negotiate_work);
++	unsigned int mA = chip->usb_safe_current_ma;
++	enum typec_pwr_opmode mode;
++	bool cable_issue;
++	u32 status, type;
++	int ret;
++
++	ret  = regmap_read(chip->regmap, FUSB303B_STATUS, &status);
++	ret |= regmap_read(chip->regmap, FUSB303B_TYPE, &type);
++	if (ret) {
++		dev_err(chip->dev, "Failed to read regmap\n");
++		return;
++	}
++
++	if (!(status & FUSB303B_STATUS_ATTACH))
++		goto done;
++
++	if (!(type & FUSB303B_TYPE_SINK) && !(type & FUSB303B_TYPE_DEBUGSNK))
++		goto done;
++
++	/*
++	 * If we are unable to obtain USB state, ideally, we should set the safe
++	 * current limit. Let us wait with doing that, until we have seen that
++	 * this mechanism is stable. We can not risk customers ending up stuck
++	 * at 100mA charging.
++	 */
++	if (!chip->usbphy->otg || !chip->usbphy->otg->gadget) {
++		dev_info(chip->dev, "Unable to obtain gadget state\n");
++		goto skip_usb_state;
++	}
++
++	switch (chip->usbphy->otg->gadget->state) {
++	case USB_STATE_CONFIGURED:
++		mA = 500;
++		break;
++	case USB_STATE_ADDRESS:
++		goto skip_typec;
++	case USB_STATE_SUSPENDED:
++		goto done;
++	case USB_STATE_NOTATTACHED:
++	case USB_STATE_ATTACHED:
++	case USB_STATE_POWERED:
++	case USB_STATE_RECONNECTING:
++	case USB_STATE_UNAUTHENTICATED:
++	case USB_STATE_DEFAULT:
++		break;
++	}
++
++skip_usb_state:
++	switch (FIELD_GET(FUSB303B_STATUS_BC_LVL, status)) {
++	case BC_LVL_3_0A:
++		mode = TYPEC_PWR_MODE_3_0A;
++		mA = 3000;
++		break;
++	case BC_LVL_1_5A:
++		mode = TYPEC_PWR_MODE_1_5A;
++		mA = 1500;
++		break;
++	default:
++		mode = TYPEC_PWR_MODE_USB;
++		break;
++	}
++
++	typec_set_pwr_opmode(chip->port, mode);
++
++	if (mA >= 1500)
++		goto done;
++
++skip_typec:
++	switch (chip->usbphy->chg_type) {
++	case DCP_TYPE:
++		fallthrough;
++	case CDP_TYPE:
++		mA = 1500;
++		break;
++	default:
++		break;
++	}
++
++done:
++	cable_issue = FIELD_GET(FUSB303B_STATUS_ORIENT, status) == ORIENT_FAULT ||
++		      FIELD_GET(FUSB303B_STATUS_ORIENT, status) == ORIENT_UNRESOLVED;
++	if (cable_issue && mA > 500) {
++		dev_warn(chip->dev, "Current reduced to 500mA due to bad cable\n");
++		mA = 500;
++	}
++
++	dev_info(chip->dev, "Adjusting USB current to %dmA\n", mA);
++	fusb303b_set_charging_current(chip, mA);
++}
++
++static void fusb303b_negotiate_entry_work(struct work_struct *work)
++{
++	struct fusb303b *chip = container_of(work, struct fusb303b,
++					     negotiate_entry_work);
++
++	cancel_delayed_work_sync(&chip->negotiate_work);
++
++	fusb303b_set_charging_current(chip, chip->usb_safe_current_ma);
++
++	schedule_delayed_work(&chip->negotiate_work,
++			      msecs_to_jiffies(USB_DEBOUNCE_DURATION_MS));
++}
++
++static void fusb303b_queue_charging_negotiation(struct fusb303b *chip)
++{
++	schedule_work(&chip->negotiate_entry_work);
++}
++
++static ssize_t queue_charging_negotiation_store(struct device *dev,
++						struct device_attribute *attr,
++						const char *buf, size_t count)
++{
++	struct fusb303b *chip = dev_get_drvdata(dev);
++
++	fusb303b_queue_charging_negotiation(chip);
++
++	return count;
++}
++
++static DEVICE_ATTR_WO(queue_charging_negotiation);
++
++static struct attribute *fusb303b_attrs[] = {
++	&dev_attr_queue_charging_negotiation.attr,
++	NULL,
++};
++
++static const struct attribute_group dev_attribute_group = {
++	.attrs = fusb303b_attrs,
++};
++
++static int fusb303b_vbus_switch(struct fusb303b *chip, bool on)
++{
++	union power_supply_propval propval;
++
++	propval.intval = on ? POWER_SUPPLY_MODE_OTG_SUPPLY :
++			      POWER_SUPPLY_MODE_CHARGER;
++
++	return power_supply_set_property(chip->vbus_psy,
++					 POWER_SUPPLY_PROP_CHARGER_MODE,
++					 &propval);
++}
++
++static void fusb303b_reset_vbus_switch_latch(struct fusb303b *chip)
++{
++	gpiod_set_value_cansleep(chip->vbus_switch_latch, 1);
++	gpiod_set_value_cansleep(chip->vbus_switch_latch, 0);
++}
++
++static int fusb303b_attach(struct fusb303b *chip)
++{
++	struct typec_partner_desc desc = { };
++	enum typec_data_role dr = TYPEC_DEVICE;
++	enum usb_role ur = USB_ROLE_DEVICE;
++	enum typec_role pr = TYPEC_SINK;
++	u32 type;
++	int ret;
++
++	regmap_read(chip->regmap, FUSB303B_TYPE, &type);
++
++	if (type & FUSB303B_TYPE_SOURCE) {
++		ret = fusb303b_vbus_switch(chip, true);
++		if (ret)
++			return ret;
++		chip->vbus_on = true;
++
++		pr = TYPEC_SOURCE;
++		dr = TYPEC_HOST;
++		ur = USB_ROLE_HOST;
++	}
++
++	if (type & (FUSB303B_TYPE_DEBUGSRC | FUSB303B_TYPE_DEBUGSNK))
++		desc.accessory = TYPEC_ACCESSORY_DEBUG;
++	else if (type & (FUSB303B_TYPE_AUDIOVBUS | FUSB303B_TYPE_AUDIO))
++		desc.accessory = TYPEC_ACCESSORY_AUDIO;
++	else
++		desc.accessory = TYPEC_ACCESSORY_NONE;
++
++	chip->accessory = desc.accessory;
++
++	/* Unregister the stale partner if there is one */
++	if (chip->partner)
++		typec_unregister_partner(chip->partner);
++
++	chip->partner = typec_register_partner(chip->port, &desc);
++	if (IS_ERR(chip->partner)) {
++		ret = PTR_ERR(chip->partner);
++		goto disable_vbus;
++	}
++
++	typec_set_pwr_role(chip->port, pr);
++	typec_set_data_role(chip->port, dr);
++	usb_role_switch_set_role(chip->role_sw, ur);
++
++	fusb303b_queue_charging_negotiation(chip);
++
++	return 0;
++
++disable_vbus:
++	if (chip->vbus_on) {
++		fusb303b_vbus_switch(chip, false);
++		chip->vbus_on = false;
++	}
++
++	return ret;
++}
++
++static void fusb303b_detach(struct fusb303b *chip)
++{
++	fusb303b_queue_charging_negotiation(chip);
++
++	usb_role_switch_set_role(chip->role_sw, USB_ROLE_NONE);
++	typec_set_data_role(chip->port, TYPEC_DEVICE);
++	typec_set_pwr_role(chip->port, TYPEC_SINK);
++
++	typec_unregister_partner(chip->partner);
++	chip->partner = NULL;
++
++	if (chip->vbus_on) {
++		fusb303b_vbus_switch(chip, false);
++		chip->vbus_on = false;
++	}
++
++	fusb303b_reset_vbus_switch_latch(chip);
++}
++
++static irqreturn_t fusb303b_irq_handler(int irq, void *data)
++{
++	struct fusb303b *chip = data;
++	u32 intr, intr1, type, status;
++
++	regmap_read(chip->regmap, FUSB303B_INTERRUPT, &intr);
++	/* Clear interrupts (w1c) */
++	if (intr)
++		regmap_write(chip->regmap, FUSB303B_INTERRUPT, intr);
++
++	regmap_read(chip->regmap, FUSB303B_INTERRUPT1, &intr1);
++	/* Clear interrupts (w1c) */
++	if (intr1)
++		regmap_write(chip->regmap, FUSB303B_INTERRUPT1, intr1);
++
++	regmap_read(chip->regmap, FUSB303B_TYPE, &type);
++	regmap_read(chip->regmap, FUSB303B_STATUS, &status);
++
++	dev_dbg(chip->dev, "intr 0x%x, intr1 0x%x, type 0x%x, status 0x%x\n",
++		intr, intr1, type, status);
++
++	if (intr & FUSB303B_INTERRUPT_ATTACH && status & FUSB303B_STATUS_ATTACH)
++		fusb303b_attach(chip);
++	else if (intr & FUSB303B_INTERRUPT_DETACH)
++		fusb303b_detach(chip);
++
++	if (intr & FUSB303B_INTERRUPT_BC_LVL)
++		fusb303b_queue_charging_negotiation(chip);
++
++	pm_wakeup_event(chip->dev, MSEC_PER_SEC);
++
++	return IRQ_HANDLED;
++}
++
++static void fusb303b_software_reset(struct fusb303b *chip)
++{
++	regmap_write(chip->regmap, FUSB303B_RESET, FUSB303B_RESET_SW_RES);
++
++	/* Table 9. tRESET, Soft Reset Duration, 100 mS */
++	msleep(100);
++}
++
++static int fusb303b_hw_init(struct fusb303b *chip, struct typec_capability *cap)
++{
++	enum fusb303b_portrole_type fpt;
++	u32 id, type;
++	int ret;
++
++	/*
++	 * Workaround to get stable USB connection
++	 * Without this reset, some USB host have problem to detect USB Ethernet gadget
++	 */
++	fusb303b_software_reset(chip);
++
++	/* Read device ID and TYPE for information */
++	ret = regmap_read(chip->regmap, FUSB303B_DEVICE_ID, &id);
++	if (ret) {
++		dev_err(chip->dev, "Failed to read Device ID: %d\n", ret);
++		return ret;
++	}
++
++	regmap_read(chip->regmap, FUSB303B_DEVICE_TYPE, &type);
++
++	dev_info(chip->dev, "ID 0x%x, TYPE 0x%x\n", id, type);
++
++	/* Global interrupt enabling */
++	regmap_update_bits(chip->regmap, FUSB303B_CONTROL,
++			   FUSB303B_CONTROL_INT_MASK, 0);
++
++	/* Needs an additinal enabling for I2C mode */
++	regmap_update_bits(chip->regmap, FUSB303B_CONTROL1,
++			   FUSB303B_CONTROL1_ENABLE,
++			   FUSB303B_CONTROL1_ENABLE);
++
++
++	switch (cap->type) {
++	case TYPEC_PORT_SRC:
++		fpt = PORTROLE_TYPE_SRC;
++		break;
++	case TYPEC_PORT_SNK:
++		fpt = PORTROLE_TYPE_SNK;
++		break;
++	case TYPEC_PORT_DRP:
++		fpt = PORTROLE_TYPE_DRP;
++		break;
++	}
++
++	/* When using USB-C to USB-C connection the portrole settings will
++	 * force a re-negotiation, and VBUS will drop for ~200ms. Skip setting
++	 * the portrole when no battery is connected to avoid reboot loop.
++	 */
++	if (!fusb303b_no_battery(chip)) {
++		regmap_update_bits(chip->regmap, FUSB303B_PORTROLE,
++				   FUSB303B_PORTROLE_AUDIOACC, 0);
++
++		regmap_update_bits(chip->regmap, FUSB303B_PORTROLE,
++				FUSB303B_PORTROLE_TYPE, fpt);
++	}
++
++	if (fpt == PORTROLE_TYPE_DRP) {
++		enum fusb303b_portrole_try try;
++
++		switch (cap->prefer_role) {
++		case TYPEC_SINK:
++			try = PORTROLE_TRY_SNK;
++			break;
++		case TYPEC_SOURCE:
++			try = PORTROLE_TRY_SRC;
++			break;
++		default:
++			try = PORTROLE_TRY_DISABLE;
++		}
++
++		regmap_update_bits(chip->regmap, FUSB303B_PORTROLE,
++				   FUSB303B_PORTROLE_TRY,
++				   FIELD_PREP(FUSB303B_PORTROLE_TRY, try));
++	}
++
++	return 0;
++}
++
++static int fusb303b_usbphy_ncb(struct notifier_block *nb, unsigned long val,
++			       void *priv)
++{
++	struct fusb303b *chip = container_of(nb, struct fusb303b, usbphy_nb);
++
++	fusb303b_queue_charging_negotiation(chip);
++
++	return NOTIFY_OK;
++}
++
++static const struct regmap_config fusb303b_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++};
++
++static int fusb303b_probe(struct i2c_client *client)
++{
++	struct typec_capability cap = { };
++	struct device_node *usbphy_node;
++	struct fusb303b *chip;
++	int ret;
++
++	chip = devm_kzalloc(&client->dev, sizeof(*chip), GFP_KERNEL);
++	if (!chip)
++		return -ENOMEM;
++
++	chip->dev = &client->dev;
++
++	if (of_property_read_u32(chip->dev->of_node,
++				 "usb-safe-current-ma",
++				 &chip->usb_safe_current_ma))
++		chip->usb_safe_current_ma = 100;
++
++	chip->regmap = devm_regmap_init_i2c(client, &fusb303b_regmap_config);
++	if (IS_ERR(chip->regmap))
++		return PTR_ERR(chip->regmap);
++
++	chip->en_gpio = devm_gpiod_get_optional(chip->dev, "enable",
++						GPIOD_OUT_HIGH);
++	if (IS_ERR(chip->en_gpio)) {
++		ret = PTR_ERR(chip->en_gpio);
++		dev_err(chip->dev, "Failed to get enable GPIO: %d\n", ret);
++		return ret;
++	}
++
++	/* fuelgauge phandle is optional */
++	if (of_property_present(chip->dev->of_node, "fuelgauge")) {
++		chip->fg_psy = devm_power_supply_get_by_reference(chip->dev, "fuelgauge");
++		if (IS_ERR(chip->fg_psy)) {
++			ret = PTR_ERR(chip->fg_psy);
++			dev_err(chip->dev, "Failed to get fuelgauge: %d\n", ret);
++			return ret;
++		}
++		if (!chip->fg_psy)
++			return dev_err_probe(chip->dev, -EPROBE_DEFER,
++					     "fuelgauge not ready\n");
++	}
++
++	chip->vbus_psy = devm_power_supply_get_by_reference(chip->dev,
++							  "vbus-power-supply");
++	if (IS_ERR(chip->vbus_psy)) {
++		ret = PTR_ERR(chip->vbus_psy);
++		dev_err(chip->dev, "Failed to get VBUS supply: %d\n", ret);
++		return ret;
++	}
++	if (!chip->vbus_psy)
++		return dev_err_probe(chip->dev, -EPROBE_DEFER, "VBUS supply not ready\n");
++
++	fusb303b_set_charging_current(chip, chip->usb_safe_current_ma);
++
++	usbphy_node = of_parse_phandle(chip->dev->of_node, "usb-phy", 0);
++	if (!usbphy_node) {
++		dev_err(chip->dev, "Failed to get usb-phy node\n");
++		return -ENODEV;
++	}
++
++	chip->usbphy_nb.notifier_call = fusb303b_usbphy_ncb;
++	chip->usbphy = devm_usb_get_phy_by_node(chip->dev, usbphy_node,
++						&chip->usbphy_nb);
++	of_node_put(usbphy_node);
++	if (IS_ERR(chip->usbphy)) {
++		ret = PTR_ERR(chip->usbphy);
++		dev_err(chip->dev, "Failed to get usb phy: %d\n", ret);
++		return ret;
++	}
++
++	cap.revision = USB_TYPEC_REV_1_3;
++	cap.type = TYPEC_PORT_DRP;
++	cap.data = TYPEC_PORT_DRD;
++	cap.prefer_role = TYPEC_SINK;
++	cap.ops = &fusb303b_ops;
++	cap.driver_data = chip;
++	cap.accessory[0] = TYPEC_ACCESSORY_DEBUG;
++	cap.accessory[1] = TYPEC_ACCESSORY_AUDIO;
++
++	cap.fwnode = device_get_named_child_node(chip->dev, "connector");
++	if (!cap.fwnode) {
++		dev_err(chip->dev, "Failed to get connector node\n");
++		return -ENODEV;
++	}
++
++	chip->role_sw = fwnode_usb_role_switch_get(cap.fwnode);
++	if (IS_ERR(chip->role_sw)) {
++		ret = PTR_ERR(chip->role_sw);
++		dev_err_probe(chip->dev, ret, "Failed to get usb role switch: %d\n", ret);
++		goto put_fwnode;
++	}
++
++	chip->port = typec_register_port(chip->dev, &cap);
++	if (IS_ERR(chip->port)) {
++		ret = PTR_ERR(chip->port);
++		dev_err(chip->dev, "Failed to register typec port: %d\n", ret);
++		goto put_role_sw;
++	}
++
++	/* optional */
++	typec_get_fw_cap(&cap, cap.fwnode);
++
++	ret = fusb303b_hw_init(chip, &cap);
++	if (ret)
++		goto unregister_port;
++
++	/*
++	 * Needs to go before irq call.  Otherwise the first pm_stay_awake()
++	 * call from fusb303b_attach() will be missed if the device boots up
++	 * with USB cable connected.
++	 */
++	device_init_wakeup(chip->dev, 1);
++
++	INIT_DELAYED_WORK(&chip->negotiate_work, fusb303b_negotiate_work);
++	INIT_WORK(&chip->negotiate_entry_work, fusb303b_negotiate_entry_work);
++
++	/*
++	 * FUSB303B is powered throughout reboot. Hence, it will not trigger any
++	 * new interrupts. Force a negotiation here to avoid being stuck at min
++	 * charging current if USB was connected during reboot.
++	 */
++	fusb303b_queue_charging_negotiation(chip);
++
++	ret = sysfs_create_group(&chip->dev->kobj, &dev_attribute_group);
++	if (ret) {
++		dev_err(chip->dev, "Failed to create sysfs group\n");
++		goto unregister_port;
++	}
++
++	ret = devm_request_threaded_irq(chip->dev, client->irq, NULL,
++					fusb303b_irq_handler, IRQF_ONESHOT,
++					dev_name(chip->dev), chip);
++	if (ret) {
++		dev_err(chip->dev, "Failed to register irq: %d\n", ret);
++		goto unregister_port;
++	}
++
++	chip->vbus_switch_latch = devm_gpiod_get_optional(chip->dev, "vbus-switch-latch", 0);
++	if (IS_ERR(chip->vbus_switch_latch))
++		dev_warn(chip->dev, "vbus_switch_latch GPIO fault (%ld)\n",
++			 PTR_ERR(chip->vbus_switch_latch));
++
++	fusb303b_reset_vbus_switch_latch(chip);
++
++	i2c_set_clientdata(client, chip);
++
++	fwnode_handle_put(cap.fwnode);
++
++	return 0;
++
++unregister_port:
++	typec_unregister_port(chip->port);
++put_role_sw:
++	usb_role_switch_put(chip->role_sw);
++put_fwnode:
++	fwnode_handle_put(cap.fwnode);
++	return ret;
++}
++
++static void fusb303b_remove(struct i2c_client *client)
++{
++	struct fusb303b *chip = i2c_get_clientdata(client);
++
++	cancel_work_sync(&chip->negotiate_entry_work);
++	cancel_delayed_work_sync(&chip->negotiate_work);
++
++	sysfs_remove_group(&chip->dev->kobj, &dev_attribute_group);
++
++	typec_unregister_port(chip->port);
++	usb_role_switch_put(chip->role_sw);
++}
++
++static int __maybe_unused fusb303b_suspend(struct device *dev)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++	struct fusb303b *chip = i2c_get_clientdata(client);
++
++	if (device_may_wakeup(dev))
++		enable_irq_wake(client->irq);
++
++	disable_irq(client->irq);
++	chip->irq_disabled_by_pm = true;
++
++	cancel_work_sync(&chip->negotiate_entry_work);
++	cancel_delayed_work_sync(&chip->negotiate_work);
++
++	return 0;
++}
++
++/*
++ * Re-enable the IRQ in the PM complete callback instead of in resume, to avoid
++ * the "parent port0 should not be sleeping" warning from device_pm_add().
++ *
++ * During dpm_resume(), device_resume(fusb303b) runs before device_resume(port0)
++ * (parent before child). If enable_irq() fires a pending IRQ at that point, the
++ * threaded handler calls typec_register_partner() -> device_pm_add(), which
++ * warns because port0->power.is_prepared is still true.
++ *
++ * dpm_complete() processes devices in child-before-parent order and clears
++ * is_prepared before invoking each complete() callback. By the time
++ * fusb303b_complete() runs, port0->power.is_prepared is already false, so the
++ * partner registration is safe.
++ */
++static void __maybe_unused fusb303b_complete(struct device *dev)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++	struct fusb303b *chip = dev_get_drvdata(dev);
++
++	if (!chip->irq_disabled_by_pm)
++		return;
++
++	chip->irq_disabled_by_pm = false;
++	enable_irq(client->irq);
++
++	if (device_may_wakeup(dev))
++		disable_irq_wake(client->irq);
++}
++
++static const struct dev_pm_ops fusb303b_pm_ops = {
++	.complete = fusb303b_complete,
++	SET_SYSTEM_SLEEP_PM_OPS(fusb303b_suspend, NULL)
++};
++
++static const struct of_device_id fusb303b_of_match[] = {
++	{ .compatible = "onnn,fusb303b" },
++	{ },
++};
++MODULE_DEVICE_TABLE(of, fusb303b_of_match);
++
++static struct i2c_driver fusb303b_driver = {
++	.driver = {
++		.name = "fusb303b",
++		.pm = &fusb303b_pm_ops,
++		.of_match_table = fusb303b_of_match,
++	},
++	.probe = fusb303b_probe,
++	.remove = fusb303b_remove,
++};
++module_i2c_driver(fusb303b_driver);
++
++MODULE_DESCRIPTION("ON Semiconductor FUSB303B Type-C Port Controller driver");
++MODULE_LICENSE("GPL v2");

@@ -1,0 +1,1927 @@
+From f2daed2e11938a17018ae73189334d4de5be5436 Mon Sep 17 00:00:00 2001
+From: gitman-101111 <development@spamfolder.xyz>
+Date: Mon, 12 Oct 2026 10:23:08 -0600
+Subject: [PATCH] Input: add the Elan SPI touch and pen controller
+
+SPI variant of the Elan touch controller as used by reMarkable, serving
+both finger touch and the electromagnetic pen (with its own resolution,
+pressure and tilt reporting, and a battery power supply for the marker).
+Ported from reMarkable's linux-imx-rm 6.12 tree; the i.MX bus-frequency
+boost calls are dropped.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/input/touchscreen/Kconfig      |   12 +
+ drivers/input/touchscreen/Makefile     |    1 +
+ drivers/input/touchscreen/elants_spi.c | 1816 ++++++++++++++++++++++++
+ include/trace/events/elants_spi.h      |   43 +
+ 4 files changed, 1872 insertions(+)
+ create mode 100644 drivers/input/touchscreen/elants_spi.c
+ create mode 100644 include/trace/events/elants_spi.h
+
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+index 9b9ae8ac3..6da474b43 100644
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -370,6 +370,18 @@ config TOUCHSCREEN_EXC3000
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called exc3000.
+ 
++config TOUCHSCREEN_ELAN_SPI
++	tristate "ELAN touchscreen SPI input driver"
++	depends on SPI
++	help
++	  Say Y here if you have an SPI ELAN touchscreen
++	  attached.
++
++	  If unsure, say N.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called elants_spi.
++
+ config TOUCHSCREEN_FUJITSU
+ 	tristate "Fujitsu serial touchscreen"
+ 	select SERIO
+diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
+index bfd9de833..79a880b03 100644
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -39,6 +39,7 @@ obj-$(CONFIG_TOUCHSCREEN_GUNZE)		+= gunze.o
+ obj-$(CONFIG_TOUCHSCREEN_EETI)		+= eeti_ts.o
+ obj-$(CONFIG_TOUCHSCREEN_EKTF2127)	+= ektf2127.o
+ obj-$(CONFIG_TOUCHSCREEN_ELAN)		+= elants_i2c.o
++obj-$(CONFIG_TOUCHSCREEN_ELAN_SPI)	+= elants_spi.o
+ obj-$(CONFIG_TOUCHSCREEN_ELO)		+= elo.o
+ obj-$(CONFIG_TOUCHSCREEN_EGALAX)	+= egalax_ts.o
+ obj-$(CONFIG_TOUCHSCREEN_EGALAX_SERIAL)	+= egalax_ts_serial.o
+diff --git a/drivers/input/touchscreen/elants_spi.c b/drivers/input/touchscreen/elants_spi.c
+new file mode 100644
+index 000000000..e4b143cf0
+--- /dev/null
++++ b/drivers/input/touchscreen/elants_spi.c
+@@ -0,0 +1,1816 @@
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// ELAN touch controller driver for touch and marker input
++//
++// Copyright (C) 2023 reMarkable AS - http://www.remarkable.com/
++
++#include <linux/spi/spi.h>
++#include <linux/input/mt.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/gpio.h>
++#include <linux/errno.h>
++#include <linux/of.h>
++#include <linux/pm_wakeirq.h>
++#include <linux/pm_runtime.h>
++#include <linux/iopoll.h>
++#include <linux/regulator/consumer.h>
++#include <linux/firmware.h>
++#include <linux/unaligned.h>
++#include <linux/power_supply.h>
++#include <linux/miscdevice.h>
++
++struct marker_packet {
++	bool in_range;
++	bool tip;
++	bool barrel;
++	bool invert;
++	bool eraser;
++	bool second_barrel;
++	bool reserved;
++	uint16_t x;
++	uint16_t y;
++	uint16_t pressure;
++	uint8_t battery;
++	int16_t tilt_x;
++	int16_t tilt_y;
++	uint8_t tx1_intensity;
++	uint8_t tx2_intensity;
++	uint16_t gid[6];
++	uint16_t vendor_data;
++};
++
++#define CREATE_TRACE_POINTS
++#include <trace/events/elants_spi.h>
++
++#define ELAN_FW_PAGESIZE		132
++#define FW_PAGE_REWRITE_RETRY		3
++#define FW_PAGE_WRITE_TIMEOUT_US	5000
++
++#define FINGER_NUM			10
++
++#define HEADER_SIZE			4
++#define PACKET_SIZE			42
++#define PACKET_TYPE_MARKER		0x07
++#define PACKET_TYPE_TOUCH		0x62
++#define PACKET_TYPE_HELLO		0x55
++#define PACKET_TYPE_CALIB		0x66
++#define PACKET_TYPE_FINGER_WAKEUP	0x42
++#define PACKET_TYPE_NO_PACKET		0xFF
++
++#define PACKET_MARKER_CHECKSUM_FIELD 41
++#define PACKET_TOUCH_CHECKSUM_FIELD  34
++
++#define ELAN_RESET_DELAY_MSEC		20
++#define AUTOSUSPEND_DELAY		2000
++#define ELAN_CMD_TIMEOUT_US		10000
++#define ELAN_BOOT_READ_TIMEOUT_US	100000
++// trial and error up to 210-220ms, set 300ms.
++#define ELAN_CALIBRATE_TIMEOUT_US	300000
++#define ELAN_RETRY_ATTEMPTS		3
++#define ELAN_DEFAULT_IDLE_RATE		30
++
++#define ELAN_IOCTLID	0xD0
++#define IOCTL_RESET  _IOR(ELAN_IOCTLID, 4, int)
++#define IOCTL_IAP_MODE_LOCK  _IOR(ELAN_IOCTLID, 5, int)
++#define IOCTL_IAP_MODE_UNLOCK  _IOR(ELAN_IOCTLID, 12, int)
++#define IOCTL_I2C_INT  _IOR(ELAN_IOCTLID, 13, int)
++
++struct elants_spi_fw_info {
++	int fw_ver;
++	int fw_id;
++	int rx;
++	int tx;
++	int touch_x_res;
++	int touch_y_res;
++	int marker_x_res;
++	int marker_y_res;
++};
++
++struct elants_data {
++	struct spi_device *spi;
++	int spi_max_speed_hz;
++	int spi_comm_speed_hz;
++	struct input_dev *input_touch;
++	struct input_dev *input_marker;
++	uint16_t fw_version;
++	uint16_t fw_file_version;
++	uint16_t fw_file_id;
++	uint32_t fw_file_ver_offset;
++	uint32_t fw_file_id_offset;
++	const char *fw_name;
++	int mode; /* 0: normal, 1: recovery */
++	bool idle_mode;
++	struct power_supply *battery;
++	bool marker_in_range;
++	bool marker_in_contact;
++	uint8_t marker_capacity;
++	struct regulator *vcc33;
++	struct elants_spi_fw_info fw_info;
++	struct gpio_desc *irq_gpio;
++	struct gpio_desc *reset_gpio;
++	bool flip_pos_x;
++	bool flip_pos_y;
++	bool swap_axes;
++	bool inverted_tilt;
++	uint8_t sensor_pitch; /* mm per channel (x10) */
++	int idle_rate;
++	uint16_t gid[6];
++	uint16_t vendor_data;
++	const char *marker_model;
++	struct miscdevice elants_dev;
++};
++
++static inline int elants_spi_read_locked(struct spi_device *spi, void *buf, size_t len)
++{
++	struct spi_message msg;
++	struct spi_transfer t = {
++		.rx_buf = buf,
++		.len = len,
++	};
++
++	spi_message_init_with_transfers(&msg, &t, 1);
++
++	return spi_sync_locked(spi, &msg);
++}
++
++static inline int elants_spi_write_locked(struct spi_device *spi, const void *buf, size_t len)
++{
++	struct spi_message msg;
++	struct spi_transfer t = {
++		.tx_buf = buf,
++		.len = len,
++	};
++
++	spi_message_init_with_transfers(&msg, &t, 1);
++
++	return spi_sync_locked(spi, &msg);
++}
++
++static int elants_set_idle_mode_locked(struct elants_data *ts, bool enable)
++{
++	int err;
++	uint8_t cmd_idle_mode[] = {0x54, 0x2C, 0x00, 0x00, 0x00, 0x00};
++
++	if (enable)
++		cmd_idle_mode[2] = 0x2;
++
++	err = elants_spi_write_locked(ts->spi, cmd_idle_mode, sizeof(cmd_idle_mode));
++	if (err)
++		return err;
++
++	ts->idle_mode = enable;
++	return 0;
++}
++
++static int elants_set_idle_mode(struct elants_data *ts, bool enable)
++{
++	int err;
++
++	spi_bus_lock(ts->spi->controller);
++	err = elants_set_idle_mode_locked(ts, enable);
++	spi_bus_unlock(ts->spi->controller);
++
++	return err;
++}
++
++static int elants_spi_write_then_read(struct elants_data *ts, const uint8_t *txbuf,
++				      const int txlen, uint8_t *rxbuf, const int rxlen,
++				      const int timeout)
++{
++	int error = 0;
++	int tries = ELAN_RETRY_ATTEMPTS;
++	int pstatus;
++
++	spi_bus_lock(ts->spi->controller);
++
++	if (ts->idle_mode) {
++		error = elants_set_idle_mode_locked(ts, false);
++		if (error)
++			goto out;
++	}
++
++retry:
++	--tries;
++
++	error = elants_spi_write_locked(ts->spi, txbuf, txlen);
++	if (error)
++		goto out;
++
++	if (rxbuf) {
++		error = read_poll_timeout(gpiod_get_value_cansleep, pstatus, pstatus == 1,
++					  (timeout >> 8), timeout, 0, ts->irq_gpio);
++		if (error == -ETIMEDOUT) {
++			if (tries > 0) {
++				dev_info(&ts->spi->dev,
++					 "write_then_read timed out. Attempts left: %d. Retrying...\n",
++					 tries);
++				goto retry;
++			}
++		}
++		if (error)
++			goto out;
++
++		error = elants_spi_read_locked(ts->spi, rxbuf, rxlen);
++		if (error)
++			goto out;
++	}
++
++out:
++	spi_bus_unlock(ts->spi->controller);
++
++	return error;
++}
++
++static int elants_get_idle_rate(struct elants_data *ts)
++{
++	int error;
++	uint8_t rbuf[6];
++	const uint8_t cmd_idle_rate[6] = {0x53, 0xC3, 0x00, 0x00, 0x00, 0x00};
++
++	error = elants_spi_write_then_read(ts, cmd_idle_rate, sizeof(cmd_idle_rate),
++					   rbuf, sizeof(rbuf), ELAN_CMD_TIMEOUT_US);
++	if (error) {
++		dev_err(&ts->spi->dev, "get idle rate failed: %d\n", error);
++		return error;
++	}
++
++	ts->idle_rate = (rbuf[2] << 8) + rbuf[3];
++	return 0;
++}
++
++static int elants_set_idle_rate(struct elants_data *ts, uint16_t idle_rate)
++{
++	uint8_t cmd_idle_rate[] = {0x54, 0xC3, 0x00, 0x00, 0x00, 0x00};
++
++	cmd_idle_rate[2] = idle_rate << 8;
++	cmd_idle_rate[3] = idle_rate & 0xff;
++
++	return elants_spi_write_then_read(ts, cmd_idle_rate, sizeof(cmd_idle_rate),
++				   NULL, 0, ELAN_CMD_TIMEOUT_US);
++}
++
++static int elants_set_palm_reject(struct elants_data *ts, bool enable)
++{
++	uint8_t cmd_palm_reject[] = {0x54, 0xC1, 0x13, 0x10, 0x00, 0x00};
++
++	if (enable)
++		cmd_palm_reject[3] = 0x18;
++
++	return elants_spi_write_then_read(ts, cmd_palm_reject, sizeof(cmd_palm_reject),
++				   NULL, 0, ELAN_CMD_TIMEOUT_US);
++}
++
++static int elants_get_palm_reject(struct elants_data *ts, bool *enabled)
++{
++	int error;
++	uint8_t rbuf[6];
++	const uint8_t cmd_palm_reject[6] = {0x53, 0xC1, 0x00, 0x01, 0x00, 0x00};
++
++	error = elants_spi_write_then_read(ts, cmd_palm_reject, sizeof(cmd_palm_reject),
++					   rbuf, sizeof(rbuf), ELAN_CMD_TIMEOUT_US);
++	if (error) {
++		dev_err(&ts->spi->dev, "get palm reject failed: %d\n", error);
++		return error;
++	}
++
++	*enabled = (rbuf[3] == 0x18) ? true : false;
++
++	return 0;
++}
++
++static int elants_get_info(struct elants_data *ts)
++{
++	int error;
++	struct device *dev = &ts->spi->dev;
++	const uint8_t cmd_ver[6] = {0x53, 0x00, 0x00, 0x01, 0x00, 0x00};
++	const uint8_t cmd_id[6] = {0x53, 0xf0, 0x00, 0x01, 0x00, 0x00};
++	uint8_t rbuf[6] = {0x00};
++	int major;
++	int minor;
++	struct elants_spi_fw_info *fw_info = &ts->fw_info;
++	int len_ack_53 = 6;
++
++	error = elants_spi_write_then_read(ts, cmd_id, sizeof(cmd_id),
++				    rbuf, len_ack_53, ELAN_CMD_TIMEOUT_US);
++	if (error) {
++		dev_err(dev, "get fw id failed\n");
++		return error;
++	}
++	major = ((rbuf[1] & 0x0f) << 4) | ((rbuf[2] & 0xf0) >> 4);
++	minor = ((rbuf[2] & 0x0f) << 4) | ((rbuf[3] & 0xf0) >> 4);
++	fw_info->fw_id = major << 8 | minor;
++
++	error = elants_spi_write_then_read(ts, cmd_ver, sizeof(cmd_ver),
++				    rbuf, len_ack_53, ELAN_CMD_TIMEOUT_US);
++	if (error) {
++		dev_err(dev, "get fw version faile\n");
++		return error;
++	}
++	major = ((rbuf[1] & 0x0f) << 4) | ((rbuf[2] & 0xf0) >> 4);
++	minor = ((rbuf[2] & 0x0f) << 4) | ((rbuf[3] & 0xf0) >> 4);
++
++	fw_info->fw_ver =  major << 8 | minor;
++	dev_info(dev, "version: %04x\n", fw_info->fw_ver);
++
++	error = elants_get_idle_rate(ts);
++	if (error)
++		return error;
++
++	return 0;
++}
++
++static int elants_check_status(struct elants_data *ts)
++{
++	int error;
++	struct device *dev = &ts->spi->dev;
++	unsigned char rxbuf[4] = {0};
++	uint8_t normal[4] = {0x55, 0x55, 0x55, 0x55};
++	uint8_t recovery[4] = {0x55, 0x55, 0x80, 0x80};
++	int pstatus;
++
++	error = read_poll_timeout(gpiod_get_value_cansleep, pstatus, pstatus == 1,
++				  500, ELAN_BOOT_READ_TIMEOUT_US, 0, ts->irq_gpio);
++	if (error) {
++		dev_err(dev, "%s failed polling int\n", __func__);
++		return error;
++	}
++
++	error = spi_read(ts->spi, rxbuf, 4);
++	if (error) {
++		dev_err(dev, "%s error\n", __func__);
++		return error;
++	}
++
++	if (memcmp(rxbuf, normal, 4) == 0) {
++		ts->mode = 0;
++		dev_info(dev, "normal mode\n");
++	} else if (memcmp(rxbuf, recovery, 4) == 0) {
++		dev_info(dev, "recovery mode\n");
++		ts->mode = 1;
++	} else {
++		dev_err(dev, "unknown mode. SPI device not found\n");
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
++static int elants_init(struct elants_data *ts)
++{
++	int error;
++	struct device *dev = &ts->spi->dev;
++
++	error = elants_check_status(ts);
++	if (error) {
++		dev_err(dev, "error check status: %d\n", error);
++		return error;
++	}
++
++	error = elants_set_idle_rate(ts, ts->idle_rate);
++	if (error) {
++		dev_err(dev, "error setting idle_rate: %d\n", error);
++		return error;
++	}
++
++	error = elants_get_info(ts);
++	if (error) {
++		dev_err(dev, "error get info: %d\n", error);
++		return error;
++	}
++
++	return 0;
++}
++
++static void elants_reset(struct elants_data *ts)
++{
++	gpiod_set_value(ts->reset_gpio, 1);
++	mdelay(1);
++	gpiod_set_value(ts->reset_gpio, 0);
++	mdelay(1);
++}
++
++static int elants_spi_locked_check_ack(struct elants_data *ts, char *rbuf,
++				       const char *ackbuf, int read_len, int ack_len)
++{
++	int error;
++	unsigned char *rxbuf;
++
++	rxbuf = kmalloc_array(read_len, 8, GFP_KERNEL);
++
++	error = elants_spi_read_locked(ts->spi, rxbuf, read_len);
++	if (error)
++		goto end;
++
++	error = memcmp(ackbuf, rxbuf, ack_len);
++	memcpy(rbuf, rxbuf, read_len);
++end:
++	kfree(rxbuf);
++	return error;
++}
++
++static int elants_calibrate(struct elants_data *ts)
++{
++	int error;
++	struct device *dev = &ts->spi->dev;
++	static const u8 w_flashkey[] = { 0x54, 0xC0, 0xE1, 0x5A, 0x00, 0x00 };
++	static const u8 rek[] = { 0x54, 0x29, 0x00, 0x01, 0x00, 0x00 };
++	static const u8 rek_resp[] = { 0x66, 0x66, 0x66, 0x66 };
++	char *rbuf;
++
++	rbuf = kmalloc(sizeof(unsigned char) * sizeof(rek_resp), GFP_KERNEL);
++
++	error = elants_spi_write_then_read(ts, w_flashkey, sizeof(w_flashkey),
++				    NULL, 0, ELAN_CMD_TIMEOUT_US);
++	if (error)
++		dev_err(dev, "send flash key failed: %d\n", error);
++
++	usleep_range(5000, 10000);
++
++	error = elants_spi_write_then_read(ts, rek, sizeof(rek),
++				    rbuf, sizeof(rek_resp), ELAN_CALIBRATE_TIMEOUT_US);
++	if (error) {
++		dev_err(dev, "send calibrate failed: %d\n", error);
++		goto end;
++	}
++
++	error = memcmp(rek_resp, rbuf, sizeof(rek_resp));
++	if (error)
++		dev_err(dev, "unexpected calibration response: %*ph\n",
++			(int)sizeof(rek_resp), rbuf);
++
++end:
++	kfree(rbuf);
++
++	return error;
++}
++
++static int elants_spi_locked_enter_isp(struct elants_data *ts, bool recovery_isp)
++{
++	int error;
++	unsigned char enter_isp_cmd[4] = {0x45, 0x49, 0x41, 0x50};
++	unsigned char enter_recovery_isp_cmd[4] = {0x54, 0x00, 0x12, 0x34};
++
++	if (recovery_isp)
++		memcpy(enter_isp_cmd, enter_recovery_isp_cmd, 4);
++
++	error = elants_spi_write_locked(ts->spi, enter_isp_cmd, sizeof(enter_isp_cmd));
++	if (error)
++		return error;
++
++	return 0;
++}
++
++static int elants_spi_locked_validate_remark_id(struct elants_data *ts, const struct firmware *fw)
++{
++	int error;
++	int pstatus;
++	int tries = ELAN_RETRY_ATTEMPTS;
++	struct device *dev = &ts->spi->dev;
++	const u8 query_remark_id_cmd[] = { 0x96, 0x80, 0x1F, 0x00, 0x00, 0x21 };
++	uint8_t resp[6];
++	uint16_t ts_remark_id;
++	uint16_t fw_remark_id;
++
++retry:
++	--tries;
++
++	error = elants_spi_write_locked(ts->spi, query_remark_id_cmd, sizeof(query_remark_id_cmd));
++	if (error)
++		return error;
++
++	error = read_poll_timeout(gpiod_get_value_cansleep, pstatus, pstatus == 1,
++				  50, ELAN_CMD_TIMEOUT_US, 0, ts->irq_gpio);
++	if (error == -ETIMEDOUT) {
++		if (tries > 0) {
++			dev_info(&ts->spi->dev,
++				 "validate_remark_id timed out. Attempts left: %d. Retrying...\n",
++				 tries);
++			goto retry;
++		}
++	}
++	if (error)
++		return error;
++
++	error = elants_spi_read_locked(ts->spi, resp, sizeof(resp));
++	if (error)
++		return error;
++
++	ts_remark_id = get_unaligned_be16(&resp[3]);
++	fw_remark_id = get_unaligned_le16(&fw->data[fw->size - 4]);
++	if (fw_remark_id != ts_remark_id) {
++		dev_err(dev, "remark id mismatch: ts=0x%04x, fw=0x%04x\n",
++			ts_remark_id, fw_remark_id);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int elants_get_fw_file_info(struct elants_data *ts, const struct firmware *fw)
++{
++	uint32_t ver_idx = ts->fw_file_ver_offset;
++	uint32_t id_idx = ts->fw_file_id_offset;
++
++	if (fw->size <= (id_idx + 1))
++		return -EINVAL;
++
++	ts->fw_file_version = (fw->data[ver_idx + 1] << 8) + fw->data[ver_idx];
++	ts->fw_file_id = (fw->data[id_idx + 1] << 8) + fw->data[id_idx];
++
++	return 0;
++}
++
++static int elants_firmware_update(struct elants_data *ts)
++{
++	int error;
++	int pstatus;
++	int i;
++	char *rbuf;
++	struct device *dev = &ts->spi->dev;
++	const char iap_page_ack[] = {0xAA, 0xAA};
++	unsigned char dummy_cmd[1] = {0x10};
++	const struct firmware *fw = NULL;
++	const u8 *fw_data;
++	unsigned char *fw_page_data;
++	int fw_size;
++	int fw_pagenum;
++	int fw_page_rewrite_cnt = 0;
++
++	rbuf = kmalloc(sizeof(unsigned char) * sizeof(iap_page_ack), GFP_KERNEL);
++	fw_page_data = kmalloc(sizeof(unsigned char) * ELAN_FW_PAGESIZE, GFP_KERNEL);
++
++	if (pm_runtime_enabled(dev)) {
++		pm_runtime_disable(dev);
++		error = elants_set_idle_mode(ts, false);
++		if (error)
++			goto out;
++	}
++
++	disable_irq(ts->spi->irq);
++
++	error = request_firmware(&fw, ts->fw_name, dev);
++	if (error) {
++		dev_err(dev, "%s: request_firmware fail, ret=%d\n", __func__, error);
++		goto out;
++	}
++
++	error = elants_get_fw_file_info(ts, fw);
++	if (error) {
++		dev_err(dev, "failed to read fw file version: %d\n", error);
++		goto out;
++	}
++
++	if ((ts->fw_info.fw_id != ts->fw_file_id) || (ts->fw_file_version == ts->fw_info.fw_ver)) {
++		dev_info(dev, "fw current: 0x%04x, file: 0x%04x, id: 0x%04x\n",
++			 ts->fw_info.fw_ver, ts->fw_file_version, ts->fw_file_id);
++
++		/* Some early firmwares has fw id set to 0x0.
++		 * Support upgrading of such firmwares.
++		 */
++		if (!ts->fw_info.fw_id)
++			dev_warn(dev, "broken firmware id detected - allowing firmware update\n");
++		else if (!ts->mode)
++			goto out;
++
++		/* We don't have valid fw version/id if current TS firmware is
++		 * broken and TS is in recovery mode, force update to recover.
++		 */
++		dev_warn(dev, "forcing firmware update in recovery mode\n");
++	}
++
++	fw_data = fw->data;
++	fw_size = fw->size;
++	fw_pagenum = (fw_size/sizeof(uint8_t)/ELAN_FW_PAGESIZE);
++
++	if (fw_size % ELAN_FW_PAGESIZE) {
++		dev_err(dev, "invalid firmware length: %zu\n", fw->size);
++		error = -EINVAL;
++		goto out;
++	}
++
++	ts->spi->max_speed_hz = ts->spi_comm_speed_hz;
++
++	spi_bus_lock(ts->spi->controller);
++
++	if (!ts->mode) {
++		elants_reset(ts);
++		msleep(30);
++	}
++
++	error = elants_spi_locked_validate_remark_id(ts, fw);
++	if (error) {
++		dev_err(dev, "%s: validate remark id failed: %d\n", __func__, error);
++		goto end;
++	}
++
++	error = elants_spi_locked_enter_isp(ts, ts->mode);
++	if (error)
++		goto end;
++
++	usleep_range(2000, 8000);
++
++	error = elants_spi_write_locked(ts->spi, dummy_cmd,  sizeof(dummy_cmd));
++	if (error)
++		goto end;
++
++	ts->spi->max_speed_hz = ts->spi_max_speed_hz;
++
++retry:
++	for (i = 0; i < fw_pagenum; i++) {
++		memcpy(fw_page_data, fw_data + i*ELAN_FW_PAGESIZE, ELAN_FW_PAGESIZE);
++
++		error = elants_spi_write_locked(ts->spi, fw_page_data, ELAN_FW_PAGESIZE);
++		if (error) {
++			dev_err(dev, "%s: IAP write page fail\n", __func__);
++			goto retry;
++		}
++
++		error = read_poll_timeout(gpiod_get_value_cansleep, pstatus, pstatus == 1,
++					  50, FW_PAGE_WRITE_TIMEOUT_US, 0, ts->irq_gpio);
++		if (error) {
++			dev_err(dev, "error polling interrupt: %d\n", error);
++			goto end;
++		}
++
++		error = elants_spi_locked_check_ack(ts, rbuf, iap_page_ack,
++					  sizeof(iap_page_ack), sizeof(iap_page_ack));
++		if (error) {
++			fw_page_rewrite_cnt++;
++			dev_err(dev, "page %d: page_ack failed %d times, (0x%02x 0x%02x)\n",
++				i, fw_page_rewrite_cnt, rbuf[0], rbuf[1]);
++			if (fw_page_rewrite_cnt == FW_PAGE_REWRITE_RETRY)
++				goto end;
++			else
++				goto retry;
++		}
++	}
++
++end:
++	spi_bus_unlock(ts->spi->controller);
++
++	if (error)
++		dev_err(dev, "fw update failed: %d\n", error);
++
++	elants_reset(ts);
++	msleep(ELAN_RESET_DELAY_MSEC);
++
++	error = elants_init(ts);
++	if (error)
++		dev_err(dev, "failed init: %d\n", error);
++
++	if (!error) {
++		msleep(50);
++		error = elants_calibrate(ts);
++		if (error)
++			dev_err(dev, "calibrate error: %d\n", error);
++	}
++
++out:
++	enable_irq(ts->spi->irq);
++
++	if (fw != NULL)
++		release_firmware(fw);
++
++	pm_runtime_enable(dev);
++
++	ts->spi->max_speed_hz = ts->spi_max_speed_hz;
++	kfree(rbuf);
++	kfree(fw_page_data);
++
++	return error;
++}
++
++static ssize_t fw_version_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%04x\n", ts->fw_info.fw_ver);
++}
++
++static ssize_t gid_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%04x %04x %04x %04x %04x %04x\n",
++			  ts->gid[0], ts->gid[1], ts->gid[2], ts->gid[3], ts->gid[4], ts->gid[5]);
++}
++
++static ssize_t vendor_data_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%04x\n", ts->vendor_data);
++}
++
++static ssize_t firmware_update_store(struct device *dev, struct device_attribute *attr,
++				     const char *buf, size_t count)
++{
++	int error;
++	struct elants_data *ts = dev_get_drvdata(dev);
++
++	error = elants_firmware_update(ts);
++	if (error)
++		dev_err(dev, "firmware update failed: %d\n", error);
++	else
++		dev_info(dev, "firmware update finished\n");
++
++	return count;
++}
++
++static ssize_t calibrate_store(struct device *dev, struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	int error;
++	struct elants_data *ts = dev_get_drvdata(dev);
++
++	disable_irq(ts->spi->irq);
++
++	error = elants_calibrate(ts);
++	if (error)
++		dev_err(dev, "calibrate command failed: %d\n", error);
++
++	enable_irq(ts->spi->irq);
++
++	return count;
++}
++
++static ssize_t idle_rate_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++	int error;
++
++	error = elants_get_idle_rate(ts);
++	if (error)
++		return sysfs_emit(buf, "err %d\n", error);
++
++	return sysfs_emit(buf, "%d\n", ts->idle_rate);
++}
++
++static ssize_t idle_rate_store(struct device *dev, struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++	unsigned int idle_rate;
++	int error;
++
++	error = kstrtouint(buf, 10, &idle_rate);
++	if (error)
++		return error;
++
++	error = elants_set_idle_rate(ts, (uint16_t) idle_rate);
++	if (error)
++		return error;
++
++	ts->idle_rate = idle_rate;
++	return count;
++}
++
++static ssize_t idle_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", ts->idle_mode);
++}
++
++static ssize_t idle_mode_store(struct device *dev, struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++	int error;
++	bool enable;
++
++	error = kstrtobool(buf, &enable);
++	if (error)
++		return error;
++
++	error = elants_set_idle_mode(ts, enable);
++	if (error)
++		return error;
++
++	return count;
++}
++
++static ssize_t palm_reject_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++	int error;
++	bool enabled;
++
++	error = elants_get_palm_reject(ts, &enabled);
++	if (error)
++		return error;
++
++	return sysfs_emit(buf, "%d\n", enabled);
++}
++
++static ssize_t palm_reject_store(struct device *dev, struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++	unsigned int palm_reject;
++	int error;
++
++	error = kstrtouint(buf, 10, &palm_reject);
++	if (error)
++		return error;
++
++	error = elants_set_palm_reject(ts, (uint16_t) palm_reject);
++	if (error)
++		return error;
++
++	return count;
++}
++
++static DEVICE_ATTR_RO(fw_version);
++static DEVICE_ATTR_RO(gid);
++static DEVICE_ATTR_RO(vendor_data);
++static DEVICE_ATTR_WO(firmware_update);
++static DEVICE_ATTR_WO(calibrate);
++static DEVICE_ATTR_RW(idle_rate);
++static DEVICE_ATTR_RW(idle_mode);
++static DEVICE_ATTR_RW(palm_reject);
++
++static struct attribute *elants_attributes[] = {
++	&dev_attr_fw_version.attr,
++	&dev_attr_gid.attr,
++	&dev_attr_vendor_data.attr,
++	&dev_attr_idle_rate.attr,
++	&dev_attr_idle_mode.attr,
++	&dev_attr_palm_reject.attr,
++	&dev_attr_firmware_update.attr,
++	&dev_attr_calibrate.attr,
++	NULL
++};
++
++static struct attribute_group elants_attr_group = {
++	.name = "elants_ktf",
++	.attrs = elants_attributes,
++};
++
++static bool elants_check_checksum(u8 *data, int checksum_index)
++{
++	unsigned char sum = 0;
++
++	/*
++	 * Checksum is defined as sum_of_all_bytes_before_checksum % 256.
++	 * So we can simply sum up all non-checksum fields and resort
++	 * to defined overflow at byte level.
++	 */
++	for (int i = 0; i < checksum_index; ++i)
++		sum += data[i];
++
++	return sum == data[checksum_index];
++}
++
++static void elants_parse_marker_data(u8 *data, struct marker_packet *marker_data)
++{
++	marker_data->in_range = data[1] & 1;
++	marker_data->tip = data[1] & 2;
++	marker_data->barrel = data[1] & 4;
++	marker_data->invert = data[1] & 8;
++	marker_data->eraser = data[1] & 16;
++	marker_data->second_barrel = data[1] & 32;
++	marker_data->reserved = data[1] & 64;
++	marker_data->x = (data[3] << 8) + data[2];
++	marker_data->y = (data[5] << 8) + data[4];
++	marker_data->pressure = (data[7] << 8) + data[6];
++	marker_data->battery = data[8];
++	marker_data->tilt_x = (data[10] << 8) + data[9];
++	marker_data->tilt_y = (data[12] << 8) + data[11];
++	marker_data->tx1_intensity = data[13];
++	marker_data->tx2_intensity = data[14];
++	marker_data->gid[0] = (data[16] << 8) + data[15];
++	marker_data->gid[1] = (data[18] << 8) + data[17];
++	marker_data->gid[2] = (data[20] << 8) + data[19];
++	marker_data->gid[3] = (data[22] << 8) + data[21];
++	marker_data->gid[4] = (data[24] << 8) + data[23];
++	marker_data->gid[5] = (data[26] << 8) + data[25];
++	marker_data->vendor_data = (data[28] << 8) + data[27];
++}
++
++static void elants_report_marker_event(struct elants_data *ts, uint8_t *data)
++{
++	struct device *dev = &ts->spi->dev;
++	struct marker_packet marker_data;
++	bool psy_changed = false;
++	unsigned int x;
++	unsigned int y;
++	unsigned int tilt_x;
++	unsigned int tilt_y;
++	unsigned int tmp;
++	uint16_t abs_distance;
++
++	if (!elants_check_checksum(data, PACKET_MARKER_CHECKSUM_FIELD)) {
++		dev_warn(dev, "Checksum failed for marker event!\n");
++		return;
++	}
++
++	elants_parse_marker_data(data, &marker_data);
++
++	trace_marker_event(&marker_data);
++
++	x = ts->flip_pos_x ? ts->fw_info.marker_x_res - marker_data.x : marker_data.x;
++	y = ts->flip_pos_y ? ts->fw_info.marker_y_res - marker_data.y : marker_data.y;
++	tmp = x;
++	x = ts->swap_axes ? y : x;
++	y = ts->swap_axes ? tmp : y;
++	tmp = marker_data.tilt_x;
++	tilt_x = ts->swap_axes ? marker_data.tilt_y : marker_data.tilt_x;
++	tilt_y = ts->swap_axes ? tmp : marker_data.tilt_y;
++	tilt_x = ts->inverted_tilt ? -tilt_x : tilt_x;
++	tilt_y = ts->inverted_tilt ? -tilt_y : tilt_y;
++
++	input_report_key(ts->input_marker, BTN_TOUCH, marker_data.tip || marker_data.eraser);
++	input_report_key(ts->input_marker, BTN_TOOL_PEN, marker_data.in_range &&
++			 !marker_data.invert);
++	input_report_key(ts->input_marker, BTN_STYLUS, marker_data.barrel);
++	input_report_key(ts->input_marker, BTN_STYLUS2, marker_data.second_barrel);
++	input_report_key(ts->input_marker, BTN_TOOL_RUBBER, marker_data.in_range &&
++			 marker_data.invert);
++	input_report_abs(ts->input_marker, ABS_PRESSURE, marker_data.pressure);
++
++	abs_distance = (marker_data.tx2_intensity << 8) + marker_data.tx1_intensity;
++	input_report_abs(ts->input_marker, ABS_DISTANCE, abs_distance);
++	input_report_abs(ts->input_marker, ABS_X, x);
++	input_report_abs(ts->input_marker, ABS_Y, y);
++	input_report_abs(ts->input_marker, ABS_TILT_X, tilt_x);
++	input_report_abs(ts->input_marker, ABS_TILT_Y, tilt_y);
++
++	input_sync(ts->input_marker);
++
++	if (memcmp(ts->gid, marker_data.gid, sizeof(ts->gid)))
++		memcpy(ts->gid, marker_data.gid, sizeof(ts->gid));
++
++	ts->vendor_data = marker_data.vendor_data;
++
++	/*
++	 * Elan will report battery level as 0x80 until the pairing is completed. In this
++	 * state the marker is in range and we are getting valid position data, but battery
++	 * should be discarded.
++	 */
++	if (ts->marker_capacity != marker_data.battery && marker_data.battery != 0x80) {
++		ts->marker_capacity = marker_data.battery;
++		psy_changed = true;
++	}
++
++	if (ts->marker_in_range != marker_data.in_range && marker_data.battery != 0x80) {
++		ts->marker_in_range = marker_data.in_range;
++		psy_changed = true;
++	}
++
++	if (ts->marker_in_contact != !!marker_data.pressure) {
++		ts->marker_in_contact = !!marker_data.pressure;
++
++		if (ts->marker_in_contact) {
++		}
++	}
++
++	if (psy_changed)
++		power_supply_changed(ts->battery);
++}
++
++static void elants_report_touch_event(struct elants_data *ts, uint8_t *data)
++{
++	struct device *dev = &ts->spi->dev;
++	uint16_t finger_bits;
++	uint16_t palm_bits;
++	int finger_active;
++	int palm_active;
++	int mt_tool;
++	int i;
++	uint16_t x;
++	uint16_t y;
++	uint16_t tmp;
++	uint32_t width;
++
++	int finger_count = 0;
++	int palm_count = 0;
++
++	if (!elants_check_checksum(data, PACKET_TOUCH_CHECKSUM_FIELD)) {
++		dev_warn(dev, "Checksum failed for touch event!\n");
++		return;
++	}
++
++	finger_bits = ((data[2] & 0x30) << 4) | data[1];
++	palm_bits = ((data[41] & 0x3) << 8) | data[40];
++
++	for (i = 0; i < FINGER_NUM; i++) {
++		finger_active = finger_bits & 0x1;
++		palm_active = palm_bits & 0x1;
++		finger_bits = finger_bits >> 1;
++		palm_bits = palm_bits >> 1;
++
++		if (finger_active) {
++			if (i % 2 == 0)
++				width = (((data[35 + i/2] & 0xf0) >> 4) * ts->sensor_pitch) / 10;
++			else
++				width = ((data[35 + i/2] & 0x0f) * ts->sensor_pitch) / 10;
++
++			x = ((data[3 + 3*i] & 0xf0) << 4) | data[4 + 3*i];
++			y = ((data[3 + 3*i] & 0x0f) << 8) | data[5 + 3*i];
++			x = ts->flip_pos_x ? (ts->fw_info.touch_x_res - x) : x;
++			y = ts->flip_pos_y ? (ts->fw_info.touch_y_res - y) : y;
++			tmp = x;
++			x = ts->swap_axes ? y : x;
++			y = ts->swap_axes ? tmp : y;
++
++			if (palm_active) {
++				mt_tool = MT_TOOL_PALM;
++				++palm_count;
++			} else {
++				mt_tool = MT_TOOL_FINGER;
++				++finger_count;
++			}
++
++			input_mt_slot(ts->input_touch, i);
++			input_mt_report_slot_state(ts->input_touch, mt_tool, true);
++			input_report_abs(ts->input_touch, ABS_MT_POSITION_X, x);
++			input_report_abs(ts->input_touch, ABS_MT_POSITION_Y, y);
++			input_report_abs(ts->input_touch, ABS_MT_TOUCH_MAJOR, width);
++		}
++	}
++
++	trace_touch_event(finger_count, palm_count);
++	input_mt_sync_frame(ts->input_touch);
++	input_sync(ts->input_touch);
++}
++
++static void elants_report_data(struct elants_data *ts, uint8_t *buf)
++{
++	struct device *dev = &ts->spi->dev;
++
++	switch (buf[0]) {
++	case PACKET_TYPE_TOUCH:
++		elants_report_touch_event(ts, &buf[0]);
++		break;
++	case PACKET_TYPE_MARKER:
++		elants_report_marker_event(ts, &buf[0]);
++		break;
++	case PACKET_TYPE_HELLO:
++		dev_info(dev, "hello packet in int handler\n");
++		break;
++	case PACKET_TYPE_FINGER_WAKEUP:
++		/* Finger hover detect caused exit from idle state */
++		break;
++	case PACKET_TYPE_CALIB:
++		break;
++	case PACKET_TYPE_NO_PACKET:
++		/*
++		 * If we do reads when the hardware is not ready, we will read an all 0xFF
++		 * buffer. According to ELAN, this may happen in certain race condition windows.
++		 * We also observe it when hovering. Hence, we only log this as debug.
++		 */
++		dev_dbg(dev, "read empty packet!\n");
++		break;
++	default:
++		dev_err(dev, "unknown packet: %x %x\n", buf[0], buf[1]);
++		break;
++	}
++}
++
++static irqreturn_t elants_irq_handler(int irq, void *dev_id)
++{
++	struct elants_data *ts = (struct elants_data *)dev_id;
++	struct device *dev = &ts->spi->dev;
++	unsigned char rxbuf[PACKET_SIZE];
++	int err;
++
++	spi_bus_lock(ts->spi->controller);
++
++	/* read all pending events */
++	while (gpiod_get_value(ts->irq_gpio)) {
++		err = elants_spi_read_locked(ts->spi, rxbuf, PACKET_SIZE);
++
++		if (err) {
++			dev_err(dev, "spi_sync failed\n");
++			break; /* releases the lock which may allow other progress */
++		}
++		elants_report_data(ts, rxbuf);
++	}
++
++	ts->idle_mode = false;
++
++	spi_bus_unlock(ts->spi->controller);
++
++	pm_runtime_get_sync(dev);
++	pm_runtime_mark_last_busy(dev);
++	pm_runtime_put_autosuspend(dev);
++	pm_wakeup_event(dev, 1000);
++
++	return IRQ_HANDLED;
++}
++
++static int elants_setup_touch_input_device(struct elants_data *ts)
++{
++	int error;
++	unsigned int x_max;
++	unsigned int y_max;
++	struct device *dev = &ts->spi->dev;
++
++	ts->input_touch = devm_input_allocate_device(dev);
++	if (!ts->input_touch) {
++		dev_err(dev, "Failed to allocate input device\n");
++		return -ENOMEM;
++	}
++
++	ts->input_touch->name = "Elan touch input";
++	ts->input_touch->id.bustype = BUS_SPI;
++	ts->input_touch->dev.parent = dev;
++
++	error = input_mt_init_slots(ts->input_touch, 10, INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
++	if (error) {
++		dev_err(dev, "failed to initialize MT slots: %d\n", error);
++		return error;
++	}
++
++	x_max = ts->swap_axes ? ts->fw_info.touch_y_res : ts->fw_info.touch_x_res;
++	y_max = ts->swap_axes ? ts->fw_info.touch_x_res : ts->fw_info.touch_y_res;
++	input_set_abs_params(ts->input_touch, ABS_MT_TOOL_TYPE, 0, MT_TOOL_PALM, 0, 0);
++	input_set_abs_params(ts->input_touch, ABS_MT_POSITION_X, 0, x_max, 0, 0);
++	input_set_abs_params(ts->input_touch, ABS_MT_POSITION_Y, 0, y_max, 0, 0);
++	input_set_abs_params(ts->input_touch, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
++	input_set_abs_params(ts->input_touch, ABS_MT_PRESSURE, 0, 255, 0, 0);
++	input_set_abs_params(ts->input_touch, ABS_MT_DISTANCE, 0, 255, 0, 0);
++	input_mt_init_slots(ts->input_touch, FINGER_NUM, 0);
++	input_abs_set_res(ts->input_touch, ABS_MT_POSITION_X, x_max);
++	input_abs_set_res(ts->input_touch, ABS_MT_POSITION_Y, y_max);
++
++	input_set_drvdata(ts->input_touch, ts);
++
++	error = input_register_device(ts->input_touch);
++	if (error) {
++		dev_err(dev, "unable to register input device: %d\n", error);
++		return error;
++	}
++
++	return 0;
++}
++
++static int elants_setup_marker_input_device(struct elants_data *ts)
++{
++	int error;
++	unsigned int x_max;
++	unsigned int y_max;
++	struct device *dev = &ts->spi->dev;
++
++	ts->input_marker = devm_input_allocate_device(dev);
++	if (!ts->input_marker) {
++		dev_err(dev, "Failed to allocate input device\n");
++		return -ENOMEM;
++	}
++
++	ts->input_marker->name = "Elan marker input";
++	ts->input_marker->id.bustype = BUS_SPI;
++	ts->input_marker->dev.parent = dev;
++
++	__set_bit(BTN_TOUCH, ts->input_marker->keybit);
++	__set_bit(EV_ABS, ts->input_marker->evbit);
++	__set_bit(EV_KEY, ts->input_marker->evbit);
++	__set_bit(BTN_TOOL_PEN, ts->input_marker->keybit);
++	__set_bit(BTN_STYLUS, ts->input_marker->keybit);
++	__set_bit(BTN_STYLUS2, ts->input_marker->keybit);
++	__set_bit(BTN_TOOL_RUBBER, ts->input_marker->keybit);
++
++	x_max = ts->swap_axes ? ts->fw_info.marker_y_res : ts->fw_info.marker_x_res;
++	y_max = ts->swap_axes ? ts->fw_info.marker_x_res : ts->fw_info.marker_y_res;
++	input_set_abs_params(ts->input_marker, ABS_X, 0, x_max, 0, 0);
++	input_set_abs_params(ts->input_marker, ABS_Y, 0, y_max, 0, 0);
++	input_set_abs_params(ts->input_marker, ABS_TILT_X, -9000, 9000, 0, 0);
++	input_set_abs_params(ts->input_marker, ABS_TILT_Y, -9000, 9000, 0, 0);
++	input_set_abs_params(ts->input_marker, ABS_PRESSURE, 0, 4096, 0, 0);
++	input_set_abs_params(ts->input_marker, ABS_DISTANCE, 0, 65535, 0, 0);
++	input_abs_set_res(ts->input_marker, ABS_X, ts->fw_info.touch_x_res);
++	input_abs_set_res(ts->input_marker, ABS_Y, ts->fw_info.touch_y_res);
++
++	/*
++	 * While we do not send that many events per packet, this ends up influencing
++	 * the buffer size. And while we do not send a lot of events per packet, we have
++	 * A LOT of packets.
++	 *
++	 * At ~1700 events per second a 1024 should be good for half a second in bad lag.
++	 * uevent will multiply this number by 8, so we set this as an indirect signal.
++	 */
++	input_set_events_per_packet(ts->input_marker, 1024 / 8);
++
++	input_set_drvdata(ts->input_marker, ts);
++
++	error = input_register_device(ts->input_marker);
++	if (error) {
++		dev_err(dev, "unable to register input device: %d\n", error);
++		return error;
++	}
++
++	return 0;
++}
++
++static int elants_batt_get_prop(struct power_supply *psy, enum power_supply_property psp,
++				union power_supply_propval *val)
++{
++	struct elants_data *ts = dev_get_drvdata(psy->dev.parent);
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = READ_ONCE(ts->marker_in_range);
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		val->intval = READ_ONCE(ts->marker_capacity);
++		break;
++	case POWER_SUPPLY_PROP_STATUS:
++		if (READ_ONCE(ts->marker_in_range))
++			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
++		else
++			val->intval = POWER_SUPPLY_STATUS_UNKNOWN;
++		break;
++	default:
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
++static enum power_supply_property elants_batt_props[] = {
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_CAPACITY,
++};
++
++static const struct power_supply_desc elants_marker_battery_desc = {
++	.name = "elants-marker-battery",
++	.type = POWER_SUPPLY_TYPE_WIRELESS,
++	.properties = elants_batt_props,
++	.num_properties = ARRAY_SIZE(elants_batt_props),
++	.get_property = elants_batt_get_prop,
++};
++
++static int elants_power_on(struct elants_data *ts)
++{
++	int error;
++
++	gpiod_set_value_cansleep(ts->reset_gpio, 1);
++
++	error = regulator_enable(ts->vcc33);
++	if (error) {
++		dev_err(&ts->spi->dev, "failed to enable vcc33: %d\n", error);
++		return error;
++	}
++
++	gpiod_set_value_cansleep(ts->reset_gpio, 0);
++
++	msleep(ELAN_RESET_DELAY_MSEC);
++
++	return 0;
++}
++
++static int elants_power_off(struct elants_data *ts)
++{
++	return regulator_disable(ts->vcc33);
++}
++
++static int elants_iap_open(struct inode *inode, struct file *filp)
++{
++	struct elants_data *ts = container_of((struct miscdevice *)filp->private_data,
++					       struct elants_data, elants_dev);
++	filp->private_data = ts;
++	dev_err(&ts->spi->dev, "fw: %04x\n", ts->fw_info.fw_ver);
++	return 0;
++}
++
++static int elants_iap_release(struct inode *inode, struct file *filp)
++{
++	filp->private_data = NULL;
++	return 0;
++}
++
++static ssize_t elants_iap_write(struct file *filp, const char *buff, size_t count, loff_t *offp)
++{
++	struct elants_data *ts = filp->private_data;
++	int ret;
++	char *tmp;
++
++	if (count > 8192)
++		count = 8192;
++
++	tmp = kmalloc(count, GFP_KERNEL);
++
++	if (tmp == NULL)
++		return -ENOMEM;
++
++	if (copy_from_user(tmp, buff, count))
++		return -EFAULT;
++
++	ret = spi_write(ts->spi, tmp, count);
++
++	kfree(tmp);
++
++	return (ret == 0) ? count : ret;
++}
++
++static ssize_t elants_iap_read(struct file *filp, char *buff, size_t count, loff_t *offp)
++{
++	struct elants_data *ts = filp->private_data;
++	char *tmp;
++	int ret;
++	long rc;
++
++	if (count > 8192)
++		count = 8192;
++
++	tmp = kmalloc(count, GFP_KERNEL);
++
++	if (tmp == NULL)
++		return -ENOMEM;
++
++	ret = spi_read(ts->spi, tmp, count);
++	if (ret == 0)
++		rc = copy_to_user(buff, tmp, count);
++
++	kfree(tmp);
++
++	return (ret == 0) ? count : ret;
++}
++
++static long elants_iap_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	struct elants_data *ts = filp->private_data;
++	int __user *ip = (int __user *)arg;
++
++	switch (cmd) {
++	case IOCTL_I2C_INT:
++		put_user(!gpiod_get_value_cansleep(ts->irq_gpio), ip);
++		break;
++	case IOCTL_RESET:
++		elants_reset(ts);
++		break;
++	case IOCTL_IAP_MODE_LOCK:
++		disable_irq(ts->spi->irq);
++		break;
++	case IOCTL_IAP_MODE_UNLOCK:
++		enable_irq(ts->spi->irq);
++		break;
++	default:
++		dev_info(&ts->spi->dev, "unknown IOCTL cmd: %d\n", cmd);
++		break;
++	}
++	return 0;
++}
++
++struct file_operations elants_touch_fops = {
++	.open = elants_iap_open,
++	.write = elants_iap_write,
++	.read = elants_iap_read,
++	.release = elants_iap_release,
++	.unlocked_ioctl = elants_iap_ioctl,
++	.compat_ioctl = elants_iap_ioctl,
++};
++
++static int parse_vendor_firmware_name(struct device *dev)
++{
++	const char *touch_sn;
++	const char *front_panel_sn;
++	char touch_firmware[32];
++	char vendor_prefix[5];
++	struct device_node *map;
++	struct elants_data *ts = dev_get_drvdata(dev);
++	int ret = 0;
++
++	map = of_get_child_by_name(dev->of_node, "vendor_map");
++	if (!map) {
++		if (!of_property_read_string(dev->of_node, "firmware-name", &ts->fw_name))
++			return 0;
++
++		dev_err(dev, "failed reading firmware-name from dts\n");
++		return -ENOENT;
++	}
++
++	if (of_property_read_string(dev->of_node, "touch-sn", &touch_sn)) {
++		dev_err(dev, "unable to read touch serial number\n");
++		ret = -ENOENT;
++		goto done;
++	}
++
++	if (of_property_read_string(dev->of_node, "front-panel-sn", &front_panel_sn)) {
++		dev_err(dev, "unable to read front panel serial number\n");
++		ret = -ENOENT;
++		goto done;
++	}
++
++	snprintf(vendor_prefix, sizeof(vendor_prefix), "%s", touch_sn);
++
++	dev_dbg(dev, "touch-sn %s\n", touch_sn);
++	dev_dbg(dev, "front-panel-sn %s\n", front_panel_sn);
++	dev_dbg(dev, "vendor_prefix %s\n", vendor_prefix);
++
++	ret = -ENOENT;
++	for_each_child_of_node_scoped(map, map_entry) {
++		const char *oca_sn_node;
++		const char *oca_sn;
++		u32 oca_offset[2];
++
++		if (strncmp(vendor_prefix, map_entry->name, sizeof(vendor_prefix)))
++			continue;
++
++		if (of_property_read_string(map_entry, "oca-node", &oca_sn_node))
++			continue;
++
++		if (of_property_read_u32_array(map_entry, "oca-offset", oca_offset, 2))
++			continue;
++
++		if (of_property_read_string(dev->of_node, oca_sn_node, &oca_sn))
++			continue;
++
++		for_each_child_of_node_scoped(map_entry, oca_entry) {
++			const char *key;
++			const char *postfix;
++
++			if (of_property_read_string(oca_entry, "key", &key))
++				continue;
++
++			if (of_property_read_string(oca_entry, "postfix", &postfix))
++				continue;
++
++			dev_dbg(dev, "key %s postfix %s oca-sn %s off:%u/%u\n", key, postfix,
++				oca_sn, oca_offset[0], oca_offset[1]);
++
++			if (strlen(oca_sn) < oca_offset[1])
++				continue;
++
++			if (strncmp(key, &oca_sn[oca_offset[0]], oca_offset[1]))
++				continue;
++
++			snprintf(touch_firmware, sizeof(touch_firmware), "elants_spi_%s_%s.bin",
++				 vendor_prefix, postfix);
++
++			string_lower(touch_firmware, touch_firmware);
++			ret = 0;
++			break;
++		}
++		break;
++	}
++
++	if (ret) {
++		dev_err(dev, "unable to find match for panel %s/%s\n", touch_sn, front_panel_sn);
++		goto done;
++	}
++
++	ts->fw_name = devm_kstrdup(dev, touch_firmware, GFP_KERNEL);
++
++	dev_info(dev, "firmware name set to %s\n", ts->fw_name);
++
++done:
++	of_node_put(map);
++	return ret;
++}
++
++static int elants_probe(struct spi_device *spi)
++{
++	struct elants_data *ts;
++	int error;
++	uint32_t cs_inactive;
++	struct device_node *np = spi->dev.of_node;
++	struct device *dev = &spi->dev;
++
++	ts = devm_kzalloc(&spi->dev, sizeof(struct elants_data), GFP_KERNEL);
++	if (!ts)
++		return -ENOMEM;
++
++	ts->spi = spi;
++
++	error = spi_setup(ts->spi);
++	if (error) {
++		dev_err(&spi->dev, "error setting up spi: %d\n", error);
++		return -ENXIO;
++	}
++
++	if (!of_property_read_u32(np, "spi-cs-inactive-delay-us", &cs_inactive)) {
++		ts->spi->cs_inactive.value = cs_inactive;
++		ts->spi->cs_inactive.unit = SPI_DELAY_UNIT_USECS;
++	}
++
++	if (of_property_read_u32(np, "spi-max-frequency", &ts->spi_max_speed_hz)) {
++		dev_err(dev, "failed reading spi max freq, fallback to 1MHz\n");
++		ts->spi_max_speed_hz = 1 * 1000 * 1000;
++		ts->spi->max_speed_hz = ts->spi_max_speed_hz;
++	}
++
++	ts->spi_comm_speed_hz = 500 * 1000;
++
++	spi_set_drvdata(spi, ts);
++
++	ts->vcc33 = devm_regulator_get(dev, "vcc33");
++	if (IS_ERR(ts->vcc33))
++		return dev_err_probe(dev, PTR_ERR(ts->vcc33),
++				     "can't get vcc33 regulator\n");
++
++	ts->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
++	if (IS_ERR(ts->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(ts->reset_gpio),
++				     "failed to get reset gpio\n");
++
++	ts->irq_gpio = devm_gpiod_get(dev, "irq", GPIOD_IN);
++	if (IS_ERR(ts->irq_gpio))
++		return dev_err_probe(dev, PTR_ERR(ts->irq_gpio),
++				     "failed to get irq gpio\n");
++
++	/*
++	 * Don't return on failure to fetch the firmware name.
++	 * Let the device probe successfully, but fail firmware upgrade.
++	 */
++	error = parse_vendor_firmware_name(dev);
++	if (error)
++		dev_err(dev, "failed to parse firmware name (%d)\n", error);
++
++	if (of_property_read_u32(np, "firmware-ver-file-offset", &ts->fw_file_ver_offset)) {
++		dev_err(&spi->dev, "failed reading firmware name from dts: %d\n", error);
++		return -ENOENT;
++	}
++
++	if (of_property_read_u32(np, "firmware-id-file-offset", &ts->fw_file_id_offset)) {
++		dev_err(&spi->dev, "failed reading firmware name from dts: %d\n", error);
++		return -ENOENT;
++	}
++
++	if (of_property_read_u32(np, "marker-resolution-x", &ts->fw_info.marker_x_res)) {
++		dev_err(&spi->dev, "failed reading marker-resolution-x from dts: %d\n", error);
++		return -ENOENT;
++	}
++
++	if (of_property_read_u32(np, "marker-resolution-y", &ts->fw_info.marker_y_res)) {
++		dev_err(&spi->dev, "failed reading marker-resolution-y from dts: %d\n", error);
++		return -ENOENT;
++	}
++
++	if (of_property_read_u32(np, "touch-resolution-x", &ts->fw_info.touch_x_res)) {
++		dev_err(&spi->dev, "failed reading touch-resolution-x from dts: %d\n", error);
++		return -ENOENT;
++	}
++
++	if (of_property_read_u32(np, "touch-resolution-y", &ts->fw_info.touch_y_res)) {
++		dev_err(&spi->dev, "failed reading touch-resolution-y from dts: %d\n", error);
++		return -ENOENT;
++	}
++
++	error = sysfs_create_group(&dev->kobj, &elants_attr_group);
++	if (error) {
++		dev_err(dev, "failed to create sysfs attributes: %d\n", error);
++		return error;
++	}
++
++	ts->idle_rate = ELAN_DEFAULT_IDLE_RATE;
++
++	error = elants_power_on(ts);
++	if (error)
++		goto remove_sysfs;
++
++	error = elants_init(ts);
++	if (error) {
++		dev_err(dev, "init failed: %d\n", error);
++
++		if (!ts->mode)
++			goto power_off;
++
++		/* Init failed because TS is in recovery mode (broken firmware),
++		 * continue to have the opportunity to upgrade the firmware.
++		 */
++	}
++
++	ts->flip_pos_x = of_property_read_bool(np, "flip-pos-x");
++	ts->flip_pos_y = of_property_read_bool(np, "flip-pos-y");
++	ts->swap_axes = of_property_read_bool(np, "swap-axes");
++	ts->inverted_tilt = of_property_read_bool(np, "inverted-tilt");
++
++	error = of_property_read_u8(np, "sensor-pitch", &ts->sensor_pitch);
++	if (error) {
++		dev_err(dev, "failed reading sensor pitch from dts, fallback to 4.2mm\n");
++		ts->sensor_pitch = 42;
++	}
++
++	error = elants_setup_marker_input_device(ts);
++	if (error) {
++		dev_err(dev, "marker input device create failed: %d\n", error);
++		goto power_off;
++	}
++
++	error = elants_setup_touch_input_device(ts);
++	if (error) {
++		dev_err(dev, "finger input device create failed: %d\n", error);
++		goto power_off;
++	}
++
++	ts->elants_dev.minor = MISC_DYNAMIC_MINOR;
++	ts->elants_dev.name = "elan-iap";
++	ts->elants_dev.fops = &elants_touch_fops;
++	if (misc_register(&ts->elants_dev) < 0) {
++		dev_err(dev, "failed to create miscdevice: %d\n", error);
++		goto power_off;
++	}
++
++	ts->battery = devm_power_supply_register(dev, &elants_marker_battery_desc, NULL);
++	if (IS_ERR(ts->battery)) {
++		error = PTR_ERR(ts->battery);
++		dev_err(dev, "failed to create power supply: %d\n", error);
++		goto misc_dereg;
++	}
++
++	error = devm_request_threaded_irq(dev, spi->irq,
++					  NULL, elants_irq_handler,
++					  IRQF_ONESHOT,
++					  dev->driver->name, ts);
++	if (error) {
++		dev_err(dev, "request irq failed: %d\n", error);
++		goto misc_dereg;
++	}
++
++	device_set_wakeup_capable(dev, true);
++	dev_pm_set_wake_irq(dev, spi->irq);
++
++	if (!pm_runtime_enabled(dev)) {
++		pm_runtime_set_active(dev);
++		pm_runtime_enable(dev);
++	}
++
++	ts->idle_mode = false;
++	pm_runtime_use_autosuspend(dev);
++	pm_runtime_set_autosuspend_delay(dev, AUTOSUSPEND_DELAY);
++
++	error = elants_firmware_update(ts);
++	if (error)
++		dev_err(dev, "fw update failed: %d\n", error);
++
++	return 0;
++
++misc_dereg:
++	misc_deregister(&ts->elants_dev);
++
++power_off:
++	elants_power_off(ts);
++
++remove_sysfs:
++	sysfs_remove_group(&dev->kobj, &elants_attr_group);
++	return error;
++}
++
++static void elants_remove(struct spi_device *spi)
++{
++	struct elants_data *ts = spi_get_drvdata(spi);
++	struct device *dev = &spi->dev;
++
++	input_unregister_device(ts->input_touch);
++	input_unregister_device(ts->input_marker);
++
++	dev_pm_clear_wake_irq(dev);
++
++	if (pm_runtime_enabled(dev))
++		pm_runtime_disable(dev);
++
++	pm_runtime_dont_use_autosuspend(dev);
++
++	disable_irq(spi->irq);
++	elants_power_off(ts);
++
++	sysfs_remove_group(&dev->kobj, &elants_attr_group);
++	misc_deregister(&ts->elants_dev);
++}
++
++static int elants_suspend(struct device *dev)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++	int error;
++
++	disable_irq(ts->spi->irq);
++
++	if (device_may_wakeup(dev)) {
++		error = elants_set_idle_mode(ts, true);
++		if (error)
++			dev_err(dev, "failed to set idle mode\n");
++	} else {
++		elants_power_off(ts);
++	}
++
++	return 0;
++}
++
++static int elants_resume(struct device *dev)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++
++	if (!device_may_wakeup(dev)) {
++		elants_power_on(ts);
++
++		if (elants_init(ts))
++			return -EIO;
++	}
++
++	enable_irq(ts->spi->irq);
++
++	pm_runtime_mark_last_busy(dev);
++	ts->idle_mode = false;
++
++	return 0;
++}
++
++static int elants_freeze(struct device *dev)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++
++	disable_irq(ts->spi->irq);
++	elants_power_off(ts);
++
++	return 0;
++}
++
++static int elants_thaw(struct device *dev)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++
++	elants_power_on(ts);
++	enable_irq(ts->spi->irq);
++
++	return 0;
++}
++
++static int elants_restore(struct device *dev)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++	int error;
++
++	elants_power_on(ts);
++
++	error = elants_check_status(ts);
++	if (error) {
++		dev_err(dev, "error check status: %d\n", error);
++		return error;
++	}
++
++	enable_irq(ts->spi->irq);
++
++	return 0;
++}
++
++static int elants_runtime_suspend(struct device *dev)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++	int error;
++
++	if (pm_runtime_enabled(dev)) {
++		error = elants_set_idle_mode(ts, true);
++		if (error)
++			dev_err(dev, "failed to set idle mode\n");
++	}
++
++	return 0;
++}
++
++static int elants_runtime_resume(struct device *dev)
++{
++	struct elants_data *ts = dev_get_drvdata(dev);
++	int error;
++
++
++	if (pm_runtime_enabled(dev)) {
++		error = elants_set_idle_mode(ts, false);
++		if (error)
++			dev_err(dev, "failed to set idle mode\n");
++	}
++
++	return 0;
++}
++
++static const struct dev_pm_ops elants_pm_ops = {
++	.suspend = elants_suspend,
++	.resume = elants_resume,
++	.freeze = elants_freeze,
++	.thaw = elants_thaw,
++	.restore = elants_restore,
++	.runtime_suspend = elants_runtime_suspend,
++	.runtime_resume = elants_runtime_resume,
++};
++
++static const struct spi_device_id elants_spi_ids[] = {
++	{ .name = "elants_spi",},
++	{},
++};
++MODULE_DEVICE_TABLE(spi, elants_spi_ids);
++
++static const struct of_device_id elants_of_match[] = {
++	{ .compatible = "elan,elants_spi",},
++	{},
++};
++MODULE_DEVICE_TABLE(of, elants_of_match);
++
++static struct spi_driver elants_driver = {
++	.probe = elants_probe,
++	.remove = elants_remove,
++	.id_table = elants_spi_ids,
++	.driver = {
++		.name = "elants_spi",
++		.pm = &elants_pm_ops,
++		.of_match_table = of_match_ptr(elants_of_match),
++	},
++};
++module_spi_driver(elants_driver);
++
++MODULE_AUTHOR("Espen Lie <espen.lie@remarkable.no>");
++MODULE_DESCRIPTION("ELAN touch controller SPI driver");
++MODULE_LICENSE("GPL");
+diff --git a/include/trace/events/elants_spi.h b/include/trace/events/elants_spi.h
+new file mode 100644
+index 000000000..6882dc524
+--- /dev/null
++++ b/include/trace/events/elants_spi.h
+@@ -0,0 +1,43 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM elants_spi
++
++#if !defined(_TRACE_ELANTS_SPI_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_ELANTS_SPI_H
++
++#include <linux/tracepoint.h>
++
++TRACE_EVENT(marker_event,
++	    TP_PROTO(struct marker_packet *packet),
++	    TP_ARGS(packet),
++	    TP_STRUCT__entry(
++			     __field(u8, state)
++			    ),
++	    TP_fast_assign(
++			   __entry->state = packet->eraser << 1 | packet->tip;
++			  ),
++	    TP_printk("elants_spi marker event [tip:%d,eraser:%d]",
++		      (__entry->state & 0x1) != 0,
++		      (__entry->state & 0x2) != 0)
++);
++
++TRACE_EVENT(touch_event,
++	    TP_PROTO(int finger_count, int palm_count),
++	    TP_ARGS(finger_count, palm_count),
++	    TP_STRUCT__entry(
++			     __field(u8, finger_count)
++			     __field(u8, palm_count)
++			    ),
++	    TP_fast_assign(
++			   __entry->finger_count = finger_count;
++			   __entry->palm_count = palm_count;
++			  ),
++	    TP_printk("elants_spi touch event [finger_count:%d,palm_count:%d]",
++		      __entry->finger_count,
++		      __entry->palm_count)
++);
++
++#endif /* if !defined(_TRACE_ELANTS_SPI_H) || defined(TRACE_HEADER_MULTI_READ) */
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>

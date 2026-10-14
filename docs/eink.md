@@ -22,18 +22,18 @@ rendering automatically based on the content being displayed. See
 ## Hardware pipeline
 
 ```
-LCDIFv3 → LDB (fsl,imx93-ldb-nxp) → remarkable,cumulus-panel (LVDS)
+LCDIFv3 → parallel display format converter (fsl,imx93-parallel-display-format, RGB565) → remarkable,cumulus-panel
 ```
 
-- DRM device: `/dev/dri/card0`, connector `LVDS-1` (id 36), CRTC id 34, plane id 32
-- LVDS transport mode: **365×1700 @ 85 Hz**, pixel clock 56 MHz
+- DRM device: `/dev/dri/card0`, connector `LVDS-1` (id 36; the panel driver registers an LVDS connector type, but the wire is the SoC's 16-bit parallel RGB bus — pads `MEDIAMIX_DISP_DATA00..15` in the DT), CRTC id 34, plane id 32
+- Transport mode: **365×1700 @ 85 Hz**, pixel clock 56 MHz
 - Pixel format: **RGB565** (`RG16`), 2 bytes/px, stride 730
 - Frame size: `365 × 1700 × 2` = 1,241,000 bytes
 
-The `cumulus` controller converts scanned-out LVDS frames to e-ink drive signals.
+The `cumulus` controller converts the scanned-out frames to e-ink drive signals.
 Waveform selection is not out-of-band — **the frame sequence is the waveform**.
 
-> **Cumulus disambiguation.** This panel is driven **purely over LVDS** — no MIPI-DSI,
+> **Cumulus disambiguation.** This panel is driven **purely over the parallel display bus** — no LVDS, no MIPI-DSI,
 > no FPGA bitstream, no EPDC/PXP. The BSP also ships `rm-cumulus-bridge.c` (an
 > i2c + fpga-mgr + DSI driver), but that is for the **bigger Paper Pro (`ferrari`)**,
 > NOT chiappa — ignore it when reading vendor source.

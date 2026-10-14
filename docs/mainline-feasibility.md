@@ -1,5 +1,10 @@
 # Mainline Linux feasibility (researched 2026-07-05, mainline ~7.1)
 
+> **Update 2026-10-14:** this is now the only kernel: [`../kernel/`](../kernel/)
+> carries the Linux 7.2 patch series and config, and remarkable-nixos builds
+> nothing else. It boots and runs the full system, deep suspend included. The
+> notes below are the research that led there.
+
 **Verdict: a hybrid "mainline + ~15-patch small patchset" tree is very achievable,
 and would be the first public one for this device.** The i.MX93 SoC side is
 essentially complete upstream; the work is ~5-8k LOC of self-contained leaf-driver

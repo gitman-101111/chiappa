@@ -16,7 +16,7 @@ Known integrations built on this layer:
 | **SoC** | NXP i.MX 93, 2× Cortex-A55 @ 1.7 GHz + Cortex-M33 |
 | **RAM** | 2 GB LPDDR4 (Micron) |
 | **Storage** | 64 GB eMMC (Kingston EMMC64G-TY29), GPT |
-| **Display** | E Ink Gallery 3 (color), 1696×954, 264 DPI, LVDS via LCDIFv3 |
+| **Display** | E Ink Gallery 3 (color), 1696×954, 264 DPI, 16-bit parallel RGB565 from LCDIFv3 |
 | **Touch** | Elan SPI (`elants_spi`) |
 | **WiFi / BT / NFC** | NXP IW611 combo (WiFi 6 / BT / NFC) |
 | **USB** | USB-C OTG, `ci_hdrc_imx` (chipidea), CDC ECM gadget |
@@ -24,7 +24,7 @@ Known integrations built on this layer:
 | **Charger** | MAX77818 |
 | **Frontlight** | AW99703 (I2C, PWM) |
 | **Accelerometer** | ST LIS2DW12 (I2C) |
-| **Kernel** | NXP BSP fork of Linux 6.12.49 (`linux-imx-rm`, branch `rmpp_6.12.49_v3.26.x`) |
+| **Kernel** | mainline Linux 7.2 + the [`kernel/`](kernel/) series (the vendor OS runs an NXP BSP fork of 6.12.49, `linux-imx-rm`) |
 | **Bootloader** | U-Boot 2025.04 (NXP ELE / AHAB) |
 | **HW revisions** | DTBs for rev F–K; all six are byte-identical in current firmware |
 | **Vendor OS** | Codex Linux 5.6 / image 3.27.1.0 (Yocto scarthgap) |
@@ -122,7 +122,7 @@ chiappa/
 │   ├── power.md               # charging budget, idle draw, low-battery pitfalls
 │   └── recovery.md            # SDP unbrick + non-destructive slot switch
 ├── dtb/                # vendor device trees, rev F–K (firmware/extract-vendor-data.sh)
-├── kernel/             # Kernel config + patches + README (build notes)
+├── kernel/             # Mainline kernel: patch series, config fragment + full config, README
 ├── eink/               # e-ink toolkit — see eink/README.md
 │   ├── src/            # einkbridge.cpp, vkms_bridge.c, libfakekms.c, swtfb_fill.c, RE tools
 │   ├── scripts/        # build-bridge.sh, build-bundle.sh, chiappa-compositor, RE helpers
@@ -149,30 +149,20 @@ chiappa/
 
 ### 1. Kernel
 
-Source: `https://github.com/reMarkable/linux-imx-rm`, branch `rmpp_6.12.49_v3.26.x`.
-The tarball (`linux-imx-rel-5.6-vc-3.26.0.68-122eda1b63d9.tar.gz`) is distributed
-via Git LFS from that repository.
-
-Use `kernel/config-remarkable-chiappa.aarch64` as your `.config`. This is a
-**complete config** based on the vendor `chiappa_defconfig` with additional deltas.
-It must be used as-is — do not reduce it to a fragment. The kernel build system's
-`olddefconfig` applied to a fragment silently drops `CONFIG_ARCH_MXC`, removing
-all i.MX platform support (clocks, pinctrl, power domains, eMMC, everything).
-
-Apply the patches in `kernel/` in order (0003 is generated against a
-0002-patched tree):
-```
-0001-drm-panel-remarkable-cumulus-select-VIDEOMODE_HELPERS.patch
-0002-drm-vkms-set-default-mode-to-954x1696-for-chiappa-panel.patch
-0003-drm-vkms-allow-cloning-virtual-and-writeback-encoder.patch
-```
-(0002/0003 are only needed for the Wayland/VKMS path.) See
-[kernel/README.md](kernel/README.md) for details and driver quirks.
+Mainline Linux (currently **7.2.10**, from kernel.org) plus the patch series
+in [`kernel/`](kernel/): apply `0001-…` to `0016-…` in order, build with
+`kernel/config-chiappa-mainline.aarch64` as your complete `.config` (it is
+generated from `kernel/chiappa-mainline.config` by `regenerate-config.sh`;
+do not run `olddefconfig` on the fragment alone, it drops `CONFIG_ARCH_MXC`
+and with it the whole i.MX platform). WiFi is NXP's out-of-tree `mwifiex`
+driver, tag `lf-6.18.37-2.1.0`, with the patch in `kernel/mwifiex/`. See
+[kernel/README.md](kernel/README.md) for what the series carries, how to
+bump the kernel, and the bring-up checklist.
 
 Notable config flags:
-- `CONFIG_BLK_DEV_INITRD` **not set** — kernel boots directly to rootfs, no initramfs
 - `CONFIG_DRM_VKMS=m` — virtual DRM device, required for Wayland compositors
-- `CONFIG_USB_CONFIGFS_F_ECM=y` — USB ECM gadget
+- `CONFIG_USB_CONFIGFS_ECM=y` with the gadget built in — the headless USB link needs no modules
+- `CONFIG_PSTORE_RAM=y` + a `ramoops` reservation in the DT — crash logs without a UART
 
 ### 2. Firmware and vendor blobs
 
@@ -193,11 +183,11 @@ Then install `firmware/lib/firmware/` → `/lib/firmware/` and
 
 ### 3. Device tree
 
-Use the **vendor-extracted** `chiappa-rev-h.dtb` (produced into `dtb/` by
-`firmware/extract-vendor-data.sh`), or whichever revision matches your unit
-(check `/proc/device-tree/model` on the vendor OS). All six rev F–K DTBs are
-byte-identical in the current firmware. Do NOT use the kernel-tree-built DTB —
-it hangs the device early in boot (see [docs/fitimage.md](docs/fitimage.md)).
+The kernel build produces `freescale/imx93-remarkable-chiappa.dtb` from the
+series' DTS; one DTB serves all PCBA revisions (the vendor firmware ships
+six byte-identical DTBs for rev F–K, extracted into `dtb/` for reference by
+`firmware/extract-vendor-data.sh`). The vendor DTB only boots the vendor
+kernel: it describes vendor bindings.
 
 ### 4. FIT image
 
@@ -212,12 +202,11 @@ See [E-ink display](#e-ink-display) below and [docs/eink.md](docs/eink.md).
 
 ## A/B boot slots
 
-Two symmetric rootfs slots (A = `mmcblk0p2`, B = `mmcblk0p3`). The active slot
-lives in the `lpgpr` SNVS registers and is managed with the vendor's `rootdev`
-tool (`--active` / `--inactive` / `--next-boot` / `--switch`) — **not** the eMMC
-boot partition (`mmc bootpart` only picks which `imx-boot` runs). U-Boot keeps a
-per-slot error counter that auto-rolls-back after 3 unreset boots — your safety
-net while experimenting.
+Two symmetric rootfs slots (A = `mmcblk0p2`, B = `mmcblk0p3`). U-Boot boots the
+slot whose eMMC boot partition is enabled (`boot0` → A, `boot1` → B; switch with
+`mmc bootpart enable 1|2 0 /dev/mmcblk0`) and records the booted slot in the
+`lpgpr` SNVS registers. It keeps a per-slot error counter there that
+auto-rolls-back after 3 unreset boots — your safety net while experimenting.
 
 Rules of thumb: **deploy to the inactive slot, never touch the active one**;
 reset the counter after writing a slot; and reset it *late* in boot (after SSH is

@@ -1,0 +1,988 @@
+From 62c6e56570119f92fae37c07c00e4ce77bf19b62 Mon Sep 17 00:00:00 2001
+From: gitman-101111 <development@spamfolder.xyz>
+Date: Mon, 12 Oct 2026 10:23:07 -0600
+Subject: [PATCH] regulator: add the GMT G2194 e-paper PMIC
+
+The G2194 generates the EPD bias rails (VPOS/VNEG 1-3, VGH, VGL, VPDD,
+VCOM) and sequences them through its enable and power-good pins. The
+driver also carries the delayed VPDD power-down timer the waveform
+engine configures through vpdd_length. Ported from reMarkable's
+linux-imx-rm 6.12 tree; the i.MX bus-frequency boost calls are dropped.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/regulator/Kconfig           |   7 +
+ drivers/regulator/Makefile          |   1 +
+ drivers/regulator/g2194-regulator.c | 933 ++++++++++++++++++++++++++++
+ 3 files changed, 941 insertions(+)
+ create mode 100644 drivers/regulator/g2194-regulator.c
+
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index a54a54919..d345e0289 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -440,6 +440,13 @@ config REGULATOR_FAN53880
+ 	  (PMIC), it is controlled by I2C and provides one BUCK, one BOOST
+ 	  and four LDO outputs.
+ 
++config REGULATOR_G2194
++	tristate "GMT G2194 voltage regulator"
++	depends on I2C
++	select REGMAP_I2C
++	help
++	  This driver supports the GMT G2194 e-paper display PMIC.
++
+ config REGULATOR_GPIO
+ 	tristate "GPIO regulator support"
+ 	depends on GPIOLIB || COMPILE_TEST
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index 134eee274..873999859 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -52,6 +52,7 @@ obj-$(CONFIG_REGULATOR_DBX500_PRCMU) += dbx500-prcmu.o
+ obj-$(CONFIG_REGULATOR_DB8500_PRCMU) += db8500-prcmu.o
+ obj-$(CONFIG_REGULATOR_FAN53555) += fan53555.o
+ obj-$(CONFIG_REGULATOR_FAN53880) += fan53880.o
++obj-$(CONFIG_REGULATOR_G2194) += g2194-regulator.o
+ obj-$(CONFIG_REGULATOR_GPIO) += gpio-regulator.o
+ obj-$(CONFIG_REGULATOR_HI6421) += hi6421-regulator.o
+ obj-$(CONFIG_REGULATOR_HI6421V530) += hi6421v530-regulator.o
+diff --git a/drivers/regulator/g2194-regulator.c b/drivers/regulator/g2194-regulator.c
+new file mode 100644
+index 000000000..6e39dc304
+--- /dev/null
++++ b/drivers/regulator/g2194-regulator.c
+@@ -0,0 +1,933 @@
++// SPDX-License-Identifier: GPL-2.0+
++//
++// Functions to access G2194 power management chip voltages
++//
++// Copyright (C) 2022 reMarkable AS - http://www.remarkable.com/
++//
++
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/regmap.h>
++#include <linux/i2c.h>
++#include <linux/iopoll.h>
++#include <linux/gpio/consumer.h>
++#include <linux/platform_device.h>
++#include <linux/pm_wakeup.h>
++#include <linux/regulator/driver.h>
++#include <linux/regulator/of_regulator.h>
++#include <linux/power_supply.h>
++#include <linux/reboot.h>
++
++#define G2194_REG_VPOS1_SETTING_BASE	0x01
++#define G2194_REG_VNEG1_SETTING_BASE	0x03
++#define G2194_REG_VPOS2_SETTING_BASE	0x05
++#define G2194_REG_VNEG2_SETTING_BASE	0x07
++#define G2194_REG_VPOS3_SETTING_BASE	0x09
++#define G2194_REG_VNEG3_SETTING_BASE	0x0B
++#define G2194_REG_VCOM_SETTING_BASE	0x0D
++#define G2194_REG_VPDD_SETTING_BASE	0x0F
++#define G2194_REG_PWRON_DELAY_1		0x13
++#define G2194_REG_PWRON_DELAY_3		0x15
++#define G2194_REG_CONTROL_REG		0x16
++#define G2194_REG_KEEP_ALIVE_ON_OFF	0x18
++#define G2194_REG_FAULT_1		0x19
++#define G2194_REG_FAULT_3		0x1b
++
++#define G2194_SAVED_REGISTERS_END	0x18
++
++/* G2194_REG_VPOS1_SETTING bits */
++#define VPOS1_VOLTAGE_CTRL_MASK		0x3ff
++/* G2194_REG_VNEG1_SETTING bits */
++#define VNEG1_VOLTAGE_CTRL_MASK		0x3ff
++/* G2194_REG_VPOS2_SETTING bits */
++#define VPOS2_VOLTAGE_CTRL_MASK		0x3ff
++/* G2194_REG_VNEG2_SETTING bits */
++#define VNEG2_VOLTAGE_CTRL_MASK		0x3ff
++/* G2194_REG_VPOS3_SETTING bits */
++#define VPOS3_VOLTAGE_CTRL_MASK		0x3ff
++/* G2194_REG_VNEG3_SETTING bits */
++#define VNEG3_VOLTAGE_CTRL_MASK		0x3ff
++/* G2194_REG_VCOM_SETTING bits */
++#define VCOM_EXT_EN_PIN_MASK		0x8000
++#define VCOM_VOLTAGE_CTRL_MASK		0x01ff
++#define VCOM_DISCHARGE_MASK		0x2000
++/* G2194_REG_KEEP_ALIVE_ON_OFF bits */
++#define ON_OFF_POWER_RAILS_MASK	0x4000
++
++/* G2194_REG_VPDD_SETTING bits */
++#define VPDD_VOLTAGE_CTRL_MASK		0xF800
++
++/* G2194_REG_PWRON_DELAY_1/2 bits */
++#define VPX_TO_VGL_RAMP_MASK		0xC000
++#define VGL_TO_VNEG3_RAMP_MASK		0x3000
++#define VNEG3_TO_VNEG2_RAMP_MASK	0x0C00
++#define VNEG2_TO_VNEG1_RAMP_MASK	0x0300
++#define VNEG1_TO_VPOS3_RAMP_MASK	0x00C0
++#define VPOS3_TO_VPOS2_RAMP_MASK	0x0030
++#define VPOS2_TO_VPOS1_RAMP_MASK	0x000C
++#define VPOS1_TO_VGH1_RAMP_MASK	0x0003
++
++/* G2194_REG_PWRON_DELAY_3 bits */
++#define VGH1_TO_VGH2_RAMP_MASK	0xC000
++#define PDD_POWER_OFF_SEQ_MASK	0x2000
++
++/* G2194_REG_CONTROL_REG bits */
++#define PMIC_SOFT_START_TIME_MASK	0xC000
++#define VGH2_VGL_7_LEVEL_OUTPUT		0x1000
++#define VGH1_DISCHARGE_MASK		0x0800
++#define VGH2_DISCHARGE_MASK		0x0400
++#define VPDD_LEN_DELAY_MASK		0x00ff
++
++#define PRE_ENABLE_TIMEOUT_MS		250
++#define EPD_XON_OFF_DELAY_MS		50
++#define EPD_VDD_RAMP_TIME_US		500
++#define EPD_VDD_STABLE_BEFORE_VNEG3_US	100
++#define EPD_VDD_BEFORE_ENABLE_US	(EPD_VDD_RAMP_TIME_US + EPD_VDD_STABLE_BEFORE_VNEG3_US)
++
++static const u16 vpdd_len[256] = {
++	    0,    50,   110,   160,   210,   270,   320,   380,   430,   490,
++	  540,   600,   650,   710,   760,   820,   870,   930,   990,  1040,
++	 1100,  1160,  1210,  1270,  1330,  1330,  1390,  1440,  1500,  1560,
++	 1620,  1680,  1740,  1800,  1860,  1920,  1980,  2040,  2100,  2160,
++	 2220,  2280,  2340,  2400,  2460,  2530,  2590,  2650,  2710,  2780,
++	 2840,  2900,  2970,  3030,  3100,  3160,  3230,  3290,  3360,  3420,
++	 3490,  3550,  3620,  3690,  3750,  3820,  3890,  4030,  4090,  4160,
++	 4230,  4300,  4370,  4440,  4510,  4580,  4650,  4720,  4800,  4870,
++	 4940,  5010,  5080,  5160,  5230,  5310,  5380,  5450,  5530,  5600,
++	 5680,  5760,  5830,  5910,  5990,  6060,  6140,  6220,  6300,  6380,
++	 6460,  6540,  6620,  6700,  6780,  6860,  6940,  7020,  7110,  7190,
++	 7270,  7360,  7440,  7520,  7610,  7700,  7780,  7870,  7960,  8040,
++	 8130,  8220,  8310,  8400,  8490,  8590,  8680,  8760,  8850,  8950,
++	 9040,  9130,  9230,  9320,  9420,  9510,  9610,  9710,  9910,  9900,
++	10000, 10100, 10200, 10300, 10400, 10510, 10610, 10710, 10820, 10920,
++	11030, 11130, 11240, 11350, 11460, 11570, 11680, 11790, 11900, 12010,
++	12120, 12240, 12350, 12470, 12580, 12700, 12820, 12940, 13060, 13180,
++	13300, 13420, 13540, 13670, 13790, 13920, 14050, 14170, 14300, 14430,
++	14570, 14700, 14830, 14970, 15100, 15240, 15380, 15520, 15660, 15800,
++	15940, 16090, 16230, 16380, 16530, 16680, 16830, 16980, 17140, 17290,
++	17450, 17610, 17770, 17930, 18100, 18260, 18430, 18600, 18770, 18940,
++	19120, 19290, 19470, 19650, 19830, 20020, 20210, 20390, 20590, 20780,
++	20980, 21170, 21370, 21580, 21780, 21990, 22200, 22420, 22640, 22860,
++	23080, 23300, 23530, 23770, 24000, 24240, 24490, 24730, 24990, 25240,
++	25500, 25760, 26030, 26300, 26580, 26860, 27150, 27440, 27740, 28050,
++	28360, 28670, 28990, 29320, 29660, 30000
++};
++
++struct g2194_data {
++	struct regmap *regmap;
++	struct gpio_desc *pgood_gpio;
++	struct gpio_desc *enable_gpio;
++	struct gpio_desc *epd_vdd_gpio;
++	struct gpio_desc *epd_xon_gpio;
++	struct regulator *en_supply;
++	struct power_supply *vin_psy;
++	struct wakeup_source *wakesrc;
++	atomic_t pmic_enabled;
++	struct timer_list pre_enable_timer;
++	struct timer_list vpdd_timer;
++	struct timer_list xon_disable_timer;
++	unsigned int vpdd_timer_val_ms;
++	unsigned int min_battery_capacity;
++	unsigned int saved_reg[G2194_SAVED_REGISTERS_END / 2];
++};
++
++static const struct regmap_config g2194_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 16,
++	.val_format_endian = REGMAP_ENDIAN_BIG,
++};
++
++/*
++ * VPOS1 LDO
++ * 2.0V to 12.23V (10mV step)
++ */
++static const struct linear_range g2194_vpos1_volts[] = {
++	REGULATOR_LINEAR_RANGE(2000000, 0x00, 0x3FF, 10000),
++};
++
++/* VPOS2 LDO
++ * 5.0V to 20.345V (15mV step)
++ */
++static const struct linear_range g2194_vpos2_volts[] = {
++	REGULATOR_LINEAR_RANGE(5000000, 0x00, 0x3FF, 15000),
++};
++
++/* VPOS3 LDO
++ * 9.0V to 30.483V (21mV step)
++ */
++static const struct linear_range g2194_vpos3_volts[] = {
++	REGULATOR_LINEAR_RANGE(9000000, 0x00, 0x3FF, 21000),
++};
++
++/*
++ * VNEG1 LDO
++ * -2.0V to -12.23V (10mV step)
++ * Represented as positive values.
++ */
++static const struct linear_range g2194_vneg1_volts[] = {
++	REGULATOR_LINEAR_RANGE(2000000, 0x00, 0x3FF, 10000),
++};
++
++/* VNEG2 LDO
++ * -5.0V to -20.345V (15mV step)
++ * Represented as positive values.
++ */
++static const struct linear_range g2194_vneg2_volts[] = {
++	REGULATOR_LINEAR_RANGE(5000000, 0x00, 0x3FF, 15000),
++};
++
++/* VNEG3 LDO
++ * -9.0V to -30.483V (21mV step)
++ * Represented as positive values.
++ */
++static const struct linear_range g2194_vneg3_volts[] = {
++	REGULATOR_LINEAR_RANGE(9000000, 0x00, 0x3FF, 21000),
++};
++
++/* VCOM
++ * -5.015V to +5V (19.6mV)
++ * Only implemented -5.15V to 0, represented as 0 to 5.015V due to
++ * unsupported negative voltages in regulator subsystem
++ */
++static const struct linear_range g2194_vcom_volts[] = {
++	REGULATOR_LINEAR_RANGE(17600, 0x100, 0x1ff, 19600),
++};
++
++/* VPDD
++ * +2V to +10V (500mV)
++ */
++static const struct linear_range g2194_vpdd_volts[] = {
++	REGULATOR_LINEAR_RANGE(2000000, 0x00, 0x10, 500000),
++};
++
++static int g2194_set_tdly_value(struct device_node *np,
++				const struct regulator_desc *desc,
++				struct regulator_config *cfg)
++{
++	int ret;
++	u32 tdly;
++
++	ret = of_property_read_u32(np, "gmt,tdly", &tdly);
++	if (ret == -EINVAL)
++		return 0;
++	else if (ret)
++		return ret;
++
++	if (tdly > 3) {
++		dev_warn(cfg->dev, "Unsupported tdly value\n");
++		return 0;
++	}
++
++	tdly = tdly << (ffs(desc->soft_start_mask) - 1);
++
++	if (desc->soft_start_mask && desc->soft_start_reg)
++		ret = regmap_update_bits(cfg->regmap, desc->soft_start_reg,
++					 desc->soft_start_mask, tdly);
++
++	return ret;
++}
++
++static int g2194_get_status(struct regulator_dev *rdev)
++{
++	struct g2194_data *data = dev_get_drvdata(rdev->dev.parent);
++
++	return atomic_read(&data->pmic_enabled);
++}
++
++static int g2194_check_battery(struct device *dev, struct g2194_data *data)
++{
++	int ret;
++	union power_supply_propval propval;
++
++	ret = power_supply_get_property(data->vin_psy,
++					POWER_SUPPLY_PROP_PRESENT,
++					&propval);
++	if (ret)
++		return ret;
++
++	if (propval.intval == 0) {
++		dev_err(dev, "Battery not connected. Skipping enable.\n");
++		return -EFAULT;
++	}
++
++	if (data->min_battery_capacity == 0)
++		return 0;
++
++	ret = power_supply_get_property(data->vin_psy,
++					POWER_SUPPLY_PROP_CAPACITY,
++					&propval);
++	if (ret)
++		return ret;
++
++	if (propval.intval < data->min_battery_capacity) {
++		dev_err(dev, "Battery at too low capacity (%d < %u). Skipping enable.\n",
++			propval.intval, data->min_battery_capacity);
++		return -EFAULT;
++	}
++
++	return 0;
++}
++
++static int g2194_vcom_enable(struct regulator_dev *rdev)
++{
++	struct g2194_data *data = dev_get_drvdata(rdev->dev.parent);
++	int ret;
++	int pgood;
++	ktime_t t0;
++	u32 f1, f3;
++
++	ret = g2194_check_battery(&rdev->dev, data);
++	if (ret)
++		return ret;
++
++	if (timer_delete_sync(&data->vpdd_timer)) {
++		/* force del xon_disable_timer and disable epd vdd */
++		timer_delete_sync(&data->xon_disable_timer);
++		gpiod_set_value_cansleep(data->epd_vdd_gpio, 0);
++		usleep_range(1000, 1500);
++		/* keep wakesrc active */
++	}
++
++	/* Cancel any existing timer to avoid any race situations */
++	atomic_set(&data->pmic_enabled, 1);
++	timer_delete_sync(&data->pre_enable_timer);
++
++	/* Prevent opportunistic sleep as long vcom is enabled */
++	__pm_stay_awake(data->wakesrc);
++
++	gpiod_set_value_cansleep(data->epd_xon_gpio, 1);
++	gpiod_set_value_cansleep(data->epd_vdd_gpio, 1);
++	usleep_range(EPD_VDD_BEFORE_ENABLE_US, EPD_VDD_BEFORE_ENABLE_US + 100);
++
++	gpiod_set_value_cansleep(data->enable_gpio, 1);
++
++	t0 = ktime_get();
++
++	ret = read_poll_timeout(gpiod_get_value_cansleep, pgood, pgood == 1,
++				100, 200000, 5, data->pgood_gpio);
++
++	if (ret) {
++		gpiod_set_value_cansleep(data->enable_gpio, 0);
++		gpiod_set_value_cansleep(data->epd_vdd_gpio, 0);
++		gpiod_set_value_cansleep(data->epd_xon_gpio, 0);
++
++		regmap_read(data->regmap, G2194_REG_FAULT_1, &f1);
++		regmap_read(data->regmap, G2194_REG_FAULT_3, &f3);
++
++		dev_err(&rdev->dev, "Power good signal timeout 0x%x/0x%x/0x%x\n",
++			f1 & 0xff, (f1 >> 8) & 0xff, f3);
++
++		atomic_set(&data->pmic_enabled, 0);
++	} else {
++		dev_dbg(&rdev->dev, "pgood took %lld us\n",
++			ktime_to_us(ktime_get()) - ktime_to_us(t0));
++	}
++
++	return ret;
++}
++
++static int g2194_vcom_disable(struct regulator_dev *rdev)
++{
++	struct g2194_data *data = dev_get_drvdata(rdev->dev.parent);
++
++	gpiod_set_value_cansleep(data->enable_gpio, 0);
++
++	if (data->vpdd_timer_val_ms) {
++		mod_timer(&data->xon_disable_timer,
++			  jiffies + msecs_to_jiffies(EPD_XON_OFF_DELAY_MS));
++
++		mod_timer(&data->vpdd_timer,
++			  jiffies + msecs_to_jiffies(data->vpdd_timer_val_ms));
++	} else {
++		gpiod_set_value_cansleep(data->epd_vdd_gpio, 0);
++		gpiod_set_value_cansleep(data->epd_xon_gpio, 0);
++
++		/* Unblock opportunistic sleep */
++		WARN_ON(!data->wakesrc->active);
++		__pm_relax(data->wakesrc);
++	}
++
++	/* It is always allowed to interrupt the PDD */
++	atomic_set(&data->pmic_enabled, 0);
++
++	return 0;
++}
++
++static int g2194_set_vpdd_length(struct g2194_data *data, int val)
++{
++	return regmap_update_bits(data->regmap, G2194_REG_CONTROL_REG,
++				  VPDD_LEN_DELAY_MASK, val);
++}
++
++static int g2194_set_pdd_mode(struct g2194_data *data, bool enable)
++{
++	return regmap_update_bits(data->regmap, G2194_REG_PWRON_DELAY_3,
++				  PDD_POWER_OFF_SEQ_MASK,
++				  enable ? PDD_POWER_OFF_SEQ_MASK : 0);
++}
++
++static void g2194_pre_enable_timeout_func(struct timer_list *t)
++{
++	struct g2194_data *data = timer_container_of(data, t, pre_enable_timer);
++
++	if (atomic_read(&data->pmic_enabled))
++		return;
++
++	gpiod_set_value(data->enable_gpio, 0);
++	gpiod_set_value(data->epd_vdd_gpio, 0);
++	gpiod_set_value(data->epd_xon_gpio, 0);
++
++	WARN_ON(!data->wakesrc->active);
++	__pm_relax(data->wakesrc);
++}
++
++static void g2194_vpdd_timeout_func(struct timer_list *t)
++{
++	struct g2194_data *data = timer_container_of(data, t, vpdd_timer);
++	gpiod_set_value(data->epd_vdd_gpio, 0);
++
++	WARN_ON(!data->wakesrc->active);
++	__pm_relax(data->wakesrc);
++}
++
++static void g2194_xon_disable_timeout_func(struct timer_list *t)
++{
++	struct g2194_data *data = timer_container_of(data, t, xon_disable_timer);
++
++	gpiod_set_value(data->epd_xon_gpio, 0);
++}
++
++static int g2194_find_closest_vpdd_length(struct device *dev, u32 vpdd_len_ms)
++{
++	int i;
++	int match_index = 0;
++
++	if (vpdd_len_ms > vpdd_len[255]) {
++		dev_err(dev, "Invalid vpdd_len_ms value %d max: %d\n",
++			vpdd_len_ms, vpdd_len[255]);
++		return -EINVAL;
++	}
++
++	/* Linear search find closest match */
++	for (i = 0; i < ARRAY_SIZE(vpdd_len); i++) {
++		int current_val = vpdd_len[i];
++
++		if (current_val <= vpdd_len_ms)
++			match_index = i;
++
++		if (current_val == vpdd_len_ms)
++			break;
++		else if (current_val > vpdd_len_ms) {
++			int prev_diff = vpdd_len_ms - vpdd_len[match_index];
++			int cur_diff = current_val - vpdd_len_ms;
++			int cmp = min(prev_diff, cur_diff);
++
++			if (cmp == cur_diff)
++				match_index = i;
++
++			break;
++		}
++	}
++
++	return match_index;
++}
++
++static const struct regulator_ops g2194_reg_ops = {
++	.list_voltage = regulator_list_voltage_linear_range,
++	.map_voltage = regulator_map_voltage_linear_range,
++	.set_voltage_sel = regulator_set_voltage_sel_regmap,
++	.get_voltage_sel = regulator_get_voltage_sel_regmap,
++	.get_status = g2194_get_status,
++};
++
++static const struct regulator_ops g2194_reg_vcom_ops = {
++	.list_voltage = regulator_list_voltage_linear_range,
++	.map_voltage = regulator_map_voltage_linear_range,
++	.set_voltage_sel = regulator_set_voltage_sel_regmap,
++	.get_voltage_sel = regulator_get_voltage_sel_regmap,
++	.get_status = g2194_get_status,
++	.is_enabled = g2194_get_status,
++	.enable = g2194_vcom_enable,
++	.disable = g2194_vcom_disable,
++	.set_active_discharge = regulator_set_active_discharge_regmap,
++};
++
++static const struct regulator_ops g2194_reg_fixed_ops = {
++	.get_status = g2194_get_status,
++};
++
++static const struct regulator_ops g2194_reg_fixed_ops_vgh = {
++	.get_status = g2194_get_status,
++	.set_active_discharge = regulator_set_active_discharge_regmap,
++};
++
++#define REGULATOR_DESC(_name, _id, _linear_range, _ops) \
++	.name = #_name, \
++	.of_match = of_match_ptr(#_name), \
++	.regulators_node = of_match_ptr("regulators"), \
++	.id = _id, \
++	.ops = &_ops, \
++	.type = REGULATOR_VOLTAGE, \
++	.n_voltages = _name ## _VOLTAGE_CTRL_MASK + 1, \
++	.linear_ranges = _linear_range, \
++	.n_linear_ranges = ARRAY_SIZE(_linear_range), \
++	.vsel_reg = G2194_REG_ ## _name ## _SETTING_BASE, \
++	.vsel_mask = _name ## _VOLTAGE_CTRL_MASK, \
++	.owner = THIS_MODULE
++
++#define REGULATOR_DESC_LDO(_name, _id, _linear_range, _ops, \
++			   _tdly_reg, _tdly_mask) { \
++	REGULATOR_DESC(_name, _id, _linear_range, _ops), \
++	.soft_start_reg = _tdly_reg, \
++	.soft_start_mask = _tdly_mask, \
++	.of_parse_cb = g2194_set_tdly_value, \
++}
++
++#define REGULATOR_DESC_VCOM(_name, _id, _linear_range, _ops) { \
++	REGULATOR_DESC(_name, _id, _linear_range, _ops), \
++	.off_on_delay = 30800, \
++	.active_discharge_reg = G2194_REG_VCOM_SETTING_BASE, \
++	.active_discharge_on = 0, \
++	.active_discharge_off = VCOM_DISCHARGE_MASK, \
++	.active_discharge_mask = VCOM_DISCHARGE_MASK, \
++}
++
++#define REGULATOR_DESC_FIXED(_name, _id, _ops, _tdly_reg, _tdly_mask) \
++	.name = #_name, \
++	.of_match = of_match_ptr(#_name), \
++	.regulators_node = of_match_ptr("regulators"), \
++	.id = _id, \
++	.ops = &_ops, \
++	.type = REGULATOR_VOLTAGE, \
++	.n_voltages = 1, \
++	.soft_start_reg = _tdly_reg, \
++	.soft_start_mask = _tdly_mask, \
++	.of_parse_cb = g2194_set_tdly_value, \
++	.owner = THIS_MODULE
++
++#define REGULATOR_DESC_FIXED_VGH(_name, _id, _tdly_reg, _tdly_mask, \
++				 _discharge_reg, _discharge_on, _discharge_off, \
++				 _discharge_mask) { \
++	REGULATOR_DESC_FIXED(_name, _id, g2194_reg_fixed_ops_vgh, _tdly_reg, _tdly_mask), \
++	.active_discharge_reg = _discharge_reg, \
++	.active_discharge_on = _discharge_on, \
++	.active_discharge_off = _discharge_off, \
++	.active_discharge_mask = _discharge_mask, \
++}
++
++static const struct regulator_desc g2194_regulators[] = {
++	{
++		REGULATOR_DESC_FIXED(VPX, 0, g2194_reg_fixed_ops,
++				     G2194_REG_PWRON_DELAY_1,
++				     VPX_TO_VGL_RAMP_MASK)
++	},
++	{
++		REGULATOR_DESC_FIXED(VGL, 1, g2194_reg_fixed_ops,
++				     G2194_REG_PWRON_DELAY_1,
++				     VGL_TO_VNEG3_RAMP_MASK)
++	},
++	REGULATOR_DESC_LDO(VNEG3, 2, g2194_vneg3_volts, g2194_reg_ops,
++			   G2194_REG_PWRON_DELAY_1, VNEG3_TO_VNEG2_RAMP_MASK),
++	REGULATOR_DESC_LDO(VNEG2, 3, g2194_vneg2_volts, g2194_reg_ops,
++			   G2194_REG_PWRON_DELAY_1, VNEG2_TO_VNEG1_RAMP_MASK),
++	REGULATOR_DESC_LDO(VNEG1, 4, g2194_vneg1_volts, g2194_reg_ops,
++			   G2194_REG_PWRON_DELAY_1, VNEG1_TO_VPOS3_RAMP_MASK),
++	REGULATOR_DESC_LDO(VPOS3, 5, g2194_vpos3_volts, g2194_reg_ops,
++			   G2194_REG_PWRON_DELAY_1, VPOS3_TO_VPOS2_RAMP_MASK),
++	REGULATOR_DESC_LDO(VPOS2, 6, g2194_vpos2_volts, g2194_reg_ops,
++			   G2194_REG_PWRON_DELAY_1, VPOS2_TO_VPOS1_RAMP_MASK),
++	REGULATOR_DESC_LDO(VPOS1, 7, g2194_vpos1_volts, g2194_reg_ops,
++			   G2194_REG_PWRON_DELAY_1, VPOS1_TO_VGH1_RAMP_MASK),
++	REGULATOR_DESC_FIXED_VGH(VGH1, 8, G2194_REG_PWRON_DELAY_3,
++				 VGH1_TO_VGH2_RAMP_MASK, G2194_REG_CONTROL_REG,
++				 0, VGH1_DISCHARGE_MASK, VGH1_DISCHARGE_MASK),
++	REGULATOR_DESC_FIXED_VGH(VGH2, 9, 0, 0, G2194_REG_CONTROL_REG,
++				 0, VGH2_DISCHARGE_MASK, VGH2_DISCHARGE_MASK),
++	{
++		REGULATOR_DESC(VPDD, 10, g2194_vpdd_volts, g2194_reg_ops)
++	},
++	REGULATOR_DESC_VCOM(VCOM, 11, g2194_vcom_volts, g2194_reg_vcom_ops),
++};
++
++static ssize_t vpdd_length_store(struct device *dev, struct device_attribute *attr,
++				 const char *buf, size_t count)
++{
++	int val;
++	int ret;
++	int match_index;
++	struct g2194_data *data = dev_get_drvdata(dev);
++
++	ret = kstrtoint(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	match_index = g2194_find_closest_vpdd_length(dev, val);
++	dev_dbg(dev, "Found match index %d val: %d\n", match_index, vpdd_len[match_index]);
++
++	ret = g2194_set_vpdd_length(data, match_index);
++	if (ret)
++		return ret;
++
++	data->vpdd_timer_val_ms = vpdd_len[match_index];
++	ret = g2194_set_pdd_mode(data, !!data->vpdd_timer_val_ms);
++	if (ret)
++		return ret;
++
++	return count;
++}
++
++static ssize_t vpdd_length_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	struct g2194_data *data = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", data->vpdd_timer_val_ms);
++}
++
++static ssize_t vpdd_timeout_ms_show(struct device *dev,
++				    struct device_attribute *attr, char *buf)
++{
++	struct g2194_data *data = dev_get_drvdata(dev);
++	unsigned long delta = 0;
++
++	if (atomic_read(&data->pmic_enabled))
++		return sysfs_emit(buf, "%d\n", data->vpdd_timer_val_ms);
++
++	if (timer_pending(&data->vpdd_timer))
++		delta = data->vpdd_timer.expires - jiffies;
++
++	return sysfs_emit(buf, "%u\n", jiffies_delta_to_msecs(delta));
++}
++
++static int g2194_early_enable(struct g2194_data *data)
++{
++	/* delete potential running PDD timer */
++	if (timer_delete_sync(&data->vpdd_timer)) {
++		/* force del xon_disable_timer and disable epd vdd */
++		timer_delete_sync(&data->xon_disable_timer);
++		gpiod_set_value_cansleep(data->epd_vdd_gpio, 0);
++		usleep_range(1000, 1500);
++		/* keep wakesrc active */
++	}
++
++	__pm_stay_awake(data->wakesrc);
++
++	gpiod_set_value_cansleep(data->epd_xon_gpio, 1);
++	gpiod_set_value_cansleep(data->epd_vdd_gpio, 1);
++	usleep_range(EPD_VDD_BEFORE_ENABLE_US, EPD_VDD_BEFORE_ENABLE_US + 100);
++
++	gpiod_set_value_cansleep(data->enable_gpio, 1);
++
++	mod_timer(&data->pre_enable_timer, jiffies +
++		  msecs_to_jiffies(PRE_ENABLE_TIMEOUT_MS));
++
++	return 0;
++}
++
++static ssize_t enable_nowait_store(struct device *dev, struct device_attribute *attr,
++				   const char *buf, size_t count)
++{
++	int ret;
++	struct g2194_data *data = dev_get_drvdata(dev);
++
++	ret = g2194_check_battery(dev, data);
++	if (ret)
++		return ret;
++
++	if (!sysfs_streq(buf, "1")) {
++		dev_err(dev, "Invalid value. Only Enable allowed\n");
++		return -EINVAL;
++	}
++
++	if (!atomic_read(&data->pmic_enabled))
++		ret = g2194_early_enable(data);
++
++
++	return ret ? ret : count;
++}
++
++static DEVICE_ATTR_RW(vpdd_length);
++static DEVICE_ATTR_RO(vpdd_timeout_ms);
++static DEVICE_ATTR_WO(enable_nowait);
++
++static struct attribute *g2194_attributes[] = {
++	&dev_attr_vpdd_length.attr,
++	&dev_attr_vpdd_timeout_ms.attr,
++	&dev_attr_enable_nowait.attr,
++	NULL,
++};
++
++static const struct attribute_group g2194_attr_group = {
++	.attrs	= g2194_attributes,
++};
++
++static int g2194_parse_delay_settings(struct regmap *regmap,
++				      struct device *dev)
++{
++	u32 ss;
++	const u32 ss_min = 3;
++	int ret = 0;
++	struct device_node *np = dev->of_node;
++
++	if (!of_property_read_u32(np, "gmt,soft-start", &ss)) {
++		if (ss >= ss_min && ss <= 6) {
++			ss = (ss - ss_min) << (ffs(PMIC_SOFT_START_TIME_MASK) - 1);
++			ret = regmap_update_bits(regmap, G2194_REG_CONTROL_REG,
++						 PMIC_SOFT_START_TIME_MASK, ss);
++		} else {
++			dev_info(dev, "Unsupported soft start value (%u)\n", ss);
++		}
++	}
++
++	if (ret)
++		dev_err(dev, "Failed to set ss value (%u)(%d)\n", ss, ret);
++
++	return ret;
++}
++
++static int g2194_shutdown_handler(struct sys_off_data *sysoff)
++{
++	struct g2194_data *data = sysoff->cb_data;
++
++	timer_delete_sync(&data->xon_disable_timer);
++
++	if (timer_delete_sync(&data->vpdd_timer)) {
++		/* GMT explaination on how to manually abort the HW PDD timer
++		 *
++		 * You can also use the ON_OFF[6] bit of register 0x18h
++		 * to interrupt PDD.
++		 * When EN = low, first change ON_OFF[6] from "1" to "0".
++		 * PDD can be interrupted when ON_OFF[6] is changed back to "1"
++		 */
++		regmap_update_bits(data->regmap, G2194_REG_KEEP_ALIVE_ON_OFF,
++				   ON_OFF_POWER_RAILS_MASK, 0);
++		regmap_update_bits(data->regmap, G2194_REG_KEEP_ALIVE_ON_OFF,
++				   ON_OFF_POWER_RAILS_MASK,
++				   ON_OFF_POWER_RAILS_MASK);
++
++		/* wait for VPDD to discharge to 0V */
++		usleep_range(150 * 1000, 200 * 1000);
++	}
++
++	return 0;
++}
++
++static int g2194_regulator_probe(struct i2c_client *i2c)
++{
++	int i;
++	int ret;
++	struct g2194_data *data;
++	struct regulator_config config = { };
++
++	data = devm_kzalloc(&i2c->dev, sizeof(struct g2194_data), GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	dev_set_drvdata(&i2c->dev, data);
++
++	data->regmap = devm_regmap_init_i2c(i2c, &g2194_regmap_config);
++	if (IS_ERR(data->regmap))
++		return dev_err_probe(&i2c->dev, PTR_ERR(data->regmap),
++				     "regmap initialization failed\n");
++
++	of_property_read_u32(i2c->dev.of_node, "min-battery", &data->min_battery_capacity);
++
++	data->pgood_gpio = devm_gpiod_get(&i2c->dev, "power-good", GPIOD_IN);
++	if (IS_ERR(data->pgood_gpio))
++		return dev_err_probe(&i2c->dev, PTR_ERR(data->pgood_gpio),
++				     "Power good GPIO fault\n");
++
++	data->enable_gpio = devm_gpiod_get(&i2c->dev, "enable", GPIOD_OUT_LOW);
++	if (IS_ERR(data->enable_gpio))
++		return dev_err_probe(&i2c->dev, PTR_ERR(data->enable_gpio),
++				     "Enable GPIO fault\n");
++
++	data->epd_vdd_gpio = devm_gpiod_get(&i2c->dev, "epd-vdd", GPIOD_OUT_LOW);
++	if (IS_ERR(data->epd_vdd_gpio))
++		return dev_err_probe(&i2c->dev, PTR_ERR(data->epd_vdd_gpio),
++				     "epd vdd GPIO fault\n");
++
++	data->epd_xon_gpio = devm_gpiod_get(&i2c->dev, "epd-xon", GPIOD_OUT_LOW);
++	if (IS_ERR(data->epd_xon_gpio))
++		return dev_err_probe(&i2c->dev, PTR_ERR(data->epd_xon_gpio),
++				     "epd xon GPIO fault\n");
++
++	data->vin_psy = devm_power_supply_get_by_reference(&i2c->dev,
++							 "vin-power-supply");
++	if (IS_ERR(data->vin_psy))
++		return dev_err_probe(&i2c->dev, PTR_ERR(data->vin_psy),
++				     "Failed to get VIN supply\n");
++	if (!data->vin_psy)
++		return dev_err_probe(&i2c->dev, -EPROBE_DEFER, "VIN supply not ready");
++
++	data->en_supply = devm_regulator_get(&i2c->dev, "en");
++	if (IS_ERR(data->en_supply))
++		return dev_err_probe(&i2c->dev, PTR_ERR(data->en_supply),
++				     "Failed to get EN supply\n");
++
++	g2194_parse_delay_settings(data->regmap, &i2c->dev);
++
++	if (of_property_read_bool(i2c->dev.of_node, "gmt,7-level-vgh2-only")) {
++		ret = regmap_update_bits(data->regmap, G2194_REG_CONTROL_REG,
++					 VGH2_VGL_7_LEVEL_OUTPUT,
++					 VGH2_VGL_7_LEVEL_OUTPUT);
++		if (ret)
++			dev_err(&i2c->dev, "Failed to set gmt,7-level-vgh2-only\n");
++	}
++
++	if (of_property_read_bool(i2c->dev.of_node, "gmt,enable-pdd")) {
++		int vpdd_reg;
++
++		if (!of_property_read_u32(i2c->dev.of_node, "gmt,vpdd-length-ms",
++					  &data->vpdd_timer_val_ms))
++			data->vpdd_timer_val_ms = 6000;
++
++		vpdd_reg = g2194_find_closest_vpdd_length(&i2c->dev, data->vpdd_timer_val_ms);
++		data->vpdd_timer_val_ms = vpdd_len[vpdd_reg];
++		ret = g2194_set_vpdd_length(data, vpdd_reg);
++		if (ret)
++			dev_err(&i2c->dev, "Failed to set vpdd length\n");
++
++		ret = g2194_set_pdd_mode(data, !!data->vpdd_timer_val_ms);
++		if (ret)
++			dev_err(&i2c->dev, "Failed to enable PDD power off sequence\n");
++	}
++
++	config.dev = &i2c->dev;
++	config.driver_data = data;
++	config.regmap = data->regmap;
++
++	for (i = 0; i < ARRAY_SIZE(g2194_regulators); i++) {
++		struct regulator_dev *rdev;
++
++		rdev = devm_regulator_register(config.dev, &g2194_regulators[i],
++					       &config);
++		if (IS_ERR(rdev)) {
++			dev_err(config.dev, "failed to register %s regulator\n",
++					g2194_regulators[i].name);
++			return PTR_ERR(rdev);
++		}
++	}
++
++	ret = sysfs_create_group(&i2c->dev.kobj, &g2194_attr_group);
++	if (ret != 0) {
++		dev_err(&i2c->dev,
++			"Failed to create attribute group: %d\n", ret);
++		return ret;
++	}
++
++	ret = devm_register_sys_off_handler(&i2c->dev,
++					    SYS_OFF_MODE_RESTART_PREPARE,
++					    SYS_OFF_PRIO_DEFAULT,
++					    g2194_shutdown_handler, data);
++	if (ret)
++		return ret;
++
++	ret = devm_register_sys_off_handler(&i2c->dev,
++					    SYS_OFF_MODE_POWER_OFF_PREPARE,
++					    SYS_OFF_PRIO_DEFAULT,
++					    g2194_shutdown_handler, data);
++	if (ret)
++		return ret;
++
++	data->wakesrc = wakeup_source_register(&i2c->dev, dev_name(&i2c->dev));
++	if (!data->wakesrc) {
++		dev_err(&i2c->dev, "Failed to register wakeup source\n");
++		/* continue */
++	}
++
++	timer_setup(&data->pre_enable_timer, g2194_pre_enable_timeout_func, 0);
++	timer_setup(&data->vpdd_timer, g2194_vpdd_timeout_func, 0);
++	timer_setup(&data->xon_disable_timer, g2194_xon_disable_timeout_func, 0);
++
++	return 0;
++}
++
++static void g2194_regulator_remove(struct i2c_client *i2c)
++{
++	struct g2194_data *data = i2c_get_clientdata(i2c);
++
++	wakeup_source_unregister(data->wakesrc);
++	sysfs_remove_group(&i2c->dev.kobj, &g2194_attr_group);
++}
++
++static int g2194_regulator_save_restore(struct g2194_data *data, bool save)
++{
++	int i;
++	int k;
++	int ret = 0;
++
++	for (k = 0, i = 1; i < G2194_SAVED_REGISTERS_END; k++, i = i + 2) {
++		if (save)
++			ret = regmap_read(data->regmap, i, &data->saved_reg[k]);
++		else
++			ret = regmap_write(data->regmap, i, data->saved_reg[k]);
++
++		if (ret)
++			return ret;
++	}
++
++	return ret;
++}
++
++static bool g2194_safe_to_suspend(struct device *dev)
++{
++	struct g2194_data *data = i2c_get_clientdata(to_i2c_client(dev));
++
++	/* Sanity check - ensure that EPD PMIC is off and that (delayed)
++	 * EPD VDD disabling has been done.
++	 */
++
++	if (atomic_read(&data->pmic_enabled)) {
++		dev_err(dev, "Can't suspend, epd pmic enabled\n");
++		return false;
++	}
++
++	if (timer_pending(&data->vpdd_timer)) {
++		dev_err(dev, "Can't suspend, vpdd timer running\n");
++		return false;
++	}
++
++	return true;
++}
++
++static int g2194_regulator_suspend(struct device *dev)
++{
++	struct g2194_data *data = i2c_get_clientdata(to_i2c_client(dev));
++
++	if (!g2194_safe_to_suspend(dev))
++		return -EAGAIN;
++
++	return g2194_regulator_save_restore(data, true);
++}
++
++static int g2194_regulator_resume(struct device *dev)
++{
++	struct g2194_data *data = i2c_get_clientdata(to_i2c_client(dev));
++
++	return g2194_regulator_save_restore(data, false);
++}
++
++static const struct dev_pm_ops g2194_regulator_pm = {
++	SET_SYSTEM_SLEEP_PM_OPS(g2194_regulator_suspend, g2194_regulator_resume)
++};
++
++static const struct of_device_id g2194_regulator_of_match[] = {
++	{ .compatible = "gmt,g2194-regulator", },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, g2194_regulator_of_match);
++
++static struct i2c_driver g2194_regulator_driver = {
++	.driver = {
++		.name = "g2194-regulator",
++		.of_match_table = g2194_regulator_of_match,
++		.pm = &g2194_regulator_pm,
++	},
++	.probe = g2194_regulator_probe,
++	.remove = g2194_regulator_remove,
++};
++module_i2c_driver(g2194_regulator_driver);
++
++MODULE_DESCRIPTION("G2194 voltage regulator driver");
++MODULE_LICENSE("GPL v2");

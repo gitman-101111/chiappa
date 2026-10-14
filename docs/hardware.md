@@ -19,7 +19,7 @@ All figures below were read off an owned retail unit (codename **chiappa**;
 
 | Function | Part / driver |
 |---|---|
-| Display | custom reMarkable EPD panel — DT `remarkable,cumulus-panel`, over **LVDS → LCDIFv3** (`imx-lcdifv3`, `imx93-parallel-disp-fmt`, `panel-rm-cumulus`) |
+| Display | custom reMarkable EPD panel — DT `remarkable,cumulus-panel`, over the **16-bit parallel display interface from LCDIFv3** (`imx-lcdifv3`, `imx93-parallel-disp-fmt` in RGB565 mode, `panel-rm-cumulus`; the DRM connector is named `LVDS-1` only because the panel driver registers that connector type) |
 | Touch | Elan SPI (`elants_spi`) |
 | Wi-Fi / BT / NFC | NXP **IW611** combo (mwifiex-family Wi-Fi, NXP UART BT, NFC) |
 | USB | USB-C OTG via `ci_hdrc_imx` (ChipIdea); gadget = **CDC ECM** (host side `10.11.99.1`) |
@@ -124,6 +124,7 @@ Running the vendor recovery does **not** re-lock it. This is why unsigned images
 
 ## PCBA revisions
 
-The vendor kernel ships several near-identical device trees (revisions F–K); U-Boot
-selects one by detected PCBA revision. For a custom kernel you generally only need the
-revision matching your unit (read it from the running vendor system).
+The vendor firmware ships several near-identical device trees (revisions F–K); U-Boot
+selects one by detected PCBA revision, so a FIT must offer a configuration named for
+each revision. The mainline DTS in `kernel/` serves all of them (the six vendor DTBs
+are byte-identical).

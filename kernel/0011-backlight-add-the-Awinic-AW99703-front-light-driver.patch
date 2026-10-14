@@ -1,0 +1,1188 @@
+From 5ab5eeaec4d9971d5abcfe6b0023de5e5115c004 Mon Sep 17 00:00:00 2001
+From: gitman-101111 <development@spamfolder.xyz>
+Date: Mon, 12 Oct 2026 10:23:08 -0600
+Subject: [PATCH] backlight: add the Awinic AW99703 front light driver
+
+I2C WLED driver registered as "rm_frontlight", with ramp/current/OVP
+configuration from the device tree and the stop_on_suspend parameter the
+sleep path uses. Ported from reMarkable's linux-imx-rm 6.12 tree.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/video/backlight/Kconfig      |   11 +
+ drivers/video/backlight/Makefile     |    1 +
+ drivers/video/backlight/aw99703_bl.c | 1131 ++++++++++++++++++++++++++
+ 3 files changed, 1143 insertions(+)
+ create mode 100644 drivers/video/backlight/aw99703_bl.c
+
+diff --git a/drivers/video/backlight/Kconfig b/drivers/video/backlight/Kconfig
+index 39cb7dfb9..91991f761 100644
+--- a/drivers/video/backlight/Kconfig
++++ b/drivers/video/backlight/Kconfig
+@@ -156,6 +156,17 @@ config BACKLIGHT_ATMEL_LCDC
+ 	  If in doubt, it's safe to enable this option; it doesn't kick
+ 	  in unless the board's description says it's wired that way.
+ 
++config BACKLIGHT_AW99703
++	tristate "AW99703 WLED Backlight Driver"
++	depends on I2C && (GPIOLIB || COMPILE_TEST)
++	select REGMAP_I2C
++	help
++	  Say y to enable the backlight driver for the Awinic AW99703 which is
++	  an I2C (and optionally a PWM) controlled LED driver. This driver does
++	  not currently support controlling AW99703 via PWM directly.
++
++	  The chip supports 2048 brightness levels and up to three LED strings.
++
+ config BACKLIGHT_AW99706
+ 	tristate "Backlight Driver for Awinic AW99706"
+ 	depends on I2C
+diff --git a/drivers/video/backlight/Makefile b/drivers/video/backlight/Makefile
+index 21c8313cf..99fe16375 100644
+--- a/drivers/video/backlight/Makefile
++++ b/drivers/video/backlight/Makefile
+@@ -25,6 +25,7 @@ obj-$(CONFIG_BACKLIGHT_ADP8870)		+= adp8870_bl.o
+ obj-$(CONFIG_BACKLIGHT_APPLE)		+= apple_bl.o
+ obj-$(CONFIG_BACKLIGHT_APPLE_DWI)	+= apple_dwi_bl.o
+ obj-$(CONFIG_BACKLIGHT_AS3711)		+= as3711_bl.o
++obj-$(CONFIG_BACKLIGHT_AW99703)		+= aw99703_bl.o
+ obj-$(CONFIG_BACKLIGHT_AW99706)		+= aw99706.o
+ obj-$(CONFIG_BACKLIGHT_BD6107)		+= bd6107.o
+ obj-$(CONFIG_BACKLIGHT_CGBC)		+= cgbc_bl.o
+diff --git a/drivers/video/backlight/aw99703_bl.c b/drivers/video/backlight/aw99703_bl.c
+new file mode 100644
+index 000000000..a909c3ccf
+--- /dev/null
++++ b/drivers/video/backlight/aw99703_bl.c
+@@ -0,0 +1,1131 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2023, reMarkable AS - https://www.remarkable.com/
++ */
++#include <linux/backlight.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/version.h>
++#include <linux/debugfs.h>
++
++#define AW99703_MAX_BRIGHTNESS		2047
++#define AW99703_NUM_SOURCES		3
++
++#define AW99703_ID			0x00
++#define AW99703_ID_DFLT			0x03
++#define AW99703_SFTRST			0x01
++#define AW99703_SFTRST_DFLT		0x00
++#define AW99703_MODE			0x02
++#define AW99703_MODE_DFLT		0x00
++#define AW99703_MODE_WORKMODE		GENMASK(1, 0)
++#define AW99703_MODE_WORKMODE_STBY	0x00
++#define AW99703_MODE_WORKMODE_BL	0x01
++#define AW99703_MODE_WORKMODE_FLASH	0x10
++#define AW99703_MODE_MAP		BIT(2)
++#define AW99703_MODE_MAP_SHIFT		2
++#define AW99703_MODE_PDIS		BIT(4)
++#define AW99703_LEDCUR			0x03
++#define AW99703_LEDCUR_DFLT		0x9f
++#define AW99703_LEDCUR_CH1_SHIFT	0
++#define AW99703_LEDCUR_CH2_SHIFT	1
++#define AW99703_LEDCUR_CH3_SHIFT	2
++#define AW99703_LEDCUR_IFS		GENMASK(7, 3)
++#define AW99703_LEDCUR_IFS_SHIFT	3
++#define AW99703_LEDCUR_IFS_MAX		0x1f
++#define AW99703_BSTCTR1			0x04
++#define AW99703_BSTCTR1_DFLT		0x2e
++#define AW99703_BSTCTR1_OCPSEL		GENMASK(1, 0)
++#define AW99703_BSTCTR1_OCPSEL_MAX	0x03
++#define AW99703_BSTCTR1_OVPSEL		GENMASK(4, 2)
++#define AW99703_BSTCTR1_OVPSEL_MAX	0x07
++#define AW99703_BSTCTR1_OVPSEL_SHIFT	2
++#define AW99703_BSTCTR1_SF		BIT(5)
++#define AW99703_BSTCTR2			0x05
++#define AW99703_BSTCTR2_DFLT		0x00
++#define AW99703_BSTCTR2_EMISEL		GENMASK(5, 3)
++#define AW99703_BSTCTR2_EMISEL_SHIFT	3
++#define AW99703_BSTCTR2_EMISEL_MAX	0x07
++#define AW99703_BSTCTR2_INDSEL		BIT(6)
++#define AW99703_LEDLSB			0x06
++#define AW99703_LEDLSB_LSB		GENMASK(2, 0)
++#define AW99703_LEDLSB_DFLT		0x07
++#define AW99703_LEDMSB			0x07
++#define AW99703_LEDMSB_DFLT		0xff
++#define AW99703_PWM			0x08
++#define AW99703_PWM_DFLT		0x93
++#define AW99703_TURNCFG			0x09
++#define AW99703_TURNCFG_DFLT		0x44
++#define AW99703_TURNCFG_OFF		GENMASK(3, 0)
++#define AW99703_TURNCFG_ON		GENMASK(7, 4)
++#define AW99703_TURNCFG_ON_SHIFT	4
++#define AW99703_TURNCFG_MAX		0x0f
++#define AW99703_TRANCFG			0x0a
++#define AW99703_TRANCFG_DFLT		0x00
++#define AW99703_TRANCFG_IIC		GENMASK(3, 0)
++#define AW99703_TRANCFG_MAX		0x0f
++#define AW99703_FLASH			0x0b
++#define AW99703_FLASH_DFLT		0x58
++#define AW99703_AFHIGH			0x0c
++#define AW99703_AFHIGH_DFLT		0x80
++#define AW99703_AFLOW			0x0d
++#define AW99703_AFLOW_DFLT		0x10
++#define AW99703_FLAGS1			0x0e
++#define AW99703_FLAGS1_DFLT		0x00
++#define AW99703_FLAGS2			0x0f
++#define AW99703_FLAGS2_DFLT		0x00
++#define AW99703_REG_MAX			(AW99703_FLAGS2 + 1)
++
++#define DRV_NAME	"aw99703-bl"
++
++static bool stop_on_suspend;
++
++static const u16 iic_ramp_time[16] = {
++	0, 128, 192, 256, 320, 384, 448, 512,
++	576, 640, 768, 1024, 1280, 1536, 2560, 4096,
++};
++static const u16 on_ramp_time[16] = {
++	0, 1, 2, 4, 8, 16, 32, 64,
++	128, 256, 512, 1024, 2048, 4096, 8192, 16384,
++};
++
++struct aw99703_bl {
++	struct gpio_desc *enable_gpio;
++	struct backlight_device *bd;
++	struct regmap *regmap;
++	struct device *dev;
++
++
++	unsigned int default_brightness;
++	bool linear_mapping;
++	unsigned int led_sources[AW99703_NUM_SOURCES];
++	unsigned int max_full_scale_current;
++	unsigned int full_scale_current;
++	unsigned int emi;
++	unsigned int ocp;
++	unsigned int ovp;
++	bool reduced_sf;
++	bool big_inductor;
++	unsigned int off_time;
++	unsigned int on_time;
++	unsigned int ramp_time;
++	int ramp_up_diff_down_time;
++	unsigned long timeout;
++	struct dentry *debugfs;
++};
++
++static int aw99703_set_off_time(struct aw99703_bl *priv, unsigned int off_time_index)
++{
++	int ret = regmap_update_bits(priv->regmap, AW99703_TURNCFG,
++				     AW99703_TURNCFG_OFF, off_time_index);
++	if (ret)
++		return ret;
++
++	priv->off_time = off_time_index;
++
++	return 0;
++}
++
++static int aw99703_set_on_time(struct aw99703_bl *priv, unsigned int on_time_index)
++{
++	int ret = regmap_update_bits(priv->regmap, AW99703_TURNCFG,
++				     AW99703_TURNCFG_ON,
++				     on_time_index << AW99703_TURNCFG_ON_SHIFT);
++	if (ret)
++		return ret;
++
++	priv->on_time = on_time_index;
++
++	return 0;
++}
++
++static int aw99703_set_ramp_time(struct aw99703_bl *priv, unsigned int ramp_time_index)
++{
++	return regmap_update_bits(priv->regmap, AW99703_TRANCFG,
++				  AW99703_TRANCFG_IIC, ramp_time_index);
++}
++
++static int aw99703_get_brightness(struct aw99703_bl *priv)
++{
++	int ret;
++	unsigned int brightness;
++	unsigned int val;
++
++	ret = regmap_read(priv->regmap, AW99703_LEDLSB, &val);
++	if (ret)
++		return ret;
++
++	brightness = val & AW99703_LEDLSB_LSB;
++
++	ret = regmap_read(priv->regmap, AW99703_LEDMSB, &val);
++	if (ret)
++		return ret;
++
++	brightness += (val << 3);
++	brightness = clamp_val(brightness, 0U, AW99703_MAX_BRIGHTNESS);
++	return brightness;
++}
++
++static int aw99703_set_brightness(struct aw99703_bl *priv, unsigned int brightness)
++{
++	int ret;
++	int cur_brightness;
++	u8 ramp_time;
++
++	cur_brightness = aw99703_get_brightness(priv);
++	if (brightness == (unsigned int)cur_brightness)
++		return 0;
++
++	ramp_time = priv->ramp_time;
++	/* Change ramp-up time, if ramp time index is > 0 (index 0: 1us/step */
++	if (priv->ramp_time > 0 && brightness > (unsigned int)cur_brightness)
++		ramp_time = clamp((int)ramp_time + priv->ramp_up_diff_down_time,
++				  1, (int)ARRAY_SIZE(iic_ramp_time) - 1);
++
++	dev_dbg(priv->dev, "setting brightness to %d, ramp_time %d (%u ms)\n",
++		brightness, ramp_time, iic_ramp_time[ramp_time]);
++
++	ret = aw99703_set_ramp_time(priv, ramp_time);
++	if (ret)
++		return ret;
++
++	/* Set AW99703_LEDLSB before AW99703_LEDMSB */
++	ret = regmap_update_bits(priv->regmap, AW99703_LEDLSB,
++				 AW99703_LEDLSB_LSB, brightness);
++	if (ret)
++		return ret;
++
++	ret = regmap_write(priv->regmap, AW99703_LEDMSB, (brightness >> 3));
++	if (ret)
++		return ret;
++
++	priv->timeout = jiffies + msecs_to_jiffies(iic_ramp_time[ramp_time] ? : 1);
++
++	return ret;
++}
++
++static size_t aw99703_calc_off_time_index(struct aw99703_bl *priv, unsigned long now)
++{
++	size_t i;
++	unsigned int off_time = 0;
++
++	if (time_before(now, priv->timeout) &&
++	    jiffies_to_msecs(priv->timeout - now) <= 2 * iic_ramp_time[priv->ramp_time])
++		off_time = jiffies_to_msecs(priv->timeout - now);
++
++	if (aw99703_get_brightness(priv) > 0)
++		off_time = iic_ramp_time[priv->ramp_time];
++
++	for (i = 0; i < ARRAY_SIZE(on_ramp_time) - 1; i++) {
++		if (off_time < ((on_ramp_time[i] + on_ramp_time[i + 1]) / 2))
++			break;
++	}
++	return i;
++}
++
++static size_t aw99703_calc_on_time_index(struct aw99703_bl *priv, unsigned long now)
++{
++	size_t i;
++	unsigned int on_time = 0;
++
++	if (time_before(now, priv->timeout) &&
++	    jiffies_to_msecs(priv->timeout - now) <= 2 * iic_ramp_time[priv->ramp_time]) {
++		on_time = jiffies_to_msecs(priv->timeout - now);
++	}
++
++	if (aw99703_get_brightness(priv) > 0)
++		on_time = iic_ramp_time[priv->ramp_time];
++
++	for (i = 0; i < ARRAY_SIZE(on_ramp_time) - 1; i++) {
++		if (on_time < ((on_ramp_time[i] + on_ramp_time[i + 1]) / 2))
++			break;
++	}
++	return i;
++}
++
++static int aw99703_standby(struct aw99703_bl *priv, bool standby)
++{
++	int ret;
++	unsigned int mode_stby;
++	unsigned long now;
++
++	ret = regmap_read(priv->regmap, AW99703_MODE, &mode_stby);
++	if (ret)
++		return ret;
++
++	mode_stby &= AW99703_MODE_WORKMODE;
++
++	if ((standby ? AW99703_MODE_WORKMODE_STBY :
++	     AW99703_MODE_WORKMODE_BL) == mode_stby)
++		return 0;
++
++	dev_dbg(priv->dev, "%s standby mode\n",
++		standby ? "entering" : "leaving");
++
++	now = jiffies;
++	if (standby) {
++		size_t off_time = aw99703_calc_off_time_index(priv, now);
++
++		ret = aw99703_set_off_time(priv, off_time);
++		if (ret)
++			return ret;
++
++	} else {
++		size_t on_time = aw99703_calc_on_time_index(priv, now);
++
++		ret = aw99703_set_on_time(priv, on_time);
++		if (ret)
++			return ret;
++	}
++	ret = regmap_update_bits(priv->regmap,
++				 AW99703_MODE,
++				 AW99703_MODE_WORKMODE,
++				 standby ? AW99703_MODE_WORKMODE_STBY :
++					   AW99703_MODE_WORKMODE_BL);
++
++	return ret;
++}
++
++static int aw99703_bl_update_status(struct backlight_device *bd)
++{
++	int brightness = backlight_get_brightness(bd);
++	struct aw99703_bl *priv = bl_get_data(bd);
++	int ret;
++
++	if (!backlight_is_blank(bd)) {
++		ret = aw99703_set_brightness(priv, brightness);
++		if (ret)
++			return ret;
++	}
++
++	return aw99703_standby(priv, backlight_is_blank(bd));
++}
++
++static struct backlight_ops aw99703_bl_ops = {
++	.update_status = aw99703_bl_update_status,
++};
++
++static int stop_on_suspend_set(const char *val, const struct kernel_param *kp)
++{
++	int ret = param_set_bool(val, kp);
++
++	if (ret)
++		return ret;
++
++	if (stop_on_suspend)
++		aw99703_bl_ops.options |= BL_CORE_SUSPENDRESUME;
++	else
++		aw99703_bl_ops.options &= ~BL_CORE_SUSPENDRESUME;
++
++	return 0;
++}
++
++static const struct kernel_param_ops stop_on_suspend_ops = {
++	.set	= stop_on_suspend_set,
++	.get	= param_get_bool,
++};
++
++module_param_cb(stop_on_suspend, &stop_on_suspend_ops, &stop_on_suspend, 0660);
++
++static int full_scale_current_get(void *data, u64 *val)
++{
++	struct aw99703_bl *priv = data;
++
++	*val = priv->full_scale_current;
++	return 0;
++}
++
++static int full_scale_current_set(void *data, u64 val)
++{
++	struct aw99703_bl *priv = data;
++	int ret;
++
++	/* Limit to 20mA to avoid damaging LEDs. */
++	if (val > 0x13)
++		return -EINVAL;
++
++	ret = regmap_update_bits(priv->regmap,
++				 AW99703_LEDCUR,
++				 AW99703_LEDCUR_IFS,
++				 val << AW99703_LEDCUR_IFS_SHIFT);
++	if (ret)
++		return ret;
++
++	priv->full_scale_current = val;
++	return 0;
++}
++
++#ifdef CONFIG_DEBUG_FS
++static int ramp_up_diff_down_time_get(void *data, u64 *val)
++{
++	struct aw99703_bl *priv = data;
++	*val = priv->ramp_up_diff_down_time;
++	return 0;
++}
++
++static int ramp_up_diff_down_time_set(void *data, u64 val)
++{
++	s64 ramp_up_diff_down_time = val;
++	struct aw99703_bl *priv = data;
++
++	if (abs(ramp_up_diff_down_time) > AW99703_TRANCFG_MAX)
++		return -EINVAL;
++
++	priv->ramp_up_diff_down_time = ramp_up_diff_down_time;
++	return 0;
++}
++
++static int ramp_time_get(void *data, u64 *val)
++{
++	struct aw99703_bl *priv = data;
++	*val = priv->ramp_time;
++	return 0;
++}
++
++static int ramp_time_set(void *data, u64 val)
++{
++	struct aw99703_bl *priv = data;
++	int ret;
++
++	if (val > 0x0f)
++		return -EINVAL;
++
++	ret = aw99703_set_ramp_time(priv, val);
++	if (ret)
++		return ret;
++
++	priv->ramp_time = val;
++	return 0;
++}
++
++static int off_time_get(void *data, u64 *val)
++{
++	struct aw99703_bl *priv = data;
++	*val = priv->off_time;
++	return 0;
++}
++
++static int off_time_set(void *data, u64 val)
++{
++	struct aw99703_bl *priv = data;
++	int ret;
++
++	if (val > 0x0f)
++		return -EINVAL;
++
++	ret = regmap_update_bits(priv->regmap, AW99703_TURNCFG,
++				 AW99703_TURNCFG_OFF, val);
++	if (ret)
++		return ret;
++
++	priv->off_time = val;
++	return 0;
++}
++
++static int on_time_get(void *data, u64 *val)
++{
++	struct aw99703_bl *priv = data;
++	*val = priv->on_time;
++	return 0;
++}
++
++static int on_time_set(void *data, u64 val)
++{
++	struct aw99703_bl *priv = data;
++	int ret;
++
++	if (val > 0x0f)
++		return -EINVAL;
++
++	ret = regmap_update_bits(priv->regmap,
++				 AW99703_TURNCFG,
++				 AW99703_TURNCFG_ON,
++				 val << AW99703_TURNCFG_ON_SHIFT);
++	if (ret)
++		return ret;
++
++	priv->on_time = val;
++	return 0;
++}
++
++static int emi_get(void *data, u64 *val)
++{
++	struct aw99703_bl *priv = data;
++	*val = priv->emi;
++	return 0;
++}
++
++static int emi_set(void *data, u64 val)
++{
++	struct aw99703_bl *priv = data;
++	int ret;
++
++	if (val > 0x07)
++		return -EINVAL;
++
++	ret = regmap_update_bits(priv->regmap,
++				 AW99703_BSTCTR2,
++				 AW99703_BSTCTR2_EMISEL,
++				 val << AW99703_BSTCTR2_EMISEL_SHIFT);
++	if (ret)
++		return ret;
++
++	priv->emi = val;
++	return 0;
++}
++
++static int flags1_get(void *data, u64 *val)
++{
++	struct aw99703_bl *priv = data;
++	unsigned int flags1;
++	int ret;
++
++	ret = regmap_read(priv->regmap, AW99703_FLAGS1, &flags1);
++	if (ret < 0) {
++		dev_err(priv->dev, "failed to read flags1\n");
++		return ret;
++	}
++	*val = flags1;
++	return 0;
++}
++
++static int flags2_get(void *data, u64 *val)
++{
++	struct aw99703_bl *priv = data;
++	unsigned int flags2;
++	int ret;
++
++	ret = regmap_read(priv->regmap, AW99703_FLAGS2, &flags2);
++	if (ret < 0) {
++		dev_err(priv->dev, "failed to read flags2\n");
++		return ret;
++	}
++	*val = flags2;
++	return 0;
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE_SIGNED(ramp_up_diff_down_time_fops, ramp_up_diff_down_time_get,
++				ramp_up_diff_down_time_set, "%lld\n");
++DEFINE_DEBUGFS_ATTRIBUTE(ramp_time_fops, ramp_time_get,
++			 ramp_time_set, "%llu\n");
++DEFINE_DEBUGFS_ATTRIBUTE(off_time_fops, off_time_get,
++			 off_time_set, "%llu\n");
++DEFINE_DEBUGFS_ATTRIBUTE(on_time_fops, on_time_get,
++			 on_time_set, "%llu\n");
++DEFINE_DEBUGFS_ATTRIBUTE(emi_fops, emi_get,
++			 emi_set, "%llu\n");
++DEFINE_DEBUGFS_ATTRIBUTE(full_scale_current_fops, full_scale_current_get,
++			 full_scale_current_set, "%llu\n");
++DEFINE_DEBUGFS_ATTRIBUTE(flags1_fops, flags1_get,
++			 NULL, "0x%02llx\n");
++DEFINE_DEBUGFS_ATTRIBUTE(flags2_fops, flags2_get,
++			 NULL, "0x%02llx\n");
++
++static void aw99703_add_debugfs(struct aw99703_bl *priv)
++{
++	int ret;
++	char dirname[20];
++
++	scnprintf(dirname, sizeof(dirname), DRV_NAME "-%s", dev_name(priv->dev));
++	priv->debugfs = debugfs_create_dir(dirname, NULL);
++	ret = PTR_ERR_OR_ZERO(priv->debugfs);
++	if (ret) {
++		dev_dbg(priv->dev, "%s: failed to create debugfs dir (err %d)\n", __func__, ret);
++		priv->debugfs = NULL;
++		return;
++	}
++
++	debugfs_create_file("ramp_up_diff_down_time", 0644,
++			    priv->debugfs, priv, &ramp_up_diff_down_time_fops);
++	debugfs_create_file("ramp_time", 0644,
++			    priv->debugfs, priv, &ramp_time_fops);
++	debugfs_create_file("off_time", 0644,
++			    priv->debugfs, priv, &off_time_fops);
++	debugfs_create_file("on_time", 0644,
++			    priv->debugfs, priv, &on_time_fops);
++	debugfs_create_file("emi", 0644,
++			    priv->debugfs, priv, &emi_fops);
++	debugfs_create_file("full_scale_current", 0644,
++			    priv->debugfs, priv, &full_scale_current_fops);
++	debugfs_create_file("flags1", 0444,
++			    priv->debugfs, priv, &flags1_fops);
++	debugfs_create_file("flags2", 0444,
++			    priv->debugfs, priv, &flags2_fops);
++}
++
++static void aw99703_remove_debugfs(struct aw99703_bl *priv)
++{
++	if (!priv->debugfs)
++		return;
++	debugfs_remove(priv->debugfs);
++}
++#else /* CONFIG_DEBUG_FS */
++static inline void aw99703_add_debugfs(struct aw99703_bl *priv) { }
++static inline void aw99703_remove_debugfs(struct aw99703_bl *priv) { }
++#endif /* CONFIG_DEBUG_FS */
++
++static ssize_t linear_mapping_show(struct device *dev,
++				   struct device_attribute *attr,
++				   char *buf)
++{
++	struct aw99703_bl *priv = dev_get_drvdata(dev);
++
++	return sprintf(buf, "%s\n", priv->linear_mapping ? "yes" : "no");
++}
++
++static ssize_t linear_mapping_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	struct aw99703_bl *priv = dev_get_drvdata(dev);
++	bool linear;
++	int ret;
++
++	if (sysfs_streq(buf, "yes"))
++		linear = true;
++	else if (sysfs_streq(buf, "no"))
++		linear = false;
++	else
++		return -EINVAL;
++
++	ret = regmap_update_bits(priv->regmap,
++				 AW99703_MODE,
++				 AW99703_MODE_MAP,
++				 linear << AW99703_MODE_MAP_SHIFT);
++	if (ret)
++		return ret;
++
++	priv->linear_mapping = linear;
++
++	return count;
++}
++
++static ssize_t full_scale_current_show(struct device *dev,
++				       struct device_attribute *attr,
++				       char *buf)
++{
++	struct aw99703_bl *priv = dev_get_drvdata(dev);
++	u64 value;
++	int ret;
++
++	ret = full_scale_current_get(priv, &value);
++	if (ret)
++		return ret;
++
++	return sprintf(buf, "%llu\n", value);
++}
++
++static ssize_t full_scale_current_store(struct device *dev,
++					struct device_attribute *attr,
++					const char *buf, size_t count)
++{
++	struct aw99703_bl *priv = dev_get_drvdata(dev);
++	unsigned long value;
++	int ret;
++
++	ret = kstrtoul(buf, 0, &value);
++	if (ret)
++		return ret;
++
++	if (value > priv->max_full_scale_current)
++		return -EINVAL;
++
++	ret = full_scale_current_set(priv, value);
++	return ret ? : count;
++}
++
++static ssize_t max_full_scale_current_show(struct device *dev,
++					   struct device_attribute *attr,
++					   char *buf)
++{
++	struct aw99703_bl *priv = dev_get_drvdata(dev);
++
++	return sprintf(buf, "%u\n", priv->max_full_scale_current);
++}
++
++static DEVICE_ATTR_RW(linear_mapping);
++static DEVICE_ATTR_RW(full_scale_current);
++static DEVICE_ATTR_RO(max_full_scale_current);
++
++static struct attribute *aw99703_bl_attributes[] = {
++	&dev_attr_linear_mapping.attr,
++	&dev_attr_full_scale_current.attr,
++	&dev_attr_max_full_scale_current.attr,
++	NULL,
++};
++
++static struct attribute_group aw99703_bl_attribute_group = {
++	.attrs = aw99703_bl_attributes,
++};
++
++static bool aw99703_writeable_reg(struct device *dev, unsigned int reg)
++{
++	switch (reg) {
++	case AW99703_ID:
++	case AW99703_FLAGS1:
++	case AW99703_FLAGS2:
++		return false;
++	default:
++		return true;
++	}
++}
++
++static bool aw99703_volatile_reg(struct device *dev, unsigned int reg)
++{
++	/*
++	 * Specify ID as volatile to ensure bus accesses are performed (i.e. no
++	 * caching). This is appropriate for its usage as chip-is-alive check.
++	 */
++	switch (reg) {
++	case AW99703_ID:
++	case AW99703_SFTRST:
++	case AW99703_FLAGS1:
++	case AW99703_FLAGS2:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static const struct reg_default aw99703_regmap_default[] = {
++	{ AW99703_ID,      AW99703_ID_DFLT      },
++	{ AW99703_SFTRST,  AW99703_SFTRST_DFLT  },
++	{ AW99703_MODE,    AW99703_MODE_DFLT    },
++	{ AW99703_LEDCUR,  AW99703_LEDCUR_DFLT  },
++	{ AW99703_BSTCTR1, AW99703_BSTCTR1_DFLT },
++	{ AW99703_BSTCTR2, AW99703_BSTCTR2_DFLT },
++	{ AW99703_LEDLSB,  AW99703_LEDLSB_DFLT  },
++	{ AW99703_LEDMSB,  AW99703_LEDMSB_DFLT  },
++	{ AW99703_PWM,     AW99703_PWM_DFLT     },
++	{ AW99703_TURNCFG, AW99703_TURNCFG_DFLT },
++	{ AW99703_TRANCFG, AW99703_TRANCFG_DFLT },
++	{ AW99703_FLASH,   AW99703_FLASH_DFLT   },
++	{ AW99703_AFHIGH,  AW99703_AFHIGH_DFLT  },
++	{ AW99703_AFLOW,   AW99703_AFLOW_DFLT   },
++	{ AW99703_FLAGS1,  AW99703_FLAGS1_DFLT  },
++	{ AW99703_FLAGS2,  AW99703_FLAGS2_DFLT  },
++};
++
++static const struct regmap_config aw99703_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.cache_type = REGCACHE_FLAT,
++	.max_register = AW99703_REG_MAX,
++	.writeable_reg = aw99703_writeable_reg,
++	.volatile_reg = aw99703_volatile_reg,
++	.reg_defaults = aw99703_regmap_default,
++	.num_reg_defaults = ARRAY_SIZE(aw99703_regmap_default),
++};
++
++static int aw99703_parse_dt(struct aw99703_bl *priv)
++{
++	struct device_node *np = priv->dev->of_node;
++	int ret, num_sources;
++
++	ret = of_property_read_u32(np, "default-brightness", &priv->default_brightness);
++	if (ret) {
++		dev_err(priv->dev, "failed to obtain 'default-brightness' property\n");
++		return ret;
++	}
++
++	if (priv->default_brightness > AW99703_MAX_BRIGHTNESS) {
++		dev_err(priv->dev, "'default-brightness' greater than max brightness\n");
++		return -EINVAL;
++	}
++
++	num_sources = of_property_count_u32_elems(np, "led-sources");
++	if (num_sources < 0) {
++		dev_err(priv->dev, "invalid 'led-sources' property\n");
++		return num_sources;
++	} else if (num_sources < 1 || num_sources > AW99703_NUM_SOURCES) {
++		dev_err(priv->dev, "invalid number of entries in 'led-sources' property\n");
++		return -EINVAL;
++	}
++
++	ret = of_property_read_u32_array(np, "led-sources", priv->led_sources,
++					 num_sources);
++	if (ret) {
++		dev_err(priv->dev, "failed to obtain 'led-sources' property\n");
++		return ret;
++	}
++
++	for (size_t i = 0; i < ARRAY_SIZE(priv->led_sources); i++) {
++		if (priv->led_sources[i] > 1) {
++			dev_err(priv->dev, "invalid `led-sources[%zu]` property %u\n",
++				i, priv->led_sources[i]);
++			return -EINVAL;
++		}
++	}
++
++	ret = of_property_read_u32(np, "awinic,max-full-scale-current",
++				   &priv->max_full_scale_current);
++	if (ret) {
++		dev_err(priv->dev, "failed to obtain 'max-full-scale-current' property\n");
++		return ret;
++	}
++
++	if (priv->max_full_scale_current > AW99703_LEDCUR_IFS_MAX) {
++		dev_err(priv->dev, "'full-scale-current' exceeds chip rating\n");
++		return -EINVAL;
++	}
++
++	priv->big_inductor =
++		of_property_read_bool(np, "awinic,big-inductor");
++
++	priv->linear_mapping =
++		of_property_read_bool(np, "awinic,linear-mapping-mode");
++
++	of_property_read_u32(np, "awinic,ramp-time", &priv->ramp_time);
++	if (priv->ramp_time > AW99703_TRANCFG_MAX) {
++		dev_err(priv->dev, "'ramp-time' exceeds chip rating\n");
++		return -EINVAL;
++	}
++
++	ret = of_property_read_s32(np, "awinic,ramp-up-diff-down-time",
++				   &priv->ramp_up_diff_down_time);
++	if (ret && ret != -EINVAL) {
++		dev_err(priv->dev, "failed to read 'awinic,ramp-up-diff-down-time' (err %d)\n",
++			ret);
++		return ret;
++	}
++	if (abs(priv->ramp_up_diff_down_time) > AW99703_TRANCFG_MAX) {
++		dev_err(priv->dev, "'ramp-up-diff-down-time' exceeds chip rating (%d)\n",
++			priv->ramp_up_diff_down_time);
++		return -EINVAL;
++	}
++
++	priv->off_time |= (AW99703_TURNCFG_DFLT & AW99703_TURNCFG_OFF);
++	of_property_read_u32(np, "awinic,off-time", &priv->off_time);
++	if (priv->off_time > AW99703_TURNCFG_MAX) {
++		dev_err(priv->dev, "'off-time' exceeds chip rating\n");
++		return -EINVAL;
++	}
++
++	priv->on_time = (AW99703_TURNCFG_DFLT & AW99703_TURNCFG_ON)
++		>> AW99703_TURNCFG_ON_SHIFT;
++	of_property_read_u32(np, "awinic,on-time", &priv->on_time);
++	if (priv->on_time > AW99703_TURNCFG_MAX) {
++		dev_err(priv->dev, "'on-time' exceeds chip rating\n");
++		return -EINVAL;
++	}
++
++	of_property_read_u32(np, "awinic,emi", &priv->emi);
++	if (priv->emi > AW99703_BSTCTR2_EMISEL_MAX) {
++		dev_err(priv->dev, "'emi' exceeds chip rating\n");
++		return -EINVAL;
++	}
++
++	priv->ocp = AW99703_BSTCTR1_DFLT & AW99703_BSTCTR1_OCPSEL;
++	of_property_read_u32(np, "awinic,ocp", &priv->ocp);
++	if (priv->ocp > AW99703_BSTCTR1_OCPSEL_MAX) {
++		dev_err(priv->dev, "'ocp' exceeds chip rating\n");
++		return -EINVAL;
++	}
++
++	priv->ovp = (AW99703_BSTCTR1_DFLT & AW99703_BSTCTR1_OVPSEL)
++		>> AW99703_BSTCTR1_OVPSEL_SHIFT;
++	of_property_read_u32(np, "awinic,ovp", &priv->ovp);
++	if (priv->ovp > AW99703_BSTCTR1_OVPSEL_MAX) {
++		dev_err(priv->dev, "'ovp' exceeds chip rating\n");
++		return -EINVAL;
++	}
++
++	priv->reduced_sf = of_property_read_bool(np, "awinic,reduced-sf");
++
++	return 0;
++}
++
++static int aw99703_chip_init(struct aw99703_bl *priv)
++{
++	unsigned int ledcur = 0;
++	unsigned int bstctr1 = 0;
++	unsigned int bstctr2 = 0;
++	unsigned int turncfg = 0;
++	unsigned int mode = 0;
++	int ret;
++
++	/* Initialize brightness as 0 */
++	ret = regmap_write(priv->regmap, AW99703_LEDLSB, 0);
++	if (ret)
++		return ret;
++
++	ret = regmap_write(priv->regmap, AW99703_LEDMSB, 0);
++	if (ret)
++		return ret;
++
++	ledcur = priv->full_scale_current << AW99703_LEDCUR_IFS_SHIFT;
++	ledcur |= priv->led_sources[0] << AW99703_LEDCUR_CH1_SHIFT |
++		  priv->led_sources[1] << AW99703_LEDCUR_CH2_SHIFT |
++		  priv->led_sources[2] << AW99703_LEDCUR_CH3_SHIFT;
++	ret = regmap_write(priv->regmap, AW99703_LEDCUR, ledcur);
++	if (ret)
++		return ret;
++
++	bstctr1 = priv->ocp;
++	bstctr1 |= priv->ovp << AW99703_BSTCTR1_OVPSEL_SHIFT;
++	bstctr1 |= priv->reduced_sf ? 0 : AW99703_BSTCTR1_SF;
++	ret = regmap_write(priv->regmap, AW99703_BSTCTR1, bstctr1);
++	if (ret)
++		return ret;
++
++	bstctr2 = priv->emi << AW99703_BSTCTR2_EMISEL_SHIFT;
++	bstctr2 |= priv->big_inductor ? AW99703_BSTCTR2_INDSEL : 0;
++	ret = regmap_write(priv->regmap, AW99703_BSTCTR2, bstctr2);
++	if (ret)
++		return ret;
++
++	turncfg = priv->off_time;
++	turncfg |= priv->on_time << AW99703_TURNCFG_ON_SHIFT;
++	ret = regmap_write(priv->regmap, AW99703_TURNCFG, turncfg);
++	if (ret)
++		return ret;
++
++	ret = aw99703_set_ramp_time(priv, priv->ramp_time);
++	if (ret)
++		return ret;
++
++	mode = AW99703_MODE_WORKMODE_STBY | AW99703_MODE_PDIS;
++	mode |= priv->linear_mapping ? AW99703_MODE_MAP : 0;
++	ret = regmap_write(priv->regmap, AW99703_MODE, mode);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int aw99703_probe(struct i2c_client *cl)
++{
++	struct backlight_properties props;
++	struct backlight_device *bd;
++	struct aw99703_bl *priv;
++	u32 chip_id;
++	int ret;
++
++	if (!i2c_check_functionality(cl->adapter, I2C_FUNC_SMBUS_BYTE_DATA))
++		return -EOPNOTSUPP;
++
++	priv = devm_kzalloc(&cl->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dev = &cl->dev;
++	i2c_set_clientdata(cl, priv);
++
++	ret = aw99703_parse_dt(priv);
++	if (ret) {
++		dev_err(priv->dev, "failed to parse device-tree\n");
++		return ret;
++	}
++
++	priv->regmap = devm_regmap_init_i2c(cl, &aw99703_regmap_config);
++	if (IS_ERR(priv->regmap)) {
++		dev_err(priv->dev, "failed to register regmap\n");
++		return PTR_ERR(priv->regmap);
++	}
++
++	priv->enable_gpio = devm_gpiod_get_optional(priv->dev, "enable",
++						    GPIOD_OUT_HIGH);
++	if (IS_ERR(priv->enable_gpio))
++		return dev_err_probe(priv->dev, PTR_ERR(priv->enable_gpio),
++				     "failed to get enable gpio\n");
++
++	if (priv->enable_gpio)
++		usleep_range(300, 350);
++
++	ret = regmap_read(priv->regmap, AW99703_ID, &chip_id);
++	if (ret < 0) {
++		dev_err(priv->dev, "failed to read chip id\n");
++		goto err_out;
++	}
++	dev_info(priv->dev, "registering aw99703-bl with id %i\n", chip_id);
++
++	ret = aw99703_chip_init(priv);
++	if (ret) {
++		dev_err(priv->dev, "failed to initialize chip\n");
++		goto err_out;
++	}
++
++	ret = aw99703_set_brightness(priv, priv->default_brightness);
++	if (ret) {
++		dev_err(priv->dev, "failed to set default brightness\n");
++		goto err_out;
++	}
++
++	memset(&props, 0, sizeof(props));
++	props.scale = priv->linear_mapping ? BACKLIGHT_SCALE_LINEAR :
++					     BACKLIGHT_SCALE_NON_LINEAR;
++	props.type = BACKLIGHT_RAW;
++	props.brightness = priv->default_brightness;
++	props.max_brightness = AW99703_MAX_BRIGHTNESS;
++	bd = devm_backlight_device_register(priv->dev, "rm_frontlight", priv->dev,
++					    priv, &aw99703_bl_ops, &props);
++	if (IS_ERR(bd)) {
++		dev_err(priv->dev, "failed to register backlight device\n");
++		ret = PTR_ERR(bd);
++		goto err_out;
++	}
++	priv->bd = bd;
++
++	ret = sysfs_create_group(&priv->bd->dev.kobj, &aw99703_bl_attribute_group);
++	if (ret < 0) {
++		dev_err(priv->dev, "failed to create sysfs attributes\n");
++		goto err_out;
++	}
++
++	aw99703_add_debugfs(priv);
++
++	return 0;
++
++err_out:
++	gpiod_set_value_cansleep(priv->enable_gpio, 0);
++	return ret;
++}
++
++static void aw99703_remove(struct i2c_client *client)
++{
++	struct aw99703_bl *priv = i2c_get_clientdata(client);
++
++	aw99703_remove_debugfs(priv);
++	sysfs_remove_group(&priv->bd->dev.kobj, &aw99703_bl_attribute_group);
++	gpiod_set_value_cansleep(priv->enable_gpio, 0);
++}
++
++#ifdef CONFIG_HIBERNATE_CALLBACKS
++static int aw99703_fault(struct aw99703_bl *priv)
++{
++	int ret, reg, fault;
++
++	ret = regmap_read(priv->regmap, AW99703_FLAGS1, &reg);
++	if (ret < 0)
++		return ret;
++
++	fault = reg;
++
++	ret = regmap_read(priv->regmap, AW99703_FLAGS2, &reg);
++	if (ret < 0)
++		return ret;
++
++	return fault | (reg << 8);
++}
++
++static int aw99703_restore(struct device *dev)
++{
++	struct aw99703_bl *priv = dev_get_drvdata(dev);
++	int err;
++
++	if (priv->enable_gpio) {
++		gpiod_set_value_cansleep(priv->enable_gpio, 1);
++		usleep_range(300, 350);
++	}
++
++	/*
++	 * Sometimes, in particular after hibernate, the chip reports a fault with
++	 * UVLO. In all testing thus far:
++	 *   - This caused no issue, as the frontlight always worked
++	 *   - The datasheet does not indicate a method of clearing the flag
++	 *   - A scope on Vin never showed the voltage dropping below threshold
++	 *
++	 * So, if there is a UVLO error, log it as an info. If there is a
++	 * different fault log it as an error.
++	 */
++	err = aw99703_fault(priv);
++	if (err < 0)
++		dev_err(dev, "unable to read chip fault flags");
++	else if (err == 0x4000)
++		dev_info(dev, "UVLO flag set (0x%02x)\n", err);
++	else if (err)
++		dev_err(dev, "chip in fault state (0x%02x)\n", err);
++
++	err = aw99703_chip_init(priv);
++	if (err) {
++		dev_err(dev, "chip init failed during restore: %d\n", err);
++		return err;
++	}
++
++	err = backlight_update_status(priv->bd);
++	if (err) {
++		dev_err(dev, "updating backlight after restore failed: %d\n", err);
++		return err;
++	}
++
++	return 0;
++}
++
++static int aw99703_resume(struct device *dev)
++{
++	return aw99703_restore(dev);
++}
++
++static int aw99703_suspend(struct device *dev)
++{
++	/*
++	 * Do not turn off gpio HWEN manually
++	 * Use the same approach we use for hibernate (.freeze, and .restore)
++	 */
++
++	return 0;
++}
++
++static int aw99703_freeze(struct device *dev)
++{
++
++	/*
++	 * Do not turn off gpio HWEN manually
++	 * .freeze is called before actually hibernating. The .recover callback was
++	 * designed to recover in case of hibernation errors. But as it turns out,
++	 * not all cases are covered by it.
++
++	 * Luckily, we do not need to do anything special here... The backlight will
++	 * go out once the SoC looses power anyway. There is also no state that
++	 * needs to be stored.
++
++	 * So we can simply remove the handlers. If hibernation fails, we did not
++	 * turn off the backlight and are good. If it succeeds, then backlight will
++	 * go out when the SoC looses power and will be restored by the .restore
++	 * callback.
++	 */
++
++	return 0;
++}
++
++static const struct dev_pm_ops aw99703_pm = {
++	.restore = aw99703_restore,
++	.resume = aw99703_resume,
++	.suspend = aw99703_suspend,
++	.freeze = aw99703_freeze,
++};
++#endif
++
++static const struct of_device_id aw99703_dt_ids[] = {
++	{ .compatible = "awinic,aw99703" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, aw99703_dt_ids);
++
++static const struct i2c_device_id aw99703_i2c_ids[] = {
++	{ "aw99703", 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, aw99703_i2c_ids);
++
++static struct i2c_driver aw99703_bl_driver = {
++	.driver                 = {
++		.name           = DRV_NAME,
++		.of_match_table = of_match_ptr(aw99703_dt_ids),
++#ifdef CONFIG_HIBERNATE_CALLBACKS
++		.pm             = &aw99703_pm,
++#endif
++	},
++	.probe                  = aw99703_probe,
++	.remove                 = aw99703_remove,
++	.id_table               = aw99703_i2c_ids,
++};
++module_i2c_driver(aw99703_bl_driver);
++
++MODULE_AUTHOR("Johan Korsnes <johan.korsnes@remarkable.no>");
++MODULE_DESCRIPTION("Awinic AW99703 LED Driver");
++MODULE_LICENSE("GPL");

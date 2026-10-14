@@ -1,0 +1,3276 @@
+From a430b9192350b843d5202f80c9f6c1c8d7cc63cb Mon Sep 17 00:00:00 2001
+From: gitman-101111 <development@spamfolder.xyz>
+Date: Mon, 12 Oct 2026 10:23:09 -0600
+Subject: [PATCH] nfc: add reMarkable's NXP CTN730 marker charger driver
+
+The CTN730 NFC controller charges the marker (pen) wirelessly; the
+driver loads its firmware, runs the charging protocol and reports the
+marker battery as a power supply. Ported from reMarkable's linux-imx-rm
+6.12 tree.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/nfc/Kconfig                   |    2 +
+ drivers/nfc/Makefile                  |    1 +
+ drivers/nfc/ctn730_rm/Kconfig         |   10 +
+ drivers/nfc/ctn730_rm/Makefile        |    7 +
+ drivers/nfc/ctn730_rm/ctn730.c        |  721 ++++++++++++++
+ drivers/nfc/ctn730_rm/ctn730.h        |  189 ++++
+ drivers/nfc/ctn730_rm/ctn730_fw.c     |  133 +++
+ drivers/nfc/ctn730_rm/ctn730_fw.h     |   16 +
+ drivers/nfc/ctn730_rm/ctn730_i2c.c    | 1326 +++++++++++++++++++++++++
+ drivers/nfc/ctn730_rm/ctn730_i2c.h    |  341 +++++++
+ drivers/nfc/ctn730_rm/ctn730_supply.c |  201 ++++
+ drivers/nfc/ctn730_rm/ctn730_supply.h |   16 +
+ drivers/nfc/ctn730_rm/ctn730_sysfs.c  |   90 ++
+ drivers/nfc/ctn730_rm/ctn730_sysfs.h  |   16 +
+ include/trace/events/ctn730_rm.h      |   70 ++
+ 15 files changed, 3139 insertions(+)
+ create mode 100644 drivers/nfc/ctn730_rm/Kconfig
+ create mode 100644 drivers/nfc/ctn730_rm/Makefile
+ create mode 100644 drivers/nfc/ctn730_rm/ctn730.c
+ create mode 100644 drivers/nfc/ctn730_rm/ctn730.h
+ create mode 100644 drivers/nfc/ctn730_rm/ctn730_fw.c
+ create mode 100644 drivers/nfc/ctn730_rm/ctn730_fw.h
+ create mode 100644 drivers/nfc/ctn730_rm/ctn730_i2c.c
+ create mode 100644 drivers/nfc/ctn730_rm/ctn730_i2c.h
+ create mode 100644 drivers/nfc/ctn730_rm/ctn730_supply.c
+ create mode 100644 drivers/nfc/ctn730_rm/ctn730_supply.h
+ create mode 100644 drivers/nfc/ctn730_rm/ctn730_sysfs.c
+ create mode 100644 drivers/nfc/ctn730_rm/ctn730_sysfs.h
+ create mode 100644 include/trace/events/ctn730_rm.h
+
+diff --git a/drivers/nfc/Kconfig b/drivers/nfc/Kconfig
+index 288c6f1c6..42b93d566 100644
+--- a/drivers/nfc/Kconfig
++++ b/drivers/nfc/Kconfig
+@@ -70,4 +70,6 @@ source "drivers/nfc/st-nci/Kconfig"
+ source "drivers/nfc/nxp-nci/Kconfig"
+ source "drivers/nfc/s3fwrn5/Kconfig"
+ source "drivers/nfc/st95hf/Kconfig"
++source "drivers/nfc/ctn730_rm/Kconfig"
++
+ endmenu
+diff --git a/drivers/nfc/Makefile b/drivers/nfc/Makefile
+index 7b1bfde1d..2a6e89484 100644
+--- a/drivers/nfc/Makefile
++++ b/drivers/nfc/Makefile
+@@ -18,3 +18,4 @@ obj-$(CONFIG_NFC_NXP_NCI)	+= nxp-nci/
+ obj-$(CONFIG_NFC_S3FWRN5)	+= s3fwrn5/
+ obj-$(CONFIG_NFC_ST95HF)	+= st95hf/
+ obj-$(CONFIG_NFC_VIRTUAL_NCI)	+= virtual_ncidev.o
++obj-$(CONFIG_NFC_NXP_CTN730_RM) += ctn730_rm/
+diff --git a/drivers/nfc/ctn730_rm/Kconfig b/drivers/nfc/ctn730_rm/Kconfig
+new file mode 100644
+index 000000000..6f8692930
+--- /dev/null
++++ b/drivers/nfc/ctn730_rm/Kconfig
+@@ -0,0 +1,10 @@
++#
++# Nxp NFC CTN730 wireless charging
++#
++
++config NFC_NXP_CTN730_RM
++	tristate "reMarkable NXP CTN730 driver"
++	depends on I2C
++	help
++	  reMarkable NXP CTN730 driver for wireless charging.
++	  This is a driver to provides I2C access to CTN730 NFC WLC device
+diff --git a/drivers/nfc/ctn730_rm/Makefile b/drivers/nfc/ctn730_rm/Makefile
+new file mode 100644
+index 000000000..ec9b5318f
+--- /dev/null
++++ b/drivers/nfc/ctn730_rm/Makefile
+@@ -0,0 +1,7 @@
++
++obj-$(CONFIG_NFC_NXP_CTN730_RM)	+= ctn730_rm.o
++ctn730_rm-objs := ctn730.o
++ctn730_rm-objs += ctn730_i2c.o
++ctn730_rm-objs += ctn730_sysfs.o
++ctn730_rm-objs += ctn730_fw.o
++ctn730_rm-objs += ctn730_supply.o
+diff --git a/drivers/nfc/ctn730_rm/ctn730.c b/drivers/nfc/ctn730_rm/ctn730.c
+new file mode 100644
+index 000000000..9f6e553c1
+--- /dev/null
++++ b/drivers/nfc/ctn730_rm/ctn730.c
+@@ -0,0 +1,721 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * reMarkable NXP CTN730
++ *
++ * Copyright (C) 2023 reMarkable AS - http://www.remarkable.com/
++ */
++
++#include <linux/delay.h>
++#include <linux/kernel.h>
++#include <linux/lockdep.h>
++#include <linux/version.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/init.h>
++#include <linux/rfkill.h>
++#include <linux/termios.h>
++#include "ctn730.h"
++#include "ctn730_i2c.h"
++#include "ctn730_sysfs.h"
++#include "ctn730_fw.h"
++#include "ctn730_supply.h"
++
++#define CREATE_TRACE_POINTS
++#include <trace/events/ctn730_rm.h>
++
++void ctn730_set_state(struct ctn730 *ctn730, enum ctn730_state new_state)
++{
++	int ret;
++	char env_1[64], env_2[64];
++	char *envp[] = { env_1, env_2, NULL };
++
++	lockdep_assert_held(&ctn730->lock);
++
++	dev_dbg(ctn730->dev, "state: %s->%s\n",
++		ctn730_state_text[ctn730->state],
++		ctn730_state_text[new_state]
++	);
++
++	ctn730->state = new_state;
++	trace_ctn730_state_update(ctn730);
++
++	/* send uevent */
++	envp[0] = "EVENT=nfc-host-state";
++	ret = sprintf(envp[1], "STATE=%s", ctn730_state_text[ctn730->state]);
++
++	if (ret > 0)
++		kobject_uevent_env(&ctn730->dev->kobj, KOBJ_CHANGE, envp);
++
++	/* update supply */
++	ctn730_supply_changed(ctn730);
++
++}
++
++void ctn730_set_charging_state(struct ctn730 *ctn730, enum ctn730_charging_state new_state)
++{
++	lockdep_assert_held(&ctn730->lock);
++
++	dev_dbg(ctn730->dev, "charging_state: %s->%s\n",
++		ctn730_charging_state_text[ctn730->charging_state],
++		ctn730_charging_state_text[new_state]
++	);
++
++	ctn730->charging_state = new_state;
++	trace_ctn730_state_update(ctn730);
++}
++
++void ctn730_set_device_state(struct ctn730 *ctn730, enum ctn730_device_state new_state)
++{
++	lockdep_assert_held(&ctn730->lock);
++
++	dev_dbg(ctn730->dev, "device_state: %s->%s\n",
++		ctn730_device_state_text[ctn730->device_state],
++		ctn730_device_state_text[new_state]
++	);
++
++	ctn730->device_state = new_state;
++	trace_ctn730_state_update(ctn730);
++
++	ctn730_supply_changed(ctn730);
++}
++
++void ctn730_set_app_data_state(struct ctn730 *ctn730, enum ctn730_app_data_state new_state)
++{
++	lockdep_assert_held(&ctn730->lock);
++
++	dev_dbg(ctn730->dev, "app_data_state: %s->%s\n",
++		ctn730_app_data_state_text[ctn730->app_data_state],
++		ctn730_app_data_state_text[new_state]
++	);
++
++	ctn730->app_data_state = new_state;
++	trace_ctn730_state_update(ctn730);
++}
++
++void ctn730_set_battery_level(struct ctn730 *ctn730, int new_level)
++{
++	lockdep_assert_held(&ctn730->lock);
++
++	ctn730->battery_level = new_level;
++	trace_ctn730_state_update(ctn730);
++
++	ctn730_supply_changed(ctn730);
++}
++
++static int ctn730_gpio_init(struct ctn730 *ctn730)
++{
++	struct device *dev = ctn730->dev;
++
++	ctn730->nfc_supply = devm_regulator_get_exclusive(dev, "nfc");
++
++	if (IS_ERR(ctn730->nfc_supply)) {
++		return dev_err_probe(dev, PTR_ERR(ctn730->nfc_supply),
++				     "Failed to get nfc-supply regulator\n");
++	}
++
++	return 0;
++}
++
++static int ctn730_set_power(struct ctn730 *ctn730, bool enable)
++{
++	int ret = 0;
++
++	lockdep_assert_held(&ctn730->req_lock);
++
++	dev_dbg(ctn730->dev, "set_power: %s\n", enable ? "true" : "false");
++
++	if (ctn730->init_bus_lock)
++		ctn730_i2c_lock_bus(ctn730);
++
++	if (enable && !regulator_is_enabled(ctn730->nfc_supply))
++		ret = regulator_enable(ctn730->nfc_supply);
++	else if (regulator_is_enabled(ctn730->nfc_supply))
++		ret = regulator_disable(ctn730->nfc_supply);
++	if (ret < 0)
++		dev_warn(ctn730->dev, "Failed to toggle nfc_supply: %d\n", ret);
++
++	if (ctn730->init_bus_lock) {
++		usleep_range(700, 800);
++		ctn730_i2c_unlock_bus(ctn730);
++	}
++
++	return ret;
++}
++
++static void ctn730_init(struct ctn730 *ctn730)
++{
++	mutex_init(&ctn730->lock);
++	mutex_init(&ctn730->req_lock);
++
++	mutex_lock(&ctn730->lock);
++
++	ctn730->state = state_unknown;
++	ctn730->charging_state = charging_state_unknown;
++	ctn730->device_state = device_state_unknown;
++	ctn730->boot_reason = boot_reason_unknown;
++	ctn730->app_data_state = app_data_state_unknown;
++	memset(ctn730->host_uid, 0, sizeof(ctn730->host_uid));
++	memset(ctn730->marker_uid, 0, sizeof(ctn730->marker_uid));
++	ctn730->fw_current_minor = 0;
++	ctn730->fw_current_major = 0;
++	ctn730->fw_provided_minor = 0;
++	ctn730->fw_provided_major = 0;
++	ctn730->fw_state = fw_state_unknown;
++	ctn730->battery_level = -1;
++
++	if (device_property_read_u32(ctn730->dev, "nxp,detect-interval",
++				     &ctn730->detect_interval_ms))
++		ctn730->detect_interval_ms = 128;
++
++	ctn730->init_bus_lock = fwnode_property_read_bool(ctn730->dev->fwnode,
++							  "nxp,init-bus-lock");
++
++	init_waitqueue_head(&ctn730->app_data_wait_queue);
++
++	mutex_unlock(&ctn730->lock);
++}
++
++static int ctn730_mdev_open(struct inode *inode, struct file *file)
++{
++	struct ctn730 *ctn730 = container_of((struct miscdevice *)file->private_data,
++					       struct ctn730, mdev);
++	file->private_data = ctn730;
++
++	return 0;
++}
++
++static int ctn730_mdev_release(struct inode *inode, struct file *file)
++{
++	file->private_data = NULL;
++	return 0;
++}
++
++static ssize_t ctn730_mdev_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
++{
++	struct ctn730 *ctn730 = file->private_data;
++	int ret;
++	unsigned int copied;
++
++	if (ctn730->app_data_state != app_data_state_connected) {
++		dev_err(ctn730->dev, "%s: not in application data channel state", __func__);
++		return -EIO;
++	}
++
++	if (kfifo_is_empty(&ctn730->app_data_fifo)) {
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++
++		wait_event_interruptible(ctn730->app_data_wait_queue,
++					 kfifo_len(&ctn730->app_data_fifo));
++	}
++
++	ret = kfifo_to_user(&ctn730->app_data_fifo, buf, nbytes, &copied);
++
++	return ret ? ret : copied;
++}
++
++static ssize_t ctn730_mdev_write(struct file *file, const char __user *buf, size_t len, loff_t *pos)
++{
++	struct ctn730 *ctn730 = file->private_data;
++	char data[APP_DATA_MSG_SIZE];
++	int ret;
++
++	if (ctn730->app_data_state != app_data_state_connected) {
++		dev_err(ctn730->dev, "%s: not in application data channel state", __func__);
++		return -EIO;
++	}
++
++	if (len > APP_DATA_MSG_SIZE) {
++		dev_err(ctn730->dev, "%s: data length exceeded, max %d", __func__,
++			APP_DATA_MSG_SIZE);
++		return -EINVAL;
++	}
++
++	ret = copy_from_user(data, buf, len);
++	if (ret > 0) {
++		dev_err(ctn730->dev, "%s: copy_from_user() failed", __func__);
++		return -EIO;
++	}
++
++	if (ctn730_i2c_send_app_data(ctn730, data, len)) {
++		dev_err(ctn730->dev, "%s: ctn730_i2c_send_app_data failed", __func__);
++		return -EIO;
++	}
++
++	return len;
++}
++
++static long ctn730_mdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	struct ctn730 *ctn730 = file->private_data;
++	int __user *ip = (int __user *)arg;
++
++	switch (cmd) {
++	case CTN730_IOCTL_GET_STATE:
++		put_user(ctn730->state, ip);
++		break;
++	case CTN730_IOCTL_ENABLE_APP_DATA_CHANNEL:
++		put_user(ctn730_i2c_enable_app_data_channel(ctn730), ip);
++		break;
++	case CTN730_IOCTL_DISABLE_APP_DATA_CHANNEL:
++		put_user(ctn730_i2c_disable_app_data_channel(ctn730), ip);
++		break;
++	case TCGETS:
++		return -ENOIOCTLCMD;
++	default:
++		dev_info(ctn730->dev, "unknown IOCTL cmd: %d\n", cmd);
++		return -ENOIOCTLCMD;
++	}
++
++	return 0;
++}
++static struct file_operations ctn730_fops = {
++	.owner = THIS_MODULE,
++	.open = ctn730_mdev_open,
++	.read = ctn730_mdev_read,
++	.write = ctn730_mdev_write,
++	.release = ctn730_mdev_release,
++	.unlocked_ioctl = ctn730_mdev_ioctl,
++	.compat_ioctl = ctn730_mdev_ioctl,
++};
++
++static int ctn730_persistent_parameters_set(struct ctn730 *ctn730)
++{
++	u32 comm_power_step;
++	u32 num_power_step;
++	int ret;
++
++	lockdep_assert_held(&ctn730->req_lock);
++
++	ret = device_property_read_u32(ctn730->dev, "nfc-comm-power-step-index",
++				 &comm_power_step);
++	if (ret) {
++		dev_warn(ctn730->dev, "Could not find nfc-comm-power-step-index property\n");
++	} else {
++		dev_dbg(ctn730->dev, "nfc-comm-power-step-index %u\n", comm_power_step);
++		ret = ctn730_set_nfc_comm_power_step_param(ctn730, comm_power_step);
++		if (ret) {
++			dev_err(ctn730->dev, "Failed to set power step");
++			return ret;
++		}
++	}
++
++	ret = device_property_read_u32(ctn730->dev, "nfc-num-power-step-configs",
++				 &num_power_step);
++	if (ret) {
++		dev_dbg(ctn730->dev, "Could not find nfc-num-power-step-configs property\n");
++	} else {
++		dev_dbg(ctn730->dev, "nfc-num-power-step-configs %u\n", num_power_step);
++		ret = ctn730_set_nfc_num_power_step_configs_param(ctn730, num_power_step);
++		if (ret) {
++			dev_err(ctn730->dev, "Failed to set power step");
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++static int ctn730_try_boot(struct ctn730 *ctn730, bool sync_firmware, bool set_param)
++{
++	int ret;
++
++	lockdep_assert_held(&ctn730->req_lock);
++
++	set_bit(CTN730_BOOT_PENDING, &ctn730->flags);
++	if (ctn730_set_power(ctn730, true) < 0)
++		dev_info(ctn730->dev, "Failed to power on chip\n");
++
++	ctn730_i2c_shutdown(ctn730, false);
++
++	if (wait_on_bit_timeout(&ctn730->flags, CTN730_BOOT_PENDING,
++				TASK_INTERRUPTIBLE, msecs_to_jiffies(500))) {
++		dev_info(ctn730->dev, "Timed out waiting for boot.\n");
++		return -EIO;
++	}
++
++	if (sync_firmware) {
++		/* sync firmware while still in download mode */
++		if (ctn730_fw_sync(ctn730)) {
++			dev_err(ctn730->dev, "Firmware sync failed.\n");
++			/* we will still attempt to continue the usual boot process */
++		}
++	}
++
++	set_bit(CTN730_INIT_PENDING, &ctn730->flags);
++	ctn730_i2c_reset_to_mode(ctn730, NORMAL_MODE);
++
++	/* We need to wait for CTN730 to enter INITIALIZED state */
++	if (wait_on_bit_timeout(&ctn730->flags, CTN730_INIT_PENDING,
++				TASK_INTERRUPTIBLE, msecs_to_jiffies(500))) {
++		dev_info(ctn730->dev, "Timed out waiting for init.\n");
++		return -EIO;
++	}
++
++	if (set_param) {
++		ret = ctn730_persistent_parameters_set(ctn730);
++		if (ret < 0) {
++			dev_info(ctn730->dev, "Failed to set parameters: %d\n", ret);
++			return -EIO;
++		}
++
++		set_bit(CTN730_INIT_PENDING, &ctn730->flags);
++		ctn730_i2c_reset_to_mode(ctn730, NORMAL_MODE);
++
++		/* We need to wait for CTN730 to enter INITIALIZED state */
++		if (wait_on_bit_timeout(&ctn730->flags, CTN730_INIT_PENDING,
++					TASK_INTERRUPTIBLE, msecs_to_jiffies(500))) {
++			dev_info(ctn730->dev, "Timed out waiting for init.\n");
++			return -EIO;
++		}
++	}
++
++	ret = ctn730_enable_charging_info_event(ctn730, true);
++	if (ret != 0) {
++		dev_err(ctn730->dev, "Failed to set power step");
++		return ret;
++	}
++
++	return 0;
++}
++
++static void ctn730_down(struct ctn730 *ctn730)
++{
++	mutex_lock(&ctn730->req_lock);
++
++	ctn730_i2c_shutdown(ctn730, true);
++	if (ctn730_set_power(ctn730, false) < 0)
++		dev_warn(ctn730->dev, "Failed to power off chip\n");
++
++	mutex_unlock(&ctn730->req_lock);
++}
++
++static int ctn730_recover_boot(struct ctn730 *ctn730)
++{
++	int ret;
++	dev_info(ctn730->dev, "Recover device\n");
++
++	ctn730_down(ctn730);
++
++	mutex_lock(&ctn730->req_lock);
++	ret = ctn730_try_boot(ctn730, false, false);
++	mutex_unlock(&ctn730->req_lock);
++
++	if (ret < 0) {
++		dev_warn(ctn730->dev, "Failed to recover\n");
++		ctn730_down(ctn730);
++		set_bit(CTN730_RFKILLED, &ctn730->flags);
++		return -EIO;
++	}
++
++	dev_info(ctn730->dev, "Successfully recovered\n");
++	return 0;
++}
++
++static int ctn730_up(struct ctn730 *ctn730, bool sync_firmware, bool set_param)
++{
++	int ret;
++
++	mutex_lock(&ctn730->req_lock);
++
++	ret = ctn730_try_boot(ctn730, sync_firmware, set_param);
++	mutex_unlock(&ctn730->req_lock);
++	if (ret)
++		ret = ctn730_recover_boot(ctn730);
++
++	return ret;
++}
++
++static int ctn730_rfkill_set(void *data, bool blocked)
++{
++	struct ctn730 *ctn730 = data;
++	int ret;
++
++	if (blocked) {
++		if (test_and_set_bit(CTN730_RFKILLED, &ctn730->flags))
++			return 0;
++
++		dev_info(ctn730->dev, "rfkill block\n");
++		ctn730_down(ctn730);
++	} else {
++		if (!test_and_clear_bit(CTN730_RFKILLED, &ctn730->flags)) {
++			dev_dbg(ctn730->dev, "rfkill was already unblocked. No enabling required\n");
++			return 0;
++		}
++
++		dev_info(ctn730->dev, "rfkill unblock\n");
++		ret = ctn730_up(ctn730, false, false);
++		if (ret < 0)
++			return -EIO;
++
++		/* Return to default state */
++		ctn730_i2c_detection(ctn730, ctn730->detect_interval_ms, true);
++	}
++
++	return 0;
++}
++
++static const struct rfkill_ops ctn730_rfkill_ops = {
++	.set_block = ctn730_rfkill_set,
++};
++
++static int ctn730_rfkill_init(struct ctn730 *ctn730)
++{
++	struct rfkill *rfkill;
++	int err;
++
++	rfkill = rfkill_alloc("ctn730", ctn730->dev, RFKILL_TYPE_NFC,
++			      &ctn730_rfkill_ops, ctn730);
++	if (!rfkill)
++		return -ENOMEM;
++
++	/* For enabling correct initial state for the docking
++	 * we need to either shutdown the IC or enable detection
++	 */
++	if (rfkill_blocked(rfkill)) {
++		ctn730_down(ctn730);
++	} else {
++		ctn730_i2c_detection(ctn730, ctn730->detect_interval_ms, true);
++	}
++
++	err = rfkill_register(rfkill);
++	if (err) {
++		rfkill_destroy(rfkill);
++		return err;
++	}
++
++	ctn730->rfkill = rfkill;
++
++	return 0;
++}
++
++static void ctn730_rfkill_deinit(struct ctn730 *ctn730)
++{
++	struct rfkill *rfkill = ctn730->rfkill;
++
++	if (!rfkill)
++		return;
++
++	rfkill_unregister(rfkill);
++	rfkill_destroy(rfkill);
++	ctn730->rfkill = NULL;
++}
++
++static int ctn730_probe(struct i2c_client *client)
++{
++	int ret;
++	struct ctn730 *ctn730;
++	struct device *dev = &client->dev;
++
++	dev_info(dev, "loading ctn730_rm\n");
++
++	ctn730 = devm_kzalloc(dev, sizeof(*ctn730), GFP_KERNEL);
++	if (ctn730 == NULL)
++		return -ENOMEM;
++
++	ctn730->client = client;
++	ctn730->dev = dev;
++	i2c_set_clientdata(client, ctn730);
++
++	ctn730_init(ctn730);
++
++	ret = ctn730_supply_init(ctn730);
++	if (ret < 0)
++		goto err_0;
++
++	ret = kfifo_alloc(&ctn730->app_data_fifo, MSG_SIZE * NUM_MSGS_RECV_BUFFER, GFP_KERNEL);
++	if (ret < 0) {
++		dev_err(ctn730->dev, "failed to allocate app_data_fifo\n");
++		goto err_0;
++	}
++
++	ret = ctn730_gpio_init(ctn730);
++	if (ret != 0)
++		goto err_0;
++
++	ret = ctn730_i2c_init(ctn730);
++	if (ret != 0)
++		goto err_0;
++
++	ret = ctn730_up(ctn730, true, true);
++	if (ret < 0)
++		goto err_1;
++
++	ret = ctn730_sysfs_nodes_init(ctn730);
++	if (ret < 0)
++		goto err_1;
++
++	ctn730->mdev.minor = MISC_DYNAMIC_MINOR;
++	ctn730->mdev.name = "ctn730";
++	ctn730->mdev.fops = &ctn730_fops;
++	ctn730->mdev.parent = dev;
++	if (misc_register(&ctn730->mdev) < 0) {
++		dev_err(dev, "failed to create miscdevice");
++		goto err_2;
++	}
++
++	ret = ctn730_rfkill_init(ctn730);
++	if (ret)
++		goto err_3;
++
++	return 0;
++
++err_3:
++	misc_deregister(&ctn730->mdev);
++
++err_2:
++	ctn730_sysfs_nodes_deinit(ctn730);
++
++err_1:
++	ctn730_i2c_deinit(ctn730);
++	kfifo_free(&ctn730->app_data_fifo);
++
++err_0:
++	return ret;
++}
++
++static void ctn730_remove(struct i2c_client *client)
++{
++	struct ctn730 *ctn730 = i2c_get_clientdata(client);
++
++	dev_info(ctn730->dev, "removing ctn730_rm\n");
++
++	ctn730_down(ctn730);
++
++	ctn730_rfkill_deinit(ctn730);
++	misc_deregister(&ctn730->mdev);
++	ctn730_sysfs_nodes_deinit(ctn730);
++	ctn730_i2c_deinit(ctn730);
++}
++
++static int ctn730_suspend(struct device *dev)
++{
++	struct ctn730 *ctn730 = dev_get_drvdata(dev);
++	struct ctn730_i2c *ctn730_i2c = ctn730->ctn730_i2c;
++
++	if (!test_bit(CTN730_RFKILLED, &ctn730->flags)) {
++		/*
++		 * Disable charging info events while the IRQ is still enabled,
++		 * because the command needs the IRQ handler for its response.
++		 */
++		mutex_lock(&ctn730->req_lock);
++		ctn730_enable_charging_info_event(ctn730, false);
++		mutex_unlock(&ctn730->req_lock);
++
++		/*
++		 * Drain current work with the IRQ enabled, then disable the IRQ
++		 * and drain again to catch work queued by a last IRQ handler.
++		 */
++		cancel_delayed_work_sync(&ctn730_i2c->read_battery_delayed_work);
++		disable_irq(ctn730->client->irq);
++		cancel_delayed_work_sync(&ctn730_i2c->read_battery_delayed_work);
++	}
++	return 0;
++}
++
++static int ctn730_resume(struct device *dev)
++{
++	struct ctn730 *ctn730 = dev_get_drvdata(dev);
++
++	if (!test_bit(CTN730_RFKILLED, &ctn730->flags)) {
++		enable_irq(ctn730->client->irq);
++		mutex_lock(&ctn730->req_lock);
++		ctn730_enable_charging_info_event(ctn730, true);
++		mutex_unlock(&ctn730->req_lock);
++	}
++	return 0;
++}
++
++static int ctn730_freeze(struct device *dev)
++{
++	struct ctn730 *ctn730 = dev_get_drvdata(dev);
++
++	/*
++	 * If the interface is not rfkilled, bring
++	 * the nfc interface down in a controlled fashion.
++	 * Some devices have logic to power-gate NFC_PWR_EN
++	 * tied to PMIC_ON_REQ.
++	 */
++	if (!test_bit(CTN730_RFKILLED, &ctn730->flags)) {
++		ctn730_down(ctn730);
++	}
++
++	return 0;
++}
++
++static int ctn730_thaw(struct device *dev)
++{
++	struct ctn730 *ctn730 = dev_get_drvdata(dev);
++	int ret;
++	/*
++	 * In the case of hibernation failure we need to bring the
++	 * interface back up if it was not rfkilled before
++	 * hibernation attempt.
++	 */
++	if (dev->power.power_state.event == PM_EVENT_RECOVER) {
++		if (!test_bit(CTN730_RFKILLED, &ctn730->flags)) {
++			ret = ctn730_up(ctn730, false, false);
++			if (ret < 0)
++				return -EIO;
++
++			ctn730_i2c_detection(ctn730, ctn730->detect_interval_ms, true);
++		}
++	}
++	return 0;
++}
++
++static int ctn730_restore(struct device *dev)
++{
++	struct ctn730 *ctn730 = dev_get_drvdata(dev);
++	int ret;
++
++	/*
++	 * Nothing needs to be done if system hibernated with ctn730 being
++	 * rfkilled. Otherwise, we need to power up ctn730 to match rfkill
++	 * state.
++	 */
++	if (test_bit(CTN730_RFKILLED, &ctn730->flags)) {
++		dev_dbg(dev, "ctn730 is rfkilled, no need to restore\n");
++		return 0;
++	}
++
++	ret = ctn730_up(ctn730, false, false);
++	if (ret < 0)
++		return -EIO;
++
++	ctn730_i2c_detection(ctn730, ctn730->detect_interval_ms, true);
++
++	return 0;
++}
++
++static const struct dev_pm_ops ctn730_pm_ops = {
++	.suspend = ctn730_suspend,
++	.resume = ctn730_resume,
++	.freeze = ctn730_freeze,
++	.thaw = ctn730_thaw,
++	.restore = ctn730_restore,
++};
++
++static const struct of_device_id rm_ctn730_dt_ids[] = {
++	{
++		.compatible = "nxp,ctn730-rm",
++	},
++	{},
++};
++MODULE_DEVICE_TABLE(of, rm_ctn730_dt_ids);
++
++static struct i2c_driver rm_ctn730_driver = {
++	.driver = {
++		.name = "nxp,ctn730-rm",
++		.owner = THIS_MODULE,
++		.pm = &ctn730_pm_ops,
++		.of_match_table = rm_ctn730_dt_ids,
++	},
++	.probe = ctn730_probe,
++	.remove	= ctn730_remove,
++};
++module_i2c_driver(rm_ctn730_driver);
++
++MODULE_DESCRIPTION("Low-level driver for NXP CTN730");
++MODULE_AUTHOR("reMarkable");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/nfc/ctn730_rm/ctn730.h b/drivers/nfc/ctn730_rm/ctn730.h
+new file mode 100644
+index 000000000..def5a07e0
+--- /dev/null
++++ b/drivers/nfc/ctn730_rm/ctn730.h
+@@ -0,0 +1,189 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * reMarkable NXP CTN730
++ *
++ * Copyright (C) 2023 reMarkable AS - http://www.remarkable.com/
++ */
++
++#ifndef __RM_CTN730_H_
++#define __RM_CTN730_H_
++
++#include <linux/kobject.h>
++#include <linux/pinctrl/pinctrl.h>
++#include <linux/gpio.h>
++#include <linux/of.h>
++#include <linux/i2c.h>
++#include <linux/device.h>
++#include <linux/workqueue.h>
++#include <linux/kfifo.h>
++#include <linux/mutex.h>
++#include <linux/rfkill.h>
++#include <linux/miscdevice.h>
++
++#define CTN730_IOCTLID	0xEE
++#define CTN730_IOCTL_GET_STATE  _IOR(CTN730_IOCTLID, 0, int)
++#define CTN730_IOCTL_ENABLE_APP_DATA_CHANNEL  _IOR(CTN730_IOCTLID, 1, int)
++#define CTN730_IOCTL_DISABLE_APP_DATA_CHANNEL  _IOR(CTN730_IOCTLID, 2, int)
++
++/*
++ * The 6 first stats have the same values as returned by
++ * the WLC_HOST_CTRL_DUMP_STATUS_CMD command
++ */
++enum ctn730_state {
++	state_initialized = 0,
++	state_device_detection,
++	state_device_detected,
++	state_charging_data_channel_established,
++	state_app_data_channel_established,
++	state_device_paused,
++	state_download_mode,
++	state_shutdown,
++	state_unknown,
++};
++extern const char *ctn730_state_text[];
++
++enum ctn730_charging_state {
++	charging_state_charging_started = 0,
++	charging_state_charging_ended,
++	charging_state_charging_stopped,
++	charging_state_unknown,
++};
++extern const char *ctn730_charging_state_text[];
++
++enum ctn730_device_state {
++	device_state_device_detected = 0,
++	device_state_device_deactivated,
++	device_state_device_lost,
++	device_state_device_version_mismatch,
++	device_state_device_docked,
++	device_state_device_undocked,
++	device_state_fo_present,
++	device_state_battery_full,
++	device_state_charge_failure,
++	device_state_ndef_mode,
++	device_state_listener_ot,
++	device_state_unknown,
++};
++extern const char *ctn730_device_state_text[];
++
++enum ctn730_boot_reason {
++	boot_reason_intended = 0,
++	boot_reason_firmware_corrupted,
++	boot_reason_unrecoverable,
++	boot_reason_unknown,
++};
++extern const char *ctn730_boot_reason_text[];
++
++enum ctn730_charging_disable_reason {
++	charging_disable_reason_host_controller_request = 0,
++	charging_disable_reason_overtemperature,
++	charging_disable_reason_channel_sync_error,
++	charging_disable_reason_unknown,
++};
++extern const char *ctn730_charging_disable_reason_text[];
++
++enum ctn730_app_data_state {
++	app_data_state_connected = 0,
++	app_data_state_disconnected,
++	app_data_state_activation_failed,
++	app_data_state_unknown,
++};
++extern const char *ctn730_app_data_state_text[];
++
++enum fw_state {
++	fw_state_unknown,
++	fw_state_up_to_date,
++	fw_state_not_up_to_date,
++};
++extern const char *ctn730_fw_state_text[];
++
++#define CTN730_HOST_UID_SIZE 16
++#define CTN730_MARKER_UID_SIZE 7
++
++enum {
++	CTN730_RFKILLED,
++	CTN730_RSP_WAIT,
++	CTN730_RST_DONE,
++	CTN730_INIT_PENDING,
++	CTN730_BOOT_PENDING,
++	CTN730_APP_DATA_STATE_CHANGE,
++	CTN730_APP_DATA_SENT,
++};
++
++struct ctn730 {
++	struct i2c_client *client;
++	struct device *dev;
++	struct mutex lock;
++	struct mutex req_lock;
++	struct regulator *nfc_supply;
++	struct power_supply *supply;
++	struct rfkill *rfkill;
++	struct kfifo app_data_fifo;
++
++	u32 detect_interval_ms;
++	bool init_bus_lock;
++
++	unsigned long flags;
++	enum ctn730_state state;
++	enum ctn730_charging_state charging_state;
++	enum ctn730_device_state device_state;
++	enum ctn730_boot_reason boot_reason;
++	enum ctn730_app_data_state app_data_state;
++
++	u8 host_uid[CTN730_HOST_UID_SIZE];
++	u8 marker_uid[CTN730_MARKER_UID_SIZE];
++
++	u8 fw_current_minor;
++	u8 fw_current_major;
++	u8 fw_provided_minor;
++	u8 fw_provided_major;
++	enum fw_state fw_state;
++
++	int battery_level;
++
++	void *ctn730_i2c;
++
++	struct miscdevice mdev;
++	wait_queue_head_t app_data_wait_queue;
++
++	struct kobject *kobject;
++
++	/* control attrs */
++	struct kobj_attribute reset_normal_mode_attr;
++	struct kobj_attribute reset_download_mode_attr;
++	struct kobj_attribute enable_detection_attr;
++	struct kobj_attribute disable_detection_attr;
++	struct kobj_attribute pause_charging_attr;
++	struct kobj_attribute resume_charging_attr;
++	struct kobj_attribute enable_application_channel_attr;
++	struct kobj_attribute disable_application_channel_attr;
++	struct kobj_attribute prod_test_attr;
++
++	/* info attrs */
++	struct kobj_attribute fw_version_current_attr;
++	struct kobj_attribute fw_version_provided_attr;
++	struct kobj_attribute host_uid_attr;
++	struct kobj_attribute marker_uid_attr;
++
++	/* status attrs */
++	struct kobj_attribute status_attr;
++	struct kobj_attribute charging_state_attr;
++	struct kobj_attribute device_state_attr;
++	struct kobj_attribute fw_state_attr;
++	struct kobj_attribute battery_level_attr;
++	struct kobj_attribute power_step_attr;
++
++	/* config attrs */
++	struct kobj_attribute read_parameter_attr;
++	struct kobj_attribute write_parameter_attr;
++	struct kobj_attribute read_session_parameter_attr;
++	struct kobj_attribute write_session_parameter_attr;
++};
++
++void ctn730_set_state(struct ctn730 *ctn730, enum ctn730_state new_state);
++void ctn730_set_charging_state(struct ctn730 *ctn730, enum ctn730_charging_state new_state);
++void ctn730_set_device_state(struct ctn730 *ctn730, enum ctn730_device_state new_state);
++void ctn730_set_app_data_state(struct ctn730 *ctn730, enum ctn730_app_data_state new_state);
++void ctn730_set_battery_level(struct ctn730 *ctn730, int new_level);
++
++#endif /* __RM_CTN730_H_ */
+diff --git a/drivers/nfc/ctn730_rm/ctn730_fw.c b/drivers/nfc/ctn730_rm/ctn730_fw.c
+new file mode 100644
+index 000000000..a9d2a8bca
+--- /dev/null
++++ b/drivers/nfc/ctn730_rm/ctn730_fw.c
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * reMarkable NXP CTN730
++ *
++ * Copyright (C) 2023 reMarkable AS - http://www.remarkable.com/
++ */
++
++#include <linux/crc32.h>
++#include <linux/delay.h>
++#include <linux/ihex.h>
++#include <linux/mutex.h>
++
++#include "ctn730.h"
++#include "ctn730_i2c.h"
++#include "ctn730_fw.h"
++
++const char *ctn730_fw_state_text[] = { "fw_state_unknown", "fw_state_up_to_date",
++				"fw_state_not_up_to_date" };
++
++
++static int __ctn730_fw_sync(struct ctn730 *ctn730,
++			    const struct ihex_binrec *rec)
++{
++	int ret;
++	int len;
++	bool already_up_to_date;
++	u32 crc = ~0; /* cf: ether_crc() */
++	u8 major = READ_ONCE(ctn730->fw_provided_major);
++	u8 minor = READ_ONCE(ctn730->fw_provided_minor);
++
++	lockdep_assert_held(&ctn730->req_lock);
++
++	ret = ctn730_i2c_dl_open_session(ctn730, major, minor, &already_up_to_date);
++	if (ret) {
++		dev_err(ctn730->dev, "Failed to open download session: %d\n", ret);
++		return ret;
++	}
++
++	if (already_up_to_date) {
++		dev_info(ctn730->dev, "FW already up-to-date: %02d.%02d\n", major, minor);
++		return 0;
++	}
++
++	WRITE_ONCE(ctn730->fw_state, fw_state_not_up_to_date);
++
++	while ((rec = ihex_next_binrec(rec))) {
++		len = be16_to_cpu(rec->len);
++
++		if (len != FW_BLOCK_SIZE) {
++			dev_err(ctn730->dev, "firmware record has unexpected length: %d\n", len);
++			return -EINVAL;
++		}
++
++		dev_dbg(ctn730->dev,
++			"firmware record: addr: %x, len: %d\n",
++			be32_to_cpu(rec->addr), len);
++
++		ret = ctn730_i2c_dl_write_flash(ctn730, be32_to_cpu(rec->addr), rec->data);
++		if (ret) {
++			dev_err(ctn730->dev, "Error writing fw page: %d\n", ret);
++			return ret;
++		}
++		crc = crc32_le(crc, rec->data, FW_BLOCK_SIZE);
++	}
++
++	/*
++	 * IEEE 802.3 CRC32 has to be inverted after the intermediate calculations.
++	 * cf: ether_crc()
++	 */
++	crc = ~crc;
++
++	ret = ctn730_i2c_dl_commit_session(ctn730, crc);
++	if (ret) {
++		dev_err(ctn730->dev, "Failed to commit download session: %d, crc: %x\n", ret, crc);
++		return ret;
++	}
++
++	WRITE_ONCE(ctn730->fw_state, fw_state_up_to_date);
++	dev_info(ctn730->dev, "FW update to %02d.%02d succeeded\n", major, minor);
++
++	return 0;
++}
++
++/**
++ * Has to be called while in DOWNLOAD mode.
++ */
++int ctn730_fw_sync(struct ctn730 *ctn730)
++{
++	int ret = 0;
++	const struct firmware *fw;
++	const struct ihex_binrec *rec;
++	int tries = 3;
++
++	lockdep_assert_held(&ctn730->req_lock);
++
++	ret = request_ihex_firmware(&fw, "ctn730.fw", ctn730->dev);
++	if (ret) {
++		dev_err(ctn730->dev, "Failed to read firmware\n");
++		return ret;
++	}
++
++	rec = (const struct ihex_binrec *)fw->data;
++
++	/* first record is the version number */
++	if (be32_to_cpu(rec->addr) != 0x0 || be16_to_cpu(rec->len) != 2) {
++		dev_err(ctn730->dev, "FW image has bad version frame!\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	WRITE_ONCE(ctn730->fw_provided_major, rec->data[0]);
++	WRITE_ONCE(ctn730->fw_provided_minor, rec->data[1]);
++
++retry:
++	ret = __ctn730_fw_sync(ctn730, rec);
++	if (ret) {
++		if (--tries > 0) {
++			dev_info(ctn730->dev,
++				 "FW update failed, retrying... Attempts left: %d\n", tries);
++			goto retry;
++		}
++		goto out;
++	}
++
++out:
++	release_firmware(fw);
++
++	return ret;
++}
++
++MODULE_DESCRIPTION("Low-level driver for NXP CTN730");
++MODULE_AUTHOR("reMarkable");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/nfc/ctn730_rm/ctn730_fw.h b/drivers/nfc/ctn730_rm/ctn730_fw.h
+new file mode 100644
+index 000000000..78f0a0282
+--- /dev/null
++++ b/drivers/nfc/ctn730_rm/ctn730_fw.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * reMarkable NXP CTN730
++ *
++ * Copyright (C) 2023 reMarkable AS - http://www.remarkable.com/
++ */
++
++#ifndef __CTN730_FW_H__
++#define __CTN730_FW_H__
++
++#include "ctn730.h"
++#include <linux/i2c.h>
++
++int ctn730_fw_sync(struct ctn730 *ctn730);
++
++#endif /* __CTN730_FW_H__ */
+diff --git a/drivers/nfc/ctn730_rm/ctn730_i2c.c b/drivers/nfc/ctn730_rm/ctn730_i2c.c
+new file mode 100644
+index 000000000..aa97954e2
+--- /dev/null
++++ b/drivers/nfc/ctn730_rm/ctn730_i2c.c
+@@ -0,0 +1,1326 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * reMarkable NXP CTN730
++ *
++ * Copyright (C) 2023 reMarkable AS - http://www.remarkable.com/
++ */
++
++#include <linux/delay.h>
++#include <linux/lockdep.h>
++#include <linux/wait.h>
++#include "ctn730_i2c.h"
++#include "ctn730_supply.h"
++
++#include <trace/events/ctn730_rm.h>
++
++
++const char *ctn730_state_text[] = {
++	"INITIALIZED",
++	"DEVICE_DETECTION",
++	"DEVICE_DETECTED",
++	"CHARGING_DATA_CHANNEL_ESTABLISHED",
++	"APP_DATA_CHANNEL_ESTABLISHED",
++	"DEVICE_PAUSED",
++	"DOWNLOAD_MODE",
++	"SHUTDOWN",
++	"UNKNOWN"
++};
++
++const char *ctn730_charging_state_text[] = {
++	"CHARGING_STARTED", "CHARGING_ENDED", "CHARGING_STOPPED", "UNKNOWN"
++};
++
++const char *ctn730_device_state_text[] = {
++	"DEVICE_DETECTED", "DEVICE_DEACTIVATED", "DEVICE_LOST", "DEVICE_VERSION_MISMATCH",
++	"DEVICE_DOCKED",   "DEVICE_UNDOCKED",	 "FO_PRESENT",	"BATTERY_FULL",
++	"CHARGE_FAILURE",  "NDEF_MODE",		 "LISTENER_OT", "UNKNOWN"
++};
++
++const char *ctn730_boot_reason_text[] = {
++	"INTENDED", "FIRMWARE_CORRUPTED", "UNRECOVERABLE_ERROR", "UNKNOWN"
++};
++
++const char *ctn730_charging_disable_reason_text[] = {
++	"HOST_CONTROLLER_REQUEST", "OVERTEMPERATURE", "CHANNEL_SYNC_ERROR", "UNKNOWN"
++};
++
++enum resume_reason {
++	resume_reason_host_controller_request = 0,
++	resume_reason_device_lost,
++	resume_reason_channel_sync_error,
++	resume_reason_unknown,
++};
++
++static const char * const resume_reason_text[] = {
++	"HOST_CONTROLLER_REQUEST", "DEVICE_LOST", "CHANNEL_SYNC_ERROR", "UNKNOWN"
++};
++
++const char *ctn730_app_data_state_text[] = {
++	"CONNECTED", "DISCONNECTED", "ACTIVATION_FAILED", "UNKNOWN"
++};
++
++static int ctn730_i2c_send(struct ctn730 *ctn730, u8 *buf, int count)
++{
++	int ret;
++	struct i2c_client *client = ctn730->client;
++	struct device *dev = ctn730->dev;
++	int retries = 0;
++
++	lockdep_assert_held(&ctn730->req_lock);
++
++	print_hex_dump_debug("ctn730_rm: sending raw data:",
++			     DUMP_PREFIX_NONE, count, 1,
++			     buf, count, false);
++	dev_dbg(ctn730->dev, "Sending while in state: %s / %s\n",
++		ctn730_state_text[ctn730->state],
++		ctn730_charging_state_text[ctn730->charging_state]);
++
++	if (ctn730->state == state_shutdown)
++		return -ERFKILL;
++
++retry:
++	ret = i2c_master_send(client, buf, count);
++	if (ret < 0) {
++		/*
++		 * Repeat sending command in case WLC-Host is in standby sleep.
++		 * It will wake up on device address.
++		 */
++		usleep_range(10500, 11500);
++		dev_dbg(dev, "transmit error: %d, retrying sending\n", ret);
++		retries++;
++		if (retries <= 3)
++			goto retry;
++	}
++
++	dev_dbg(dev, "retries: %d\n", retries);
++
++	if (ret < 0) {
++		dev_err(dev, "failed sending (%d)\n", ret);
++		return ret;
++	}
++
++	dev_dbg(dev, "sent bytes: %d\n", ret);
++
++	if (ret < count)
++		dev_err(dev, "tried sending %d bytes, sent %d\n", ret, count);
++
++	return ret;
++}
++
++static int ctn730_i2c_send_wait_rsp_no_status_check_locked(struct ctn730 *ctn730,
++							   struct ctn730_msg *msg,
++							   unsigned long timeout)
++{
++	struct ctn730_i2c *ctn730_i2c = ctn730->ctn730_i2c;
++	int ret;
++
++	lockdep_assert_held(&ctn730->req_lock);
++	/* global lock should not be held as IRQ handler may take that one */
++	lockdep_assert_not_held(&ctn730->lock);
++
++	trace_ctn730_send_msg_start(ctn730, msg);
++
++	set_bit(CTN730_RSP_WAIT, &ctn730->flags);
++
++	ret = ctn730_i2c_send(ctn730, (u8 *)msg, sizeof(msg->header) + msg->header.len);
++	if (ret < 0)
++		goto done;
++
++	if (wait_on_bit_timeout(&ctn730->flags, CTN730_RSP_WAIT,
++				TASK_INTERRUPTIBLE, timeout)) {
++		dev_err(ctn730->dev, "no response to cmd %02x", msg->header.instr);
++		ret = -EIO;
++		goto done;
++	}
++
++	/* copy shared rsp buffer to caller's msg */
++	memcpy(msg, &ctn730_i2c->response_msg, sizeof(struct ctn730_msg));
++
++done:
++	trace_ctn730_send_msg_end(ctn730, msg);
++	clear_bit(CTN730_RSP_WAIT, &ctn730->flags);
++
++	return ret;
++}
++
++static int ctn730_i2c_send_wait_rsp_no_status_check(struct ctn730 *ctn730,
++						    struct ctn730_msg *msg,
++						    unsigned long timeout)
++{
++	int ret;
++
++	mutex_lock(&ctn730->req_lock);
++	ret = ctn730_i2c_send_wait_rsp_no_status_check_locked(ctn730, msg, timeout);
++	mutex_unlock(&ctn730->req_lock);
++
++	return ret;
++}
++
++static int ctn730_i2c_send_wait_rsp_timeout_locked(struct ctn730 *ctn730,
++						   struct ctn730_msg *msg,
++						   unsigned long timeout)
++{
++	int err;
++
++	lockdep_assert_held(&ctn730->req_lock);
++
++	err = ctn730_i2c_send_wait_rsp_no_status_check_locked(ctn730, msg, timeout);
++	if (err)
++		return err;
++
++	if (msg->status != STATUS_OK) {
++		dev_err(ctn730->dev, "msg status error: %02x\n", msg->status);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int ctn730_i2c_send_wait_rsp_timeout(struct ctn730 *ctn730,
++					    struct ctn730_msg *msg,
++					    unsigned long timeout)
++{
++	int err;
++
++	err = ctn730_i2c_send_wait_rsp_no_status_check(ctn730, msg, timeout);
++	if (err)
++		return err;
++
++	if (msg->status != STATUS_OK) {
++		dev_err(ctn730->dev, "msg status error: %02x\n", msg->status);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int ctn730_i2c_send_wait_rsp(struct ctn730 *ctn730, struct ctn730_msg *msg)
++{
++	return ctn730_i2c_send_wait_rsp_timeout(ctn730, msg, MSG_DEFAULT_TIMEOUT);
++}
++
++static int ctn730_i2c_handle_response(struct ctn730 *ctn730, struct ctn730_msg *msg)
++{
++	struct device *dev = ctn730->dev;
++	struct ctn730_i2c *ctn730_i2c = ctn730->ctn730_i2c;
++
++	switch (msg->header.instr) {
++	case WLC_HOST_CTRL_RESET:
++		dev_dbg(dev, "WLC_HOST_CTRL_RESET_RSP\n");
++		break;
++	case WLC_HOST_CTRL_DL_WRITE_FLASH:
++		dev_dbg(dev, "WLC_HOST_CTRL_DL_WRITE_FLASH_RSP\n");
++		break;
++	case WLC_HOST_CTRL_DL_OPEN_SESSION:
++		dev_dbg(dev, "WLC_HOST_CTRL_DL_OPEN_SESSION_RSP\n");
++		break;
++	case WLC_HOST_CTRL_DL_COMMIT_SESSION:
++		dev_dbg(dev, "WLC_HOST_CTRL_DL_COMMIT_SESSION_RSP\n");
++		break;
++	case WLC_HOST_CTRL_DL_READ_UID:
++		dev_dbg(dev, "WLC_HOST_CTRL_DL_READ_UID_RSP\n");
++		break;
++	case WLC_HOST_CTRL_READ_PARAMETER:
++		dev_dbg(dev, "WLC_HOST_CTRL_READ_PARAMETER_RSP\n");
++		break;
++	case WLC_HOST_CTRL_READ_SESSION_PARAMETER:
++		dev_dbg(dev, "WLC_HOST_CTRL_READ_SESSION_PARAMETER_RSP\n");
++		break;
++	case WLC_HOST_CTRL_WRITE_PARAMETER:
++		dev_dbg(dev, "WLC_HOST_CTRL_WRITE_PARAMETER_RSP\n");
++		break;
++	case WLC_HOST_CTRL_WRITE_SESSION_PARAMETER:
++		dev_dbg(dev, "WLC_HOST_CTRL_WRITE_SESSION_PARAMETER_RSP\n");
++		break;
++	case WLC_HOST_CTRL_DUMP_STATUS:
++		dev_dbg(dev, "WLC_HOST_CTRL_DUMP_STATUS_RSP\n");
++		break;
++	case WLC_CHG_CTRL_ENABLE:
++		dev_dbg(dev, "WLC_CHG_CTRL_ENABLE_RSP\n");
++		break;
++	case WLC_CHG_CTRL_DISABLE:
++		dev_dbg(dev, "WLC_CHG_CTRL_DISABLE_RSP\n");
++		break;
++	case WLC_APP_CTRL_CHANNEL_ENABLE:
++		dev_dbg(dev, "WLC_APP_CTRL_CHANNEL_ENABLE_RSP\n");
++		break;
++	case WLC_APP_CTRL_CHANNEL_DISABLE:
++		dev_dbg(dev, "WLC_APP_CTRL_CHANNEL_DISABLE_RSP\n");
++		break;
++	case WLC_CHG_CTRL_PAUSE_DEVICE:
++		dev_dbg(dev, "WLC_CHG_CTRL_PAUSE_DEVICE_RSP\n");
++		break;
++	case WLC_CHG_CTRL_RESUME_DEVICE:
++		dev_dbg(dev, "WLC_CHG_CTRL_RESUME_DEVICE_RSP\n");
++		break;
++	case WLC_APP_CTRL_SEND_DATA:
++		dev_dbg(dev, "WLC_APP_CTRL_SEND_DATA_RSP\n");
++		break;
++	case WLC_HOST_CTRL_BIST:
++		dev_dbg(dev, "WLC_HOST_CTRL_BIST_RSP\n");
++		break;
++
++	default:
++		dev_err(dev, "illegal response (0x%02x)\n", msg->header.instr);
++		return -EIO;
++	}
++
++	memcpy(&ctn730_i2c->response_msg, msg, HEADER_SIZE + msg->header.len);
++
++	if (!test_and_clear_bit(CTN730_RSP_WAIT, &ctn730->flags))
++		dev_warn(dev, "Unexpected response\n"); /* unlikely */
++
++	wake_up_bit(&ctn730->flags, CTN730_RSP_WAIT);
++
++	return 0;
++}
++
++static void read_battery_delayed_func(struct work_struct *work)
++{
++	struct ctn730_i2c *ctn730_i2c = container_of(to_delayed_work(work),
++					struct ctn730_i2c, read_battery_delayed_work);
++	struct ctn730 *ctn730 = ctn730_i2c->ctn730;
++	struct device *dev = ctn730->dev;
++	unsigned int delay_to_next_attempt;
++	int ret;
++
++	/* we powered off before getting here */
++	if (READ_ONCE(ctn730->state) == state_shutdown)
++		return;
++
++	ret = ctn730_i2c_get_battery_level(ctn730);
++	if (ret != 0) {
++		dev_warn(dev, "Sending battery level request failed after connect: %d...\n", ret);
++		return;
++	}
++
++	mutex_lock(&ctn730->lock);
++	if (ctn730->battery_level == -1 &&
++		   ctn730_i2c->unsuccessful_battery_reads_on_dock < 10) {
++		dev_dbg(dev, "Battery level unavailable after connect... Attempts: %d\n",
++			ctn730_i2c->unsuccessful_battery_reads_on_dock);
++
++		/*
++		 * Scale the delay based on the retries that failed so far.
++		 * This leads to next attempts after 100, 200, 400, 800, 1000, 1000, ... ms
++		 */
++		delay_to_next_attempt = min_t(unsigned int, 1000,
++					      100 << ctn730_i2c->unsuccessful_battery_reads_on_dock);
++
++		++ctn730_i2c->unsuccessful_battery_reads_on_dock;
++		schedule_delayed_work(&ctn730_i2c->read_battery_delayed_work,
++						msecs_to_jiffies(delay_to_next_attempt));
++		goto out;
++	}
++
++	/* we either got a battery level or we give up */
++
++	if (ctn730->battery_level == -1)
++		dev_warn(dev, "Failed to poll battery level after dock. Giving up...\n");
++
++	/*
++	 * We want to notify userspace when we dock a marker with
++	 * full battery. Otherwise userspace has to poll the sysfs node until
++	 * battery can be read.
++	 */
++	if (ctn730->battery_level == 100) {
++		ctn730_set_device_state(ctn730, device_state_battery_full);
++	}
++
++out:
++	mutex_unlock(&ctn730->lock);
++}
++
++static int ctn730_i2c_handle_evt(struct ctn730 *ctn730, struct ctn730_msg *msg)
++{
++	struct device *dev = ctn730->dev;
++	struct ctn730_i2c *ctn730_i2c = ctn730->ctn730_i2c;
++	int size, ret, count;
++
++	mutex_lock(&ctn730->lock);
++
++	trace_ctn730_event(ctn730, msg);
++
++	switch (msg->header.instr) {
++	case WLC_HOST_CTRL_GENERIC_ERROR:
++		dev_err(dev, "WLC_HOST_CTRL_GENERIC_ERROR_EVT %d\n", msg->payload[0]);
++		break;
++	case WLC_HOST_CTRL_RESET:
++		dev_dbg(dev, "WLC_HOST_CTRL_RESET_EVT\n");
++
++		if (msg->payload[0] == NORMAL_MODE) {
++			ctn730_set_state(ctn730, state_initialized);
++			ctn730->fw_current_major = msg->payload[1];
++			ctn730->fw_current_minor = msg->payload[2];
++
++			dev_dbg(dev, "NORMAL_MODE FW=%02x.%02x\n", ctn730->fw_current_major,
++				ctn730->fw_current_minor);
++
++			clear_bit(CTN730_RST_DONE, &ctn730->flags);
++			clear_bit(CTN730_INIT_PENDING, &ctn730->flags);
++			wake_up_bit(&ctn730->flags, CTN730_INIT_PENDING);
++			wake_up_bit(&ctn730->flags, CTN730_RST_DONE);
++		} else if (msg->payload[0] == DOWNLOAD_MODE) {
++			ctn730_set_state(ctn730, state_download_mode);
++			ctn730->boot_reason = msg->payload[1];
++			if (ctn730->boot_reason >= boot_reason_unknown)
++				dev_dbg(dev, "DOWNLOAD_MODE boot reason: %s\n",
++					ctn730_boot_reason_text[boot_reason_unknown]);
++			else
++				dev_dbg(dev, "DOWNLOAD_MODE boot reason: %s\n",
++					ctn730_boot_reason_text[ctn730->boot_reason]);
++
++			clear_bit(CTN730_RST_DONE, &ctn730->flags);
++			clear_bit(CTN730_BOOT_PENDING, &ctn730->flags);
++			wake_up_bit(&ctn730->flags, CTN730_BOOT_PENDING);
++			wake_up_bit(&ctn730->flags, CTN730_RST_DONE);
++		} else {
++			dev_warn(dev, "Reset in unknown mode: 0x%02x\n", msg->payload[0]);
++		}
++
++		break;
++	case WLC_CHG_CTRL_DEVICE_STATE:
++		dev_dbg(dev, "WLC_CHG_CTRL_DEVICE_STATE_EVT: %d\n", msg->event);
++
++		switch (msg->event) {
++		case DEVICE_DETECTED:
++			size = sizeof(ctn730->marker_uid);
++			memcpy(ctn730->marker_uid, &msg->payload[1], size);
++			print_hex_dump_debug("Marker UID:", DUMP_PREFIX_NONE, size, 1,
++					     &ctn730->marker_uid, size, false);
++			ctn730_set_device_state(ctn730, device_state_device_detected);
++			ctn730_set_state(ctn730, state_device_detected);
++
++			ctn730_i2c->unsuccessful_battery_reads_on_dock = 0;
++			schedule_delayed_work(&ctn730_i2c->read_battery_delayed_work,
++						msecs_to_jiffies(150));
++			break;
++		case DEVICE_DEACTIVATED:
++			memset(ctn730->marker_uid, 0, sizeof(ctn730->marker_uid));
++			ctn730_set_device_state(ctn730, device_state_device_deactivated);
++			ctn730_set_state(ctn730, state_device_detection);
++			break;
++		case DEVICE_LOST:
++			memset(ctn730->marker_uid, 0, sizeof(ctn730->marker_uid));
++			ctn730_set_device_state(ctn730, device_state_device_lost);
++			ctn730_set_state(ctn730, state_device_detection);
++			break;
++		case DEVICE_VERSION_MISMATCH:
++			ctn730_set_device_state(ctn730, device_state_device_version_mismatch);
++			break;
++		case DEVICE_DOCKED:
++			ctn730_set_device_state(ctn730, device_state_device_docked);
++			break;
++		case DEVICE_UNDOCKED:
++			ctn730_set_device_state(ctn730, device_state_device_undocked);
++			break;
++		case FO_PRESENT:
++			ctn730_set_device_state(ctn730, device_state_fo_present);
++			break;
++		case BATTERY_FULL:
++			ctn730_set_device_state(ctn730, device_state_battery_full);
++			break;
++		case CHARGE_FAILURE:
++			ctn730_set_device_state(ctn730, device_state_charge_failure);
++			break;
++		case NDEF_MODE:
++			ctn730_set_device_state(ctn730, device_state_ndef_mode);
++			break;
++		case LISTENER_OT:
++			ctn730_set_device_state(ctn730, device_state_listener_ot);
++			break;
++		default:
++			ctn730_set_device_state(ctn730, device_state_unknown);
++			break;
++		}
++		break;
++	case WLC_CHG_CTRL_CHARGING_STATE:
++		dev_dbg(dev, "WLC_CHG_CTRL_CHARGING_STATE_EVT\n");
++
++		if (msg->event >= charging_state_unknown) {
++			ctn730_set_charging_state(ctn730, charging_state_unknown);
++		} else {
++			ctn730_set_charging_state(ctn730,  msg->event);
++		}
++
++		if (ctn730->charging_state == charging_state_charging_stopped)
++			ctn730_set_state(ctn730, state_device_detected);
++
++		if (ctn730->charging_state == charging_state_charging_started)
++			ctn730_set_state(ctn730, state_charging_data_channel_established);
++
++		break;
++	case WLC_CHG_CTRL_DISABLE:
++		ctn730_set_state(ctn730, state_initialized);
++
++		switch (msg->reason) {
++		case HOST_CONTROLLER_REQUEST:
++			dev_dbg(dev, "WLC_CHG_CTRL_DISABLE_EVT, reason: HOST_CONTROLLER_REQUEST\n");
++			break;
++		case OVERTEMPERATURE:
++			dev_info(dev, "WLC_CHG_CTRL_DISABLE_EVT, reason: OVERTEMPERATURE\n");
++			break;
++		case CHANNEL_SYNC_ERROR:
++			dev_info(dev, "WLC_CHG_CTRL_DISABLE_EVT, reason: CHANNEL_SYNC_ERROR\n");
++			break;
++		default:
++			dev_warn(dev, "WLC_CHG_CTRL_DISABLE, unknown reason\n");
++		}
++
++
++		break;
++	case WLC_CHG_CTRL_CHARGING_INFO:
++		dev_dbg(dev, "WLC_CHG_CTRL_CHARGING_INFO_EVT\n");
++
++		ctn730_set_battery_level(ctn730, msg->payload[0]);
++
++		break;
++	case WLC_CHG_CTRL_PAUSE_DEVICE:
++		dev_dbg(dev, "WLC_CHG_CTRL_PAUSE_DEVICE_EVT\n");
++
++		ctn730_set_state(ctn730, state_device_paused);
++		break;
++	case WLC_CHG_CTRL_RESUME_DEVICE:
++		dev_dbg(dev, "WLC_CHG_CTRL_RESUME_DEVICE_EVT\n");
++
++		ctn730_set_state(ctn730, state_device_detected);
++		if (msg->reason >= resume_reason_unknown)
++			dev_dbg(dev, "resume reason: %s\n",
++				resume_reason_text[resume_reason_unknown]);
++		else
++			dev_dbg(dev, "resume reason: %s\n", resume_reason_text[msg->reason]);
++		break;
++	case WLC_CHG_CTRL_OPTIONAL_NDEF:
++		dev_dbg(dev, "WLC_CHG_CTRL_OPTIONAL_NDEF_EVT\n");
++		break;
++	case WLC_APP_CTRL_CHANNEL_STATE:
++		dev_dbg(dev, "WLC_APP_CTRL_CHANNEL_STATE_EVT\n");
++
++		ctn730_set_app_data_state(ctn730, min_t(u8, msg->reason, app_data_state_unknown));
++
++		if (ctn730->app_data_state == app_data_state_disconnected) {
++			ctn730_set_state(ctn730, state_device_detected);
++		}
++		if (ctn730->app_data_state == app_data_state_connected) {
++			ctn730_set_state(ctn730, state_app_data_channel_established);
++		}
++
++		clear_bit(CTN730_APP_DATA_STATE_CHANGE, &ctn730->flags);
++		wake_up_bit(&ctn730->flags, CTN730_APP_DATA_STATE_CHANGE);
++		break;
++	case WLC_APP_CTRL_SEND_DATA:
++		dev_dbg(dev, "WLC_APP_CTRL_SEND_DATA_EVT\n");
++		clear_bit(CTN730_APP_DATA_SENT, &ctn730->flags);
++		wake_up_bit(&ctn730->flags, CTN730_APP_DATA_SENT);
++		break;
++	case WLC_APP_CTRL_RECEIVE_DATA:
++		dev_dbg(dev, "WLC_APP_CTRL_RECEIVE_DATA_EVT\n");
++
++		/* Skip the first byte as this is a flag to tell if it is a chained packet */
++		count = msg->header.len - 1;
++
++		if (kfifo_avail(&ctn730->app_data_fifo) < count) {
++			dev_err(dev, "not enough space in fifo\n");
++			break;
++		}
++
++		ret = kfifo_in(&ctn730->app_data_fifo, &msg->payload[1], count);
++
++		if (ret < count)
++			dev_err(dev, "failed inserting into fifo\n");
++
++		wake_up(&ctn730->app_data_wait_queue);
++		break;
++	default:
++		dev_err(dev, "unknown event (0x%02x)\n", msg->header.instr);
++		break;
++	}
++
++	mutex_unlock(&ctn730->lock);
++	return 0;
++}
++
++static irqreturn_t ctn730_i2c_irq(int irq, void *data)
++{
++	struct ctn730 *ctn730 = data;
++	struct device *dev = ctn730->dev;
++	int ret;
++	struct ctn730_msg msg;
++
++	/* first we receive the header to get the payload length */
++	ret = i2c_master_recv(ctn730->client, (char *)&msg.header, HEADER_SIZE);
++
++	if (ret < 0) {
++		dev_dbg(dev, "reading i2c failed: %d\n", ret);
++		return IRQ_HANDLED;
++	}
++	if (ret != HEADER_SIZE) {
++		dev_err(dev, "header has unexpected len: %d\n", ret);
++		return IRQ_HANDLED;
++	}
++
++	if (msg.header.len > 0) {
++		ret = i2c_master_recv(ctn730->client, (char *)&msg.payload, msg.header.len);
++
++		if (ret < 0) {
++			dev_err(dev, "recv failed: %d\n", ret);
++			goto exit;
++		}
++
++		if (ret < msg.header.len) {
++			dev_err(dev, "wanted %ld bytes, got %d\n", HEADER_SIZE, ret);
++			goto exit;
++		}
++	}
++
++	switch (msg.header.msg_type) {
++	case MSG_TYPE_RSP:
++		dev_dbg(dev, "msg_type RSP\n");
++		ret = ctn730_i2c_handle_response(ctn730, &msg);
++		break;
++
++	case MSG_TYPE_EVT:
++		dev_dbg(dev, "msg_type EVT\n");
++		ret = ctn730_i2c_handle_evt(ctn730, &msg);
++		break;
++	default:
++		dev_err(dev, "invalid message type");
++	}
++
++exit:
++	return IRQ_HANDLED;
++}
++
++int ctn730_i2c_init(struct ctn730 *ctn730)
++{
++	struct i2c_client *client = ctn730->client;
++	struct device *dev = ctn730->dev;
++	struct ctn730_i2c *ctn730_i2c;
++	int ret;
++
++	ctn730_i2c = devm_kzalloc(dev, sizeof(struct ctn730_i2c), GFP_KERNEL);
++	if (ctn730_i2c == NULL)
++		return -ENOMEM;
++
++	ctn730->ctn730_i2c = ctn730_i2c;
++	ctn730_i2c->ctn730 = ctn730;
++
++	ret = devm_request_threaded_irq(dev, client->irq, NULL, ctn730_i2c_irq,
++					IRQF_ONESHOT, "ctn730_rm", ctn730);
++	if (ret < 0) {
++		dev_err(dev, "Unable to register IRQ handler\n");
++		return ret;
++	}
++
++	disable_irq(client->irq);
++
++	INIT_DELAYED_WORK(&ctn730_i2c->read_battery_delayed_work, read_battery_delayed_func);
++
++	return 0;
++}
++
++void ctn730_i2c_shutdown(struct ctn730 *ctn730, bool shutdown)
++{
++	struct ctn730_i2c *ctn730_i2c = ctn730->ctn730_i2c;
++
++	lockdep_assert_held(&ctn730->req_lock);
++
++	/*
++	 * Drop req_lock before cancel_delayed_work_sync: the work acquires
++	 * req_lock internally via ctn730_i2c_get_battery_level, so holding
++	 * it here would deadlock if the work is already running.
++	 */
++	mutex_unlock(&ctn730->req_lock);
++	cancel_delayed_work_sync(&ctn730_i2c->read_battery_delayed_work);
++	mutex_lock(&ctn730->req_lock);
++
++	mutex_lock(&ctn730->lock);
++
++	dev_dbg(ctn730->dev, "shutdown: %s\n", shutdown ? "true" : "false");
++
++	if (shutdown) {
++		/*
++		 * disable_irq waits for the IRQ handler to finish,
++		 * which may be waiting for our lock. So lets unlock first.
++		 */
++		mutex_unlock(&ctn730->lock);
++
++		/* disable + wait for IRQ handler */
++		disable_irq(ctn730->client->irq);
++		dev_dbg(ctn730->dev, "irq disabled\n");
++
++		/*
++		 * The IRQ handler may have queued battery work after the first
++		 * cancel, so drain it again now that the IRQ is disabled.
++		 */
++		mutex_unlock(&ctn730->req_lock);
++		cancel_delayed_work_sync(&ctn730_i2c->read_battery_delayed_work);
++		mutex_lock(&ctn730->req_lock);
++
++		/* and lock again... */
++		mutex_lock(&ctn730->lock);
++
++		ctn730_set_state(ctn730, state_shutdown);
++		memset(ctn730->marker_uid, 0, sizeof(ctn730->marker_uid));
++
++	} else {
++		ctn730_set_state(ctn730, state_unknown);
++
++		enable_irq(ctn730->client->irq);
++		dev_dbg(ctn730->dev, "irq enabled\n");
++	}
++
++	ctn730_set_charging_state(ctn730, charging_state_unknown);
++	ctn730_set_battery_level(ctn730, -1);
++
++	mutex_unlock(&ctn730->lock);
++}
++
++int ctn730_i2c_deinit(struct ctn730 *ctn730)
++{
++	struct ctn730_i2c *ctn730_i2c = ctn730->ctn730_i2c;
++
++	cancel_delayed_work_sync(&ctn730_i2c->read_battery_delayed_work);
++
++	disable_irq(ctn730->client->irq);
++	dev_dbg(ctn730->dev, "irq disabled\n");
++
++	cancel_delayed_work_sync(&ctn730_i2c->read_battery_delayed_work);
++
++	return 0;
++}
++
++int ctn730_i2c_reset_to_mode(struct ctn730 *ctn730, int mode)
++{
++	struct device *dev = ctn730->dev;
++	struct ctn730_msg msg;
++	int ret;
++
++	lockdep_assert_held(&ctn730->req_lock);
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_HOST_CTRL_RESET;
++	msg.header.len = 1;
++	msg.payload[0] = mode;
++
++	dev_dbg(dev, "sending WLC_HOST_CTRL_RESET_CMD\n");
++
++	set_bit(CTN730_RSP_WAIT, &ctn730->flags);
++	set_bit(CTN730_RST_DONE, &ctn730->flags);
++
++	ret = ctn730_i2c_send(ctn730, (u8 *)&msg, HEADER_SIZE + msg.header.len);
++	if (ret < 0)
++		goto done;
++
++	/*
++	 * we don't care about the response to this command
++	 * as a Reset event will come soon after. Actually, the
++	 * response transmission is sometimes not done quickly enough
++	 * and can be interrupted by the reset itself so we cannot rely
++	 * on receiving this response.
++	 */
++	ret = wait_on_bit_timeout(&ctn730->flags, CTN730_RST_DONE,
++				  TASK_INTERRUPTIBLE, msecs_to_jiffies(250));
++	if (ret) {
++		dev_err(dev, "Reset timeout %d\n", ret);
++		ret = -ETIMEDOUT;
++	}
++
++done:
++	return ret;
++}
++
++int ctn730_i2c_read_host_uid(struct ctn730 *ctn730)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	dev_dbg(ctn730->dev, "sending WLC_HOST_CTRL_DL_READ_UID_CMD\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_HOST_CTRL_DL_READ_UID;
++	msg.header.len = 0;
++
++	ret = ctn730_i2c_send_wait_rsp(ctn730, &msg);
++	if (ret < 0)
++		return -EIO;
++
++	mutex_lock(&ctn730->lock);
++	memcpy(ctn730->host_uid, &msg.payload[1], sizeof(ctn730->host_uid));
++	mutex_unlock(&ctn730->lock);
++
++	return 0;
++}
++
++int ctn730_i2c_read_parameter(struct ctn730 *ctn730, struct parameter *parameter, bool session)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	dev_dbg(ctn730->dev, "sending WLC_HOST_CTRL_READ_PARAMETER_CMD\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	if (session) {
++		msg.header.instr = WLC_HOST_CTRL_READ_SESSION_PARAMETER;
++	} else {
++		msg.header.instr = WLC_HOST_CTRL_READ_PARAMETER;
++		if (ctn730->state != state_initialized)
++			dev_err(ctn730->dev, "%s in illegal state: %s",
++				__func__, ctn730_state_text[ctn730->state]);
++	}
++	msg.header.len = 1;
++	msg.payload[0] = parameter->tag;
++
++	parameter->len = 0;
++
++	ret = ctn730_i2c_send_wait_rsp(ctn730, &msg);
++	if (ret < 0)
++		return -EIO;
++
++	mutex_lock(&ctn730->lock);
++
++	parameter->status = msg.status;
++	parameter->len = msg.header.len - 1;
++	memcpy(parameter->data, &msg.payload[1], parameter->len);
++
++	mutex_unlock(&ctn730->lock);
++	return 0;
++}
++
++int ctn730_i2c_write_parameter(struct ctn730 *ctn730, struct parameter *parameter, int len,
++			       bool session)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	lockdep_assert_held(&ctn730->req_lock);
++
++	if (session) {
++		dev_dbg(ctn730->dev, "sending WLC_HOST_CTRL_WRITE_SESSION_PARAMETER_CMD\n");
++	} else {
++		dev_dbg(ctn730->dev, "sending WLC_HOST_CTRL_WRITE_PARAMETER_CMD\n");
++		if (ctn730->state != state_initialized)
++			dev_err(ctn730->dev, "%s in illegal state %s",
++				__func__, ctn730_state_text[ctn730->state]);
++	}
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	if (session)
++		msg.header.instr = WLC_HOST_CTRL_WRITE_SESSION_PARAMETER;
++	else
++		msg.header.instr = WLC_HOST_CTRL_WRITE_PARAMETER;
++	msg.header.len = len + 1;
++	msg.payload[0] = parameter->tag;
++	memcpy(&msg.payload[1], parameter->data, len);
++
++	ret = ctn730_i2c_send_wait_rsp_timeout_locked(ctn730, &msg, MSG_DEFAULT_TIMEOUT);
++	if (ret < 0)
++		return -EIO;
++
++	parameter->status = msg.status;
++
++	return 0;
++}
++
++int ctn730_enable_charging_info_event(struct ctn730 *ctn730, bool enable)
++{
++	struct parameter param;
++	int ret;
++
++	param.tag = PARAM_SESSION_SEND_CHARGING_INFO_EVT;
++	param.len = 1;
++	if (enable)
++		param.data[0] = PARAM_SEND_CHARGING_INFO_EVT_ENABLE;
++	else
++		param.data[0] = PARAM_SEND_CHARGING_INFO_EVT_DISABLE;
++
++	ret = ctn730_i2c_write_parameter(ctn730, &param, param.len, true);
++
++	if (ret < 0) {
++		dev_warn(ctn730->dev, "Failed to set charging info parameter: %d\n", ret);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++int ctn730_set_nfc_comm_power_step_param(struct ctn730 *ctn730, u32 index)
++{
++	struct parameter param;
++	int ret = 0;
++
++	param.tag = PARAM_NFC_COMM_POWER_STEP;
++	param.len = 1;
++	param.data[0] = index & 0xff;
++
++	ret = ctn730_i2c_write_parameter(ctn730, &param, param.len, false);
++	if (ret < 0) {
++		dev_err(ctn730->dev, "Failed to set NFC_COMM_POWER_STEP\n");
++		return -EIO;
++	}
++
++	param.tag = PARAM_USE_DEDICATED_NFC_COMM_POWER_STEP;
++	param.len = 1;
++	param.data[0] = PARAM_USE_DEDICATED_NFC_COMM_POWER_STEP_ENABLED;
++
++	ret = ctn730_i2c_write_parameter(ctn730, &param, param.len, false);
++	if (ret < 0) {
++		dev_err(ctn730->dev, "Failed to enable dedicated power step\n");
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int ctn730_set_nfc_tx_output_power_config(struct ctn730 *ctn730, u32 index)
++{
++	struct parameter tx_table = {
++		.tag = PARAM_TX_OUTPUT_POWER_CONTROL_CONFIGURATION,
++		.len = 10 * 4,
++		.data = { /* Default values */
++			0x92, 0x00, 0x00, 0x00,
++			0x95, 0x00, 0x00, 0x00,
++			0x9f, 0x00, 0x00, 0x00,
++			0x3f, 0x00, 0x00, 0x00,
++			0x3f, 0x20, 0x00, 0x00,
++			0x3f, 0x40, 0x00, 0x00,
++			0xdf, 0x80, 0x00, 0x00,
++			0x9f, 0x60, 0x00, 0x00,
++			0x5f, 0x60, 0x00, 0x00,
++			0x3f, 0x80, 0x00, 0x00,
++		},
++	};
++	u8 repeat[4];
++	size_t i;
++	int ret;
++
++	if (index > 10 || index < 1) {
++		dev_err(ctn730->dev, "Index out of range: %u\n", index);
++		return -1;
++	}
++
++	for (i = (index - 1) * 4; i < sizeof(tx_table.data); i++) {
++		if (i < index * 4)
++			repeat[i - (index - 1) * 4] = tx_table.data[i];
++		else
++			tx_table.data[i] = repeat[i % 4];
++	}
++
++	ret = ctn730_i2c_write_parameter(ctn730, &tx_table, tx_table.len, false);
++	if (ret < 0) {
++		dev_err(ctn730->dev, "Failed to enable dedicated power step\n");
++		return -EIO;
++	}
++
++	return 0;
++}
++
++int ctn730_set_nfc_num_power_step_configs_param(struct ctn730 *ctn730, u32 index)
++{
++	struct parameter param;
++	int ret;
++
++	if (index > 10 || index < 1) {
++		dev_err(ctn730->dev, "Power step setting out of range: %u\n", index);
++		return -1;
++	}
++
++	/* We don't set num power steps directly, but instead modify the table with
++	 * repeated values to limit the tx output power.
++	 */
++	param.tag = PARAM_TX_OUTPUT_POWER_CONTROL_INITIAL_CONFIGURATION;
++	param.len = 1;
++	param.data[0] = (index - 1) & 0xff;
++
++	ret = ctn730_i2c_write_parameter(ctn730, &param, param.len, false);
++	if (ret < 0) {
++		dev_err(ctn730->dev, "Failed to set initial config for power step\n");
++		return -EIO;
++	}
++
++	return ctn730_set_nfc_tx_output_power_config(ctn730, index);
++}
++
++int ctn730_i2c_read_status(struct ctn730 *ctn730, struct status *status)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	dev_dbg(ctn730->dev, "sending WLC_HOST_CTRL_DUMP_STATUS_CMD\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_HOST_CTRL_DUMP_STATUS;
++	msg.header.len = 1;
++	msg.payload[0] = status->tag;
++
++	ret = ctn730_i2c_send_wait_rsp(ctn730, &msg);
++	if (ret < 0)
++		return -EIO;
++
++	status->status = msg.status;
++
++	status->tag = msg.payload[1];
++	status->len = msg.payload[2];
++	memcpy(status->data, &msg.payload[3], status->len);
++
++	return 0;
++}
++
++int ctn730_i2c_detection(struct ctn730 *ctn730, int period_ms, bool enable)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	if (enable) {
++		dev_dbg(ctn730->dev, "sending WLC_CHG_CTRL_ENABLE_CMD\n");
++		msg.header.msg_type = MSG_TYPE_CMD;
++		msg.header.instr = WLC_CHG_CTRL_ENABLE;
++		msg.header.len = 2;
++		msg.payload[1] = (period_ms >> 8) & 0xFF;
++		msg.payload[0] = period_ms & 0xFF;
++	} else {
++		dev_dbg(ctn730->dev, "sending WLC_CHG_CTRL_DISABLE_CMD\n");
++		msg.header.msg_type = MSG_TYPE_CMD;
++		msg.header.instr = WLC_CHG_CTRL_DISABLE;
++		msg.header.len = 0;
++	}
++
++	ret = ctn730_i2c_send_wait_rsp(ctn730, &msg);
++	if (ret < 0)
++		return -EIO;
++
++	/*
++	 * Enabling detection is confirmed by WLC_CHG_CTRL_ENABLE_RSP,
++	 * while disabling detection is confirmed by WLC_CHG_CTRL_ENABLE_EVT
++	 * State transition to initialized is handled by the event handler
++	 */
++	if (enable) {
++		mutex_lock(&ctn730->lock);
++		ctn730_set_state(ctn730, state_device_detection);
++		mutex_unlock(&ctn730->lock);
++	}
++
++	return 0;
++}
++
++int ctn730_i2c_get_battery_level(struct ctn730 *ctn730)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	dev_dbg(ctn730->dev, "sending WLC_HOST_CTRL_DUMP_STATUS_CMD, DEVICE_BATTERY_LEVEL\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_HOST_CTRL_DUMP_STATUS;
++	msg.header.len = 1;
++	msg.payload[0] = DEVICE_BATTERY_LEVEL;
++
++	ret = ctn730_i2c_send_wait_rsp(ctn730, &msg);
++	if (ret < 0)
++		return ret;
++
++	mutex_lock(&ctn730->lock);
++	if (msg.payload[3] == 0xAB)
++		/* The value 0xAB indicates that the battery level is not available. */
++		ctn730_set_battery_level(ctn730, -1);
++	else
++		ctn730_set_battery_level(ctn730, msg.payload[3]);
++	mutex_unlock(&ctn730->lock);
++
++	return 0;
++}
++
++int ctn730_i2c_get_host_power_step(struct ctn730 *ctn730, int *step)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	dev_dbg(ctn730->dev, "sending WLC_HOST_CTRL_DUMP_STATUS_CMD, HOST_POWER_STEP\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_HOST_CTRL_DUMP_STATUS;
++	msg.header.len = 1;
++	msg.payload[0] = HOST_POWER_STEP;
++
++	ret = ctn730_i2c_send_wait_rsp(ctn730, &msg);
++	if (ret < 0) {
++		*step = -1;
++		return ret;
++	}
++
++	*step = msg.payload[3];
++
++	return 0;
++}
++
++int ctn730_i2c_enable_app_data_channel(struct ctn730 *ctn730)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	if (ctn730->state == state_app_data_channel_established)
++		return 0;
++
++	dev_dbg(ctn730->dev, "enable app data channel attempt\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_APP_CTRL_CHANNEL_ENABLE;
++	msg.header.len = 0;
++
++	set_bit(CTN730_APP_DATA_STATE_CHANGE, &ctn730->flags);
++
++	ret = ctn730_i2c_send_wait_rsp(ctn730, &msg);
++	if (ret < 0)
++		return -EIO;
++
++	if (wait_on_bit_timeout(&ctn730->flags, CTN730_APP_DATA_STATE_CHANGE,
++				TASK_INTERRUPTIBLE, msecs_to_jiffies(1000))) {
++		dev_err(ctn730->dev, "did not receive app_data_state_change evt\n");
++		return -EIO;
++	}
++
++	if (ctn730->app_data_state != app_data_state_connected) {
++		dev_err(ctn730->dev, "failed to enable app data channel\n");
++		return -EIO;
++	}
++
++	return 0;
++}
++
++int ctn730_i2c_disable_app_data_channel(struct ctn730 *ctn730)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	if (ctn730->state != state_app_data_channel_established)
++		return 0;
++
++	dev_dbg(ctn730->dev, "disable app data channel attempt\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_APP_CTRL_CHANNEL_DISABLE;
++	msg.header.len = 0;
++
++	set_bit(CTN730_APP_DATA_STATE_CHANGE, &ctn730->flags);
++
++	ret = ctn730_i2c_send_wait_rsp(ctn730, &msg);
++	if (ret < 0)
++		return -EIO;
++
++	if (wait_on_bit_timeout(&ctn730->flags, CTN730_APP_DATA_STATE_CHANGE, TASK_INTERRUPTIBLE,
++				msecs_to_jiffies(1000))) {
++		dev_err(ctn730->dev, "disable_app_data_channel: did not receive app_data_state_change evt\n");
++		return -EIO;
++	}
++
++	if (ctn730->app_data_state != app_data_state_disconnected) {
++		dev_err(ctn730->dev, "failed to disable app data channel\n");
++		dev_dbg(ctn730->dev, "state: %s\n",
++			ctn730_app_data_state_text[ctn730->app_data_state]);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++int ctn730_i2c_send_app_data(struct ctn730 *ctn730, char *data, int len)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	dev_dbg(ctn730->dev, "sending WLC_APP_CTRL_SEND_DATA_CMD\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_APP_CTRL_SEND_DATA;
++	msg.header.len = len + 1; /* +1 for Last Packet/Chained */
++	msg.payload[0] = LAST_PACKET;
++	memcpy(&msg.payload[1], data, len);
++
++	set_bit(CTN730_APP_DATA_SENT, &ctn730->flags);
++
++	ret = ctn730_i2c_send_wait_rsp_timeout(ctn730, &msg, MSG_APP_CHANNEL_TIMEOUT);
++	if (ret < 0)
++		return ret;
++
++	/*
++	 * Response is received when the data has been received by the WLC-Host.
++	 * We need to wait for the event to be sure that the data has been sent to
++	 * Marker
++	 */
++	if (wait_on_bit_timeout(&ctn730->flags, CTN730_APP_DATA_SENT,
++				TASK_INTERRUPTIBLE, msecs_to_jiffies(500)))
++		return -EIO;
++
++	return 0;
++}
++
++int ctn730_i2c_pause_charging(struct ctn730 *ctn730)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	dev_dbg(ctn730->dev, "sending WLC_CHG_CTRL_PAUSE_DEVICE_CMD\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_CHG_CTRL_PAUSE_DEVICE;
++	msg.header.len = 0;
++
++	ret = ctn730_i2c_send_wait_rsp(ctn730, &msg);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
++int ctn730_i2c_resume_charging(struct ctn730 *ctn730)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	dev_dbg(ctn730->dev, "sending WLC_CHG_CTRL_RESUME_DEVICE_CMD\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_CHG_CTRL_RESUME_DEVICE;
++	msg.header.len = 0;
++
++	ret = ctn730_i2c_send_wait_rsp(ctn730, &msg);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
++int ctn730_i2c_dl_open_session(struct ctn730 *ctn730,
++			       uint8_t version_major,
++			       uint8_t version_minor,
++			       bool *already_ok)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	lockdep_assert_held(&ctn730->req_lock);
++
++	dev_dbg(ctn730->dev, "sending WLC_HOST_CTRL_DL_OPEN_SESSION_CMD\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_HOST_CTRL_DL_OPEN_SESSION;
++
++	msg.header.len = sizeof(version_major) + sizeof(version_minor);
++	msg.payload[0] = version_major;
++	msg.payload[1] = version_minor;
++
++	ret = ctn730_i2c_send_wait_rsp_no_status_check_locked(ctn730, &msg, MSG_DEFAULT_TIMEOUT);
++	if (ret < 0)
++		return ret;
++
++	*already_ok = (msg.status == STATUS_FW_VERSION_ERROR);
++
++	if (!(msg.status == STATUS_OK || msg.status == STATUS_FW_VERSION_ERROR)) {
++		dev_err(ctn730->dev, "Unexpeced status code: %d\n", msg.status);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++int ctn730_i2c_dl_write_flash(struct ctn730 *ctn730, uint32_t addr, const uint8_t *data)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	lockdep_assert_held(&ctn730->req_lock);
++
++	dev_dbg(ctn730->dev, "sending WLC_HOST_CTRL_DL_WRITE_FLASH_CMD\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_HOST_CTRL_DL_WRITE_FLASH;
++	/* 3 byte addr + fw data */
++	msg.header.len = 3 + FW_BLOCK_SIZE;
++
++	/* addr in 3!? byte little-endian */
++	msg.payload[0] = addr & 0xff;
++	msg.payload[1] = (addr >> 8) & 0xff;
++	msg.payload[2] = (addr >> 16) & 0xff;
++
++	/* the fw page */
++	memcpy(msg.payload + 3, data, FW_BLOCK_SIZE);
++
++	ret = ctn730_i2c_send_wait_rsp_timeout_locked(ctn730, &msg, MSG_DEFAULT_TIMEOUT);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
++int ctn730_i2c_dl_commit_session(struct ctn730 *ctn730, uint32_t crc)
++{
++	struct ctn730_msg msg;
++	int ret;
++
++	lockdep_assert_held(&ctn730->req_lock);
++
++	dev_dbg(ctn730->dev, "sending WLC_HOST_CTRL_DL_COMMIT_SESSION_CMD\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_HOST_CTRL_DL_COMMIT_SESSION;
++
++	msg.header.len = sizeof(crc);
++	msg.crc = cpu_to_le32(crc);
++
++	ret = ctn730_i2c_send_wait_rsp_timeout_locked(ctn730, &msg, MSG_DEFAULT_TIMEOUT);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
++int ctn730_i2c_start_prod_test(struct ctn730 *ctn730, struct prod_test *prod_test)
++{
++	struct ctn730_i2c *ctn730_i2c = ctn730->ctn730_i2c;
++	struct prod_test_result *prod_test_result = &ctn730_i2c->last_prod_test_result;
++	struct ctn730_msg msg;
++	int ret;
++
++	dev_dbg(ctn730->dev, "sending WLC_HOST_CTRL_BIST_CMD\n");
++
++	msg.header.msg_type = MSG_TYPE_CMD;
++	msg.header.instr = WLC_HOST_CTRL_BIST;
++	msg.header.len = prod_test->len + 1;
++	msg.payload[0] = prod_test->test_id;
++	memcpy(&msg.payload[1], prod_test->data, prod_test->len);
++
++	ret = ctn730_i2c_send_wait_rsp_no_status_check(ctn730, &msg, MSG_DEFAULT_TIMEOUT);
++
++	if (ret < 0)
++		return ret;
++
++	mutex_lock(&ctn730->lock);
++
++	prod_test_result->test_id = prod_test->test_id;
++	prod_test_result->status = msg.status;
++	prod_test_result->len = msg.header.len - 1;
++
++	memcpy(prod_test_result->data, &msg.payload[1], msg.header.len - 1);
++
++	if (prod_test_result->status != STATUS_OK)
++		dev_warn(ctn730->dev, "test returned with code: %02x\n",
++				      prod_test_result->status);
++
++	mutex_unlock(&ctn730->lock);
++
++	return 0;
++}
++
++void ctn730_i2c_lock_bus(struct ctn730 *ctn730)
++{
++	i2c_lock_bus(ctn730->client->adapter, I2C_LOCK_ROOT_ADAPTER);
++}
++
++void ctn730_i2c_unlock_bus(struct ctn730 *ctn730)
++{
++	i2c_unlock_bus(ctn730->client->adapter, I2C_LOCK_ROOT_ADAPTER);
++}
++
++MODULE_DESCRIPTION("Low-level driver for NXP CTN730");
++MODULE_AUTHOR("reMarkable");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/nfc/ctn730_rm/ctn730_i2c.h b/drivers/nfc/ctn730_rm/ctn730_i2c.h
+new file mode 100644
+index 000000000..6f584f3e3
+--- /dev/null
++++ b/drivers/nfc/ctn730_rm/ctn730_i2c.h
+@@ -0,0 +1,341 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * reMarkable NXP CTN730
++ *
++ * Copyright (C) 2023 reMarkable AS - http://www.remarkable.com/
++ */
++
++#ifndef __CTN730_I2C_H__
++#define __CTN730_I2C_H__
++
++#include "ctn730.h"
++#include <linux/i2c.h>
++
++#define MSG_SIZE 256
++#define NUM_MSGS_RECV_BUFFER 5
++#define FW_BLOCK_SIZE 128
++
++#define MSG_DEFAULT_TIMEOUT msecs_to_jiffies(1000)
++#define MSG_APP_CHANNEL_TIMEOUT msecs_to_jiffies(10000)
++
++enum ctn730_msg_type {
++	MSG_TYPE_CMD = 0x00,
++	MSG_TYPE_RSP = 0x01,
++	MSG_TYPE_EVT = 0x02,
++};
++
++/**
++ * The chip documentation mostly refers to specific instruction codes by suffixing them with
++ * _MSG, _RSP or _EVT.
++ * Here, we only define the codes once (as they are the same across message types).
++ */
++enum ctn730_instr {
++	/*
++	 * The command WLC_HOST_CTRL_RESET allows the Host-Controller to perform
++	 * an explicit WLC-Host reset. Either to NORMAL_MODE or DOWNLOAD_MODE.
++	 *
++	 * As an event it is sent by WLC-Host every time it enters the INITIALIZED
++	 * state after booting up. Moreover, it informs into which operating mode
++	 * (NORMAL_MODE or DOWNLOAD_MODE) the WLC-Host has booted into
++	 */
++	WLC_HOST_CTRL_RESET = 0x00,
++	/* Used to write/change a persistent parameter within WLC-Host. */
++	WLC_HOST_CTRL_WRITE_PARAMETER = 0x01,
++	/* Used to read a persistent parameter within WLC-Host. */
++	WLC_HOST_CTRL_READ_PARAMETER = 0x02,
++	/*
++	 * To download firmware to WLC-Host, a download session needs to be opened.
++	 * Note that this is the only command that provides both FW and HW version of
++	 * the Host-Controller.
++	 * FW version can also be retrieved with command WLC_HOST_CTRL_DUMP_STATUS_CMD
++	 */
++	WLC_HOST_CTRL_DL_OPEN_SESSION = 0x03,
++	/*
++	 * Once the complete image has been downloaded, the download session needs
++	 * to be committed in order to perform the integrity check.
++	 */
++	WLC_HOST_CTRL_DL_COMMIT_SESSION = 0x04,
++	/* Used to write new FW image to flash */
++	WLC_HOST_CTRL_DL_WRITE_FLASH = 0x05,
++	/*
++	 * WLC-Host allows execution of a few tests which are implemented as part of the Builtin
++	 * self-test suite. These tests can be run during production to ensure that WLC-Host is
++	 * properly working.
++	 */
++	WLC_HOST_CTRL_BIST = 0x06,
++	/* Used to write/change a non-persistent parameter within WLC-Host. */
++	WLC_HOST_CTRL_WRITE_SESSION_PARAMETER = 0x07,
++	/* Used to read a non-persistent parameter within WLC-Host. */
++	WLC_HOST_CTRL_READ_SESSION_PARAMETER = 0x08,
++	/* returns 16 bytes identifier which unique for each WLC-Host. */
++	WLC_HOST_CTRL_DL_READ_UID = 0x09,
++	/*
++	 * The WLC_CHG_CTRL_ENABLE message is used to start the device detection and all
++	 * subsequent autonomous activities once a Device has been detected. After boot-up (when
++	 * WLC-Host is in state INITIALIZED), this command message needs explicitly sent in order
++	 * to move to state DEVICE_DETECTION.
++	 */
++	WLC_CHG_CTRL_ENABLE = 0x10,
++	/*
++	 * WLC_CHG_CTRL_DISABLE command is used to stop device detection but also to stop
++	 * an already ongoing charging activity. It can be sent in state DEVICE_DETECTION as
++	 * well as any subsequent state.
++	 */
++	WLC_CHG_CTRL_DISABLE = 0x11,
++	/*
++	 * The event WLC_CHG_CTRL_DEVICE_STATE is a notification sent by WLC-Host
++	 * to inform the Host-Controller when a Device has been detected or the Device has been
++	 * lost. Device loss can be a result of moving out the device of proximity/operating value
++	 * but also unrecoverable errors during data exchange (using Application Data Channel as
++	 * well as Charging Data Channel) finally lead to considering the device as lost.
++	 */
++	WLC_CHG_CTRL_DEVICE_STATE = 0x12,
++	WLC_CHG_CTRL_DEACTIVATE_DEVICE = 0x13,
++	WLC_CHG_CTRL_CHARGING_STATE = 0x14,
++	/*
++	 * During charging activity (i.e. while WLC-Host is in state
++	 * CHARGING_DATA_CHANNEL_ESTABLISHED) the Device regularly sends updates
++	 * via the Charging Data Channel. These updates contain the current battery level as
++	 * well as a timespan value when the next update will be sent. Each update will be
++	 * forwarded to the Host-Controller using the WLC_CHG_CTRL_CHARGING_INFO_EVT
++	 * event. In case the host is not interested in such events, they can be permanently
++	 * disabled using session parameter tag SEND_CHARGING_INFO_EVT
++	 */
++	WLC_CHG_CTRL_CHARGING_INFO = 0x15,
++	/*
++	 * To allow the Host-Controller to pause this behavior (e.g. for optimizing power
++	 * consumption) while still being able to detect a WLC-Device removal, the
++	 * WLC_CHG_CTRL_PAUSE_DEVICE_CMD can be sent. Upon reception of this
++	 * command, the WLC-Host disables any ongoing charging activity (when in state
++	 * CHARGING_DATA_CHANNEL_ESTABLISHED) by disabling the RF power transfer
++	 * leading to a transition to state DEVICE_DETECTED, indicated by sending the
++	 * WLC_CHG_CTRL_CHARGING_STATE_EVT(CHARGING_STOPPED).
++	 */
++	WLC_CHG_CTRL_PAUSE_DEVICE = 0x16,
++	/*
++	 * To release a WLC-Device pause, Host-Controller may send the
++	 * WLC_CHG_CTRL_RESUME_DEVICE_CMD which triggers a transition to state
++	 * DEVICE_DETECTED where WLC-Device will be polled again for charging requests. The
++	 * transition is indicated by WLC_CHG_CTRL_RESUME_DEVICE_EVT.
++	 */
++	WLC_CHG_CTRL_RESUME_DEVICE = 0x17,
++	/*
++	 * Returns various information such as FW version, current state, etc.
++	 * Can be used in almost all states.
++	 */
++	WLC_HOST_CTRL_DUMP_STATUS = 0x0C,
++	/*
++	 * Used to inform the Host-Controller about errors occurred within the WLC-Host
++	 * which are not directly related to any command
++	 */
++	WLC_HOST_CTRL_GENERIC_ERROR = 0x0F,
++	WLC_CHG_CTRL_OPTIONAL_NDEF = 0x1F,
++	/*
++	 * Application Data Control is used to control the behavior of the Application Data Channel.
++	 * The Application Data Channel is used for end-to-end data exchange between Host-
++	 * Controller and Device-Controller. It is a raw data channel which allows sending and
++	 * receiving data. For large data transfers the data can be split into small chunks (also
++	 * called chains) of a maximum size of 254 Bytes. These chunks are independent on the
++	 * data frames which are sent via the RF Application Data Channel, where the chunk size is
++	 * limited to 64 Bytes. In other words, WLC-Host automatically performs chaining over RF
++	 * independent on the chaining done over the Host Interface.
++	 */
++	WLC_APP_CTRL_CHANNEL_ENABLE = 0x20,
++	WLC_APP_CTRL_CHANNEL_DISABLE = 0x21,
++	WLC_APP_CTRL_CHANNEL_STATE = 0x22,
++	WLC_APP_CTRL_SEND_DATA = 0x23,
++	WLC_APP_CTRL_RECEIVE_DATA = 0x24,
++};
++
++struct ctn730_header {
++	enum ctn730_instr instr : 6;
++	enum ctn730_msg_type msg_type : 2;
++	u8 len; /* length of payload only */
++} __packed;
++
++#define HEADER_SIZE sizeof(struct ctn730_header)
++
++struct ctn730_msg {
++	struct ctn730_header header;
++	union {
++		u8 status;
++		u8 event;
++		u8 reason;
++		u8 test_id;
++		__le32 crc;
++		u8 payload[MSG_SIZE];
++	};
++} __packed;
++
++struct parameter {
++	u8 tag;
++	u8 status;
++	u8 len;
++	u8 data[MSG_SIZE - HEADER_SIZE];
++};
++
++struct status {
++	u8 tag;
++	u8 status;
++	u8 len;
++	u8 data[MSG_SIZE - HEADER_SIZE];
++};
++
++struct prod_test {
++	u8 test_id;
++	u8 len;
++	u8 data[MSG_SIZE - HEADER_SIZE];
++};
++
++struct prod_test_result {
++	u8 test_id;
++	u8 status;
++	u8 len;
++	u8 data[MSG_SIZE - HEADER_SIZE];
++};
++
++struct ctn730_i2c {
++	struct ctn730_msg response_msg;
++	struct status last_status;
++	struct parameter last_parameter;
++	struct parameter last_session_parameter;
++	struct prod_test_result last_prod_test_result;
++	struct ctn730 *ctn730;
++
++	struct delayed_work read_battery_delayed_work;
++	int unsuccessful_battery_reads_on_dock;
++};
++
++int ctn730_i2c_init(struct ctn730 *ctn730);
++int ctn730_i2c_deinit(struct ctn730 *ctn730);
++void ctn730_i2c_shutdown(struct ctn730 *ctn730, bool shutdown);
++int ctn730_i2c_reset_to_mode(struct ctn730 *ctn730, int mode);
++int ctn730_i2c_read_host_uid(struct ctn730 *ctn730);
++int ctn730_i2c_read_parameter(struct ctn730 *ctn730, struct parameter *parameter, bool session);
++int ctn730_i2c_write_parameter(struct ctn730 *ctn730, struct parameter *parameter, int len,
++			       bool session);
++int ctn730_enable_charging_info_event(struct ctn730 *ctn730, bool enable);
++int ctn730_set_nfc_comm_power_step_param(struct ctn730 *ctn730, u32 index);
++int ctn730_set_nfc_num_power_step_configs_param(struct ctn730 *ctn730, u32 index);
++int ctn730_i2c_read_status(struct ctn730 *ctn730, struct status *status);
++int ctn730_i2c_detection(struct ctn730 *ctn730, int period_ms, bool enable);
++#define ctn730_i2c_enable_detection(ctn730, period_ms) ctn730_i2c_detection(ctn730, period_ms, true)
++#define ctn730_i2c_disable_detection(ctn730) ctn730_i2c_detection(ctn730, 0, false)
++int ctn730_i2c_get_battery_level(struct ctn730 *ctn730);
++int ctn730_i2c_get_host_power_step(struct ctn730 *ctn730, int *step);
++int ctn730_i2c_enable_app_data_channel(struct ctn730 *ctn730);
++int ctn730_i2c_disable_app_data_channel(struct ctn730 *ctn730);
++int ctn730_i2c_send_app_data(struct ctn730 *ctn730, char *data, int len);
++int ctn730_i2c_get_app_data(struct ctn730 *ctn730, char *data, int len);
++int ctn730_i2c_start_prod_test(struct ctn730 *ctn730, struct prod_test *prod_test);
++void ctn730_i2c_lock_bus(struct ctn730 *ctn730);
++void ctn730_i2c_unlock_bus(struct ctn730 *ctn730);
++int ctn730_i2c_pause_charging(struct ctn730 *ctn730);
++int ctn730_i2c_resume_charging(struct ctn730 *ctn730);
++
++/* DL mode API */
++int ctn730_i2c_dl_open_session(struct ctn730 *ctn730,
++			       uint8_t version_major, uint8_t version_minor,
++			       bool *already_ok);
++int ctn730_i2c_dl_write_flash(struct ctn730 *ctn730, uint32_t addr, const uint8_t *data);
++int ctn730_i2c_dl_commit_session(struct ctn730 *ctn730, uint32_t crc);
++
++#define NORMAL_MODE 0x00
++#define DOWNLOAD_MODE 0x01
++
++enum {
++	PARAM_SEND_CHARGING_INFO_EVT = 0x0,
++	/* Controls whether to use a specific power step index for NFC communication or whether to
++	 * use whatever power step is active at the time NFC communication is initiated.
++	 */
++	PARAM_USE_DEDICATED_NFC_COMM_POWER_STEP = 0x08,
++	/* Specifies an index into the table set by the TX_OUTPUT_POWER_CONTROL_CONFIGURATION (0x1D)
++	 * parameter.
++	 */
++	PARAM_NFC_COMM_POWER_STEP = 0x09,
++	PARAM_TX_OUTPUT_POWER_CONTROL_INITIAL_CONFIGURATION = 0x26,
++	PARAM_TX_OUTPUT_POWER_CONTROL_NUM_OF_CONFIGURATIONS = 0x1c,
++	PARAM_TX_OUTPUT_POWER_CONTROL_CONFIGURATION = 0x1d,
++};
++
++enum {
++	PARAM_SESSION_SEND_CHARGING_INFO_EVT = 0x00,
++	PARAM_SESSION_USE_DEDICATED_NFC_COMM_POWER_STEP = 0x01,
++	PARAM_SESSION_NFC_COMM_POWER_STEP = 0x02,
++	PARAM_SESSION_RF_TX_OUTPUT_INV_RM = 0x03,
++};
++
++// Parameter values
++enum {
++	PARAM_SEND_CHARGING_INFO_EVT_ENABLE = 0x01,
++	PARAM_SEND_CHARGING_INFO_EVT_DISABLE = 0x0,
++};
++
++enum {
++	PARAM_USE_DEDICATED_NFC_COMM_POWER_STEP_ENABLED = 0x1,
++	PARAM_USE_DEDICATED_NFC_COMM_POWER_STEP_USE_CURRENT = 0x0,
++};
++
++enum {
++	// We use a low-power step for NFC comms for reliability reasons
++	PARAM_NFC_COMM_POWER_STEP_INDEX_1 = 0x1,
++	PARAM_NFC_COMM_POWER_STEP_INDEX_7 = 0x7,
++};
++
++/* Boot reasons, only in DOWNLOAD_MODE */
++#define INTENDED 0x00
++#define FIRMWARE_CORRUPTED 0x01
++#define UNRECOVERABLE_ERROR 0x02
++
++#define CURRENT_HOST_STATE 0x02
++#define HOST_POWER_STEP 0x03
++#define DEVICE_BATTERY_LEVEL 0x04
++
++#define SYNTAX_ERROR 0x00
++
++#define STATUS_OK 0x00
++#define STATUS_PARAMETER_ERROR 0x01
++#define STATUS_STATE_ERROR 0x02
++#define STATUS_VALUE_ERROR 0x03
++#define STATUS_REJECTED 0x04
++#define STATUS_RESOURCE_ERROR 0x10
++#define STATUS_TXLDO_ERROR 0x11
++#define STATUS_ANTENNA_SELECTION_ERROR 0x12
++#define STATUS_BIST_FAILED 0x20
++#define STATUS_BIST_NO_WLC_CAP 0x21
++#define STATUS_BIST_TXLDO_CURRENT_OVERFLOW 0x22
++#define STATUS_BIST_TXLDO_CURRENT_UNDERFLOW 0x23
++#define STATUS_FW_VERSION_ERROR 0x30
++#define STATUS_FW_VERIFICATION_ERROR 0x31
++#define STATUS_CRN120_BLOCK_PARAMETER_ERROR 0x32
++#define STATUS_CRN120_READ_ERROR 0x33
++#define STATUS_DTA_TEST_FAILED 0x40
++#define STATUS_DTA_TEST_LEN_NOT_OK 0x41
++
++#define HOST_CONTROLLER_REQUEST 0x00
++#define OVERTEMPERATURE 0x01
++#define CHANNEL_SYNC_ERROR 0x02
++
++#define DEVICE_DETECTED 0x00
++#define DEVICE_DEACTIVATED 0x01
++#define DEVICE_LOST 0x02
++#define DEVICE_VERSION_MISMATCH 0x03
++#define DEVICE_DOCKED 0x04
++#define DEVICE_UNDOCKED 0x05
++#define FO_PRESENT 0x06
++#define BATTERY_FULL 0x07
++#define CHARGE_FAILURE 0x08
++#define NDEF_MODE 0x0A
++#define LISTENER_OT 0xFA
++
++#define CHARGING_STARTED 0x00
++#define CHARGING_ENDED 0x01
++#define CHARGING_STOPPED 0x02
++
++#define CHAINED_PACKET 0x00
++#define LAST_PACKET 0x01
++
++/* max data that can be sent over Application Data Channel*/
++#define APP_DATA_MSG_SIZE 254
++
++#endif /* __CTN730_I2C_H__ */
+diff --git a/drivers/nfc/ctn730_rm/ctn730_supply.c b/drivers/nfc/ctn730_rm/ctn730_supply.c
+new file mode 100644
+index 000000000..3281650c1
+--- /dev/null
++++ b/drivers/nfc/ctn730_rm/ctn730_supply.c
+@@ -0,0 +1,201 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * reMarkable NXP CTN730
++ *
++ * Copyright (C) 2023 reMarkable AS - http://www.remarkable.com/
++ */
++
++#include <linux/delay.h>
++#include <linux/mutex.h>
++#include <linux/power_supply.h>
++#include <linux/rfkill.h>
++
++#include "ctn730.h"
++#include "ctn730_i2c.h"
++#include "ctn730_supply.h"
++
++/* string format is "%02x " for each byte */
++static char marker_uid_str[CTN730_MARKER_UID_SIZE * 3 + 1];
++
++static bool ctn730_supply_is_present(struct ctn730 *ctn730)
++{
++	bool present;
++
++	mutex_lock(&ctn730->lock);
++
++	switch (ctn730->state) {
++	case state_device_detected:
++	case state_device_paused:
++	case state_charging_data_channel_established:
++	case state_app_data_channel_established:
++		present = true;
++		break;
++	case state_download_mode:
++	case state_initialized:
++	case state_device_detection:
++	case state_unknown:
++	case state_shutdown:
++		present = false;
++		goto done;
++	}
++
++	switch (ctn730->device_state) {
++	case device_state_device_detected:
++	case device_state_device_deactivated:
++	case device_state_device_version_mismatch:
++	case device_state_device_docked:
++	case device_state_battery_full:
++	case device_state_charge_failure:
++	case device_state_ndef_mode:
++	case device_state_listener_ot:
++		present = true;
++		break;
++	case device_state_fo_present:
++	case device_state_device_lost:
++	case device_state_unknown:
++	case device_state_device_undocked:
++		present = false;
++		break;
++	}
++
++done:
++	mutex_unlock(&ctn730->lock);
++
++	return present;
++}
++
++static int ctn730_supply_battery_level(struct ctn730 *ctn730)
++{
++	int level;
++
++	if (!ctn730_supply_is_present(ctn730))
++		return 0;
++
++	level = READ_ONCE(ctn730->battery_level);
++
++	return level > 0 ? level : 0;
++}
++
++static int ctn730_supply_capacity_level(struct ctn730 *ctn730)
++{
++	int level;
++
++	if (!ctn730_supply_is_present(ctn730))
++		return POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN;
++
++	mutex_lock(&ctn730->lock);
++	if (ctn730->battery_level != -1)
++		level = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
++	else
++		level = POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN;
++	mutex_unlock(&ctn730->lock);
++
++	return level;
++}
++
++static int ctn730_supply_marker_uid(struct ctn730 *ctn730, union power_supply_propval *val)
++{
++	int i;
++
++	mutex_lock(&ctn730->lock);
++	for (i = 0; i < sizeof(ctn730->marker_uid); i++)
++		sprintf(&marker_uid_str[i * 3], "%02x ", ctn730->marker_uid[i]);
++	mutex_unlock(&ctn730->lock);
++
++	val->strval = marker_uid_str;
++
++	return 0;
++}
++
++static  int ctn730_supply_charging_state(struct ctn730 *ctn730)
++{
++	int state = POWER_SUPPLY_STATUS_UNKNOWN;
++
++	if (!ctn730_supply_is_present(ctn730))
++		return state;
++
++	mutex_lock(&ctn730->lock);
++	switch (ctn730->charging_state) {
++	case charging_state_charging_started:
++		state = POWER_SUPPLY_STATUS_CHARGING;
++		break;
++	case charging_state_charging_ended:
++		state = POWER_SUPPLY_STATUS_FULL;
++		break;
++	case charging_state_charging_stopped:
++		state = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		break;
++	case charging_state_unknown:
++	default:
++		state = POWER_SUPPLY_STATUS_UNKNOWN;
++		break;
++	}
++	mutex_unlock(&ctn730->lock);
++
++	return state;
++}
++
++static int ctn730_supply_get_prop(struct power_supply *psy,
++				  enum power_supply_property psp,
++				  union power_supply_propval *val)
++{
++	struct ctn730 *ctn730 = dev_get_drvdata(psy->dev.parent);
++
++	if (psp == POWER_SUPPLY_PROP_STATUS) {
++		val->intval = ctn730_supply_charging_state(ctn730);
++	} else if (psp == POWER_SUPPLY_PROP_CAPACITY) {
++		val->intval = ctn730_supply_battery_level(ctn730);
++	} else if (psp == POWER_SUPPLY_PROP_CAPACITY_LEVEL) {
++		val->intval = ctn730_supply_capacity_level(ctn730);
++	} else if (psp == POWER_SUPPLY_PROP_PRESENT) {
++		val->intval = ctn730_supply_is_present(ctn730);
++	} else if (psp == POWER_SUPPLY_PROP_SERIAL_NUMBER) {
++		ctn730_supply_marker_uid(ctn730, val);
++	} else if (psp == POWER_SUPPLY_PROP_ONLINE) {
++		mutex_lock(&ctn730->lock);
++		if (ctn730->state == state_shutdown)
++			val->intval = 0; /* offline */
++		else
++			val->intval = 1; /* Online Fixed - Fixed Voltage Supply */
++		mutex_unlock(&ctn730->lock);
++	}
++
++	return 0;
++}
++
++static enum power_supply_property ctn730_supply_props[] = {
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
++	POWER_SUPPLY_PROP_SERIAL_NUMBER,
++	POWER_SUPPLY_PROP_ONLINE,
++};
++
++static const struct power_supply_desc ctn730_supply_desc = {
++	.name                   = "nfc-marker-battery",
++	.type                   = POWER_SUPPLY_TYPE_WIRELESS,
++	.properties             = ctn730_supply_props,
++	.num_properties         = ARRAY_SIZE(ctn730_supply_props),
++	.get_property           = ctn730_supply_get_prop,
++};
++
++void ctn730_supply_changed(struct ctn730 *ctn730)
++{
++	if (!ctn730->supply)
++		return;
++
++	power_supply_changed(ctn730->supply);
++}
++
++int ctn730_supply_init(struct ctn730 *ctn730)
++{
++	ctn730->supply = devm_power_supply_register(ctn730->dev,
++						    &ctn730_supply_desc, NULL);
++	if (IS_ERR(ctn730->supply)) {
++		dev_err(ctn730->dev, "failed to create power-supply\n");
++		return PTR_ERR(ctn730->supply);
++	}
++
++	return 0;
++}
+diff --git a/drivers/nfc/ctn730_rm/ctn730_supply.h b/drivers/nfc/ctn730_rm/ctn730_supply.h
+new file mode 100644
+index 000000000..392807cf8
+--- /dev/null
++++ b/drivers/nfc/ctn730_rm/ctn730_supply.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * reMarkable NXP CTN730
++ *
++ * Copyright (C) 2023 reMarkable AS - http://www.remarkable.com/
++ */
++
++#ifndef __CTN730_SUPPLY_H__
++#define __CTN730_SUPPLY_H__
++
++#include "ctn730.h"
++
++int ctn730_supply_init(struct ctn730 *ctn730);
++void ctn730_supply_changed(struct ctn730 *ctn730);
++
++#endif /* __CTN730_SYSFS_H__ */
+diff --git a/drivers/nfc/ctn730_rm/ctn730_sysfs.c b/drivers/nfc/ctn730_rm/ctn730_sysfs.c
+new file mode 100644
+index 000000000..57afffd6d
+--- /dev/null
++++ b/drivers/nfc/ctn730_rm/ctn730_sysfs.c
+@@ -0,0 +1,90 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * reMarkable NXP CTN730
++ *
++ * Copyright (C) 2023 reMarkable AS - http://www.remarkable.com/
++ */
++
++#include "ctn730_sysfs.h"
++#include "ctn730_i2c.h"
++
++static ssize_t marker_uid_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct ctn730 *ctn730 = dev_get_drvdata(dev);
++	ssize_t count;
++
++	mutex_lock(&ctn730->lock);
++	count = sysfs_emit(buf, "%*ph\n", (int)sizeof(ctn730->marker_uid), ctn730->marker_uid);
++	mutex_unlock(&ctn730->lock);
++
++	return count;
++}
++
++static ssize_t charging_state_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct ctn730 *ctn730 = dev_get_drvdata(dev);
++	ssize_t count;
++
++	mutex_lock(&ctn730->lock);
++	count = sysfs_emit(buf, "%s\n", ctn730_charging_state_text[ctn730->charging_state]);
++	mutex_unlock(&ctn730->lock);
++
++	return count;
++}
++
++static ssize_t device_state_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct ctn730 *ctn730 = dev_get_drvdata(dev);
++	ssize_t count;
++
++	mutex_lock(&ctn730->lock);
++	count = sysfs_emit(buf, "%s\n", ctn730_device_state_text[ctn730->device_state]);
++	mutex_unlock(&ctn730->lock);
++
++	return count;
++}
++
++static ssize_t resume_charging_store(struct device *dev, struct device_attribute *attr,
++				     const char *buf, size_t count)
++{
++	struct ctn730 *ctn730 = dev_get_drvdata(dev);
++	int ret;
++
++	ret = ctn730_i2c_resume_charging(ctn730);
++
++	return ret ? ret : count;
++}
++
++static DEVICE_ATTR_RO(marker_uid);
++static DEVICE_ATTR_RO(charging_state);
++static DEVICE_ATTR_RO(device_state);
++static DEVICE_ATTR_WO(resume_charging);
++
++static struct attribute *ctn730_attributes[] = {
++
++	&dev_attr_marker_uid.attr,
++	&dev_attr_charging_state.attr,
++	&dev_attr_device_state.attr,
++	&dev_attr_resume_charging.attr,
++	NULL,
++};
++
++static const struct attribute_group ctn730_attr_group = {
++	.attrs	= ctn730_attributes,
++};
++
++int ctn730_sysfs_nodes_init(struct ctn730 *ctn730)
++{
++	int ret;
++
++	ret = sysfs_create_group(&(ctn730->dev->kobj), &ctn730_attr_group);
++	if (ret != 0)
++		dev_err(ctn730->dev, "Failed to create attribute group: %d\n", ret);
++
++	return ret;
++}
++
++void ctn730_sysfs_nodes_deinit(struct ctn730 *ctn730)
++{
++	sysfs_remove_group(&(ctn730->dev->kobj), &ctn730_attr_group);
++}
+diff --git a/drivers/nfc/ctn730_rm/ctn730_sysfs.h b/drivers/nfc/ctn730_rm/ctn730_sysfs.h
+new file mode 100644
+index 000000000..f960c9772
+--- /dev/null
++++ b/drivers/nfc/ctn730_rm/ctn730_sysfs.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * reMarkable NXP CTN730
++ *
++ * Copyright (C) 2023 reMarkable AS - http://www.remarkable.com/
++ */
++
++#ifndef __CTN730_SYSFS_H__
++#define __CTN730_SYSFS_H__
++
++struct ctn730;
++
++int ctn730_sysfs_nodes_init(struct ctn730 *ctn730a);
++void ctn730_sysfs_nodes_deinit(struct ctn730 *ctn730);
++
++#endif /* __CTN730_SYSFS_H__ */
+diff --git a/include/trace/events/ctn730_rm.h b/include/trace/events/ctn730_rm.h
+new file mode 100644
+index 000000000..4290c78c3
+--- /dev/null
++++ b/include/trace/events/ctn730_rm.h
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM ctn730_rm
++
++#if !defined(_TRACE_CTN730_RM_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_CTN730_RM_H
++
++#include <linux/tracepoint.h>
++
++TRACE_EVENT(ctn730_state_update,
++	TP_PROTO(struct ctn730 *ctn730),
++	TP_ARGS(ctn730),
++	TP_STRUCT__entry(
++		__field(enum ctn730_state, state)
++		__field(enum ctn730_charging_state, charging_state)
++		__field(enum ctn730_device_state, device_state)
++		__field(enum ctn730_app_data_state, app_data_state)
++		__field(int, battery_level)
++	),
++	TP_fast_assign(
++		__entry->state = ctn730->state;
++		__entry->charging_state = ctn730->charging_state;
++		__entry->device_state = ctn730->device_state;
++		__entry->app_data_state = ctn730->app_data_state;
++		__entry->battery_level = ctn730->battery_level;
++	),
++	TP_printk(
++		"state: %d, charging: %d, device: %d, app_data: %d, battery_level: %d",
++		__entry->state,
++		__entry->charging_state,
++		__entry->device_state,
++		__entry->app_data_state,
++		__entry->battery_level
++	)
++);
++
++DECLARE_EVENT_CLASS(ctn730_msg_template,
++	TP_PROTO(struct ctn730 *ctn730, struct ctn730_msg *msg),
++	TP_ARGS(ctn730, msg),
++	TP_STRUCT__entry(
++		__field(__u8, instr)
++		__field(__u8, msg_type)
++	),
++	TP_fast_assign(
++		__entry->instr = msg->header.instr;
++		__entry->msg_type = msg->header.msg_type;
++	),
++	TP_printk(
++		"instr:%u, msg_type:%u",
++		(unsigned int)__entry->instr, (unsigned int)__entry->msg_type
++	)
++);
++
++DEFINE_EVENT(ctn730_msg_template, ctn730_send_msg_start,
++	TP_PROTO(struct ctn730 *ctn730, struct ctn730_msg *msg),
++	TP_ARGS(ctn730, msg)
++);
++DEFINE_EVENT(ctn730_msg_template, ctn730_send_msg_end,
++	TP_PROTO(struct ctn730 *ctn730, struct ctn730_msg *msg),
++	TP_ARGS(ctn730, msg)
++);
++DEFINE_EVENT(ctn730_msg_template, ctn730_event,
++	TP_PROTO(struct ctn730 *ctn730, struct ctn730_msg *msg),
++	TP_ARGS(ctn730, msg)
++);
++
++#endif /* if !defined(_TRACE_CTN730_RM_H) || defined(TRACE_HEADER_MULTI_READ) */
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>

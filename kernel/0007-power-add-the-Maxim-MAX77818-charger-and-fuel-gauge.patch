@@ -1,0 +1,3605 @@
+From 6a2e00f69fe0bbe7a4131ba7ff7d7c40fac898cb Mon Sep 17 00:00:00 2001
+From: gitman-101111 <development@spamfolder.xyz>
+Date: Mon, 12 Oct 2026 10:23:08 -0600
+Subject: [PATCH] power: add the Maxim MAX77818 charger and fuel gauge
+
+MFD core, charger (with the thermal cooling device the battery thermal
+zone drives), fuel gauge (max17042-family registers plus the MAX77818
+additions) and safeout regulators, ported from reMarkable's linux-imx-rm
+6.12 tree. The charger exposes its operating mode (charger / OTG supply
+/ off) as a power-supply property so the Type-C controller can flip it;
+add that property and the fuel gauge's high-resolution capacity to the
+power-supply core.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/mfd/Kconfig                       |   11 +
+ drivers/mfd/Makefile                      |    1 +
+ drivers/mfd/max77818.c                    |  273 ++++
+ drivers/power/supply/Kconfig              |   16 +
+ drivers/power/supply/Makefile             |    2 +
+ drivers/power/supply/max77818-charger.c   | 1202 +++++++++++++++
+ drivers/power/supply/max77818_battery.c   | 1681 +++++++++++++++++++++
+ drivers/power/supply/power_supply_sysfs.c |   11 +
+ drivers/regulator/Kconfig                 |    8 +
+ drivers/regulator/Makefile                |    1 +
+ drivers/regulator/max77818-regulator.c    |  115 ++
+ include/linux/mfd/max77818/max77818.h     |   58 +
+ include/linux/power/max17042_battery.h    |   21 +
+ include/linux/power_supply.h              |   12 +
+ 14 files changed, 3412 insertions(+)
+ create mode 100644 drivers/mfd/max77818.c
+ create mode 100644 drivers/power/supply/max77818-charger.c
+ create mode 100644 drivers/power/supply/max77818_battery.c
+ create mode 100644 drivers/regulator/max77818-regulator.c
+ create mode 100644 include/linux/mfd/max77818/max77818.h
+
+diff --git a/drivers/mfd/Kconfig b/drivers/mfd/Kconfig
+index 763ce6a34..faf7051d6 100644
+--- a/drivers/mfd/Kconfig
++++ b/drivers/mfd/Kconfig
+@@ -1048,6 +1048,17 @@ config MFD_MAX77759
+ 	  To compile this driver as a module, choose M here: the module will be
+ 	  called max77759.
+ 
++config MFD_MAX77818
++	tristate "Maxim Semiconductor MAX77818 REGULATOR/CHARGER/FUEL-GAUGE Support"
++	depends on I2C=y
++	select MFD_CORE
++	select IRQ_DOMAIN
++	select REGMAP_IRQ
++	help
++	  Say yes here to add support for Maxim Semiconductor MAX77818 device.
++	  The device has a regulator part, a charger part and a fuel-gauge part
++	  which may be enabled as required (power management devices).
++
+ config MFD_MAX77843
+ 	bool "Maxim Semiconductor MAX77843 PMIC Support"
+ 	depends on I2C=y
+diff --git a/drivers/mfd/Makefile b/drivers/mfd/Makefile
+index dd4bb7e77..ba83a6944 100644
+--- a/drivers/mfd/Makefile
++++ b/drivers/mfd/Makefile
+@@ -176,6 +176,7 @@ obj-$(CONFIG_MFD_MAX77693)	+= max77693.o
+ obj-$(CONFIG_MFD_MAX77705)	+= max77705.o
+ obj-$(CONFIG_MFD_MAX77714)	+= max77714.o
+ obj-$(CONFIG_MFD_MAX77759)	+= max77759.o
++obj-$(CONFIG_MFD_MAX77818)	+= max77818.o
+ obj-$(CONFIG_MFD_MAX77843)	+= max77843.o
+ obj-$(CONFIG_MFD_MAX8907)	+= max8907.o
+ max8925-objs			:= max8925-core.o max8925-i2c.o
+diff --git a/drivers/mfd/max77818.c b/drivers/mfd/max77818.c
+new file mode 100644
+index 000000000..a9bf777e2
+--- /dev/null
++++ b/drivers/mfd/max77818.c
+@@ -0,0 +1,273 @@
++/*
++ * Maxim MAX77818 MFD Core
++ *
++ * Copyright (C) 2014 Maxim Integrated Product
++ *
++ * Copyright (C) 2019 reMarkable AS - http://www.remarkable.com/
++ *
++ * Author: Steinar Bakkemo <steinar.bakkemo@remarkable.com>
++ * Author: Shawn Guo  <shawn.guo@linaro.org>
++ * Author: Lars Ivar Miljeteig <lars.ivar.miljeteig@remarkable.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed "as is" WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * This driver is based on max77843.c
++ */
++
++#include <linux/kernel.h>
++#include <linux/version.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/err.h>
++#include <linux/slab.h>
++#include <linux/mutex.h>
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/regmap.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/of_irq.h>
++#include <linux/pm_wakeirq.h>
++#include <linux/irq.h>
++#include <linux/pm_runtime.h>
++#include <linux/mfd/core.h>
++#include <linux/mfd/max77818/max77818.h>
++#include <linux/power/max17042_battery.h>
++
++#define I2C_ADDR_PMIC		(0xcc >> 1) /* PMIC (CLOGIC/SAFELDOs) */
++#define I2C_ADDR_CHARGER	(0xd2 >> 1) /* Charger */
++#define I2C_ADDR_FUEL_GAUGE	(0x6c >> 1) /* Fuel Gauge */
++
++#define REG_PMICID		0x20
++#define REG_PMICREV        	0x21
++
++#define REG_INTSRC		0x22
++#define BIT_CHGR_INT		BIT(0)
++#define BIT_FG_INT		BIT(1)
++#define BIT_SYS_INT		BIT(2)
++
++static const struct regmap_config max77818_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.cache_type = REGCACHE_NONE,
++};
++
++static const struct regmap_config max77818_regmap_config_fg = {
++	.reg_bits = 8,
++	.val_bits = 16,
++	.cache_type = REGCACHE_NONE,
++	.val_format_endian = REGMAP_ENDIAN_NATIVE,
++};
++
++/* Declare Interrupt */
++static const struct regmap_irq max77818_intsrc_irqs[] = {
++	{ .reg_offset = 0, .mask = BIT_CHGR_INT,	},
++	{ .reg_offset = 0, .mask = BIT_FG_INT,		},
++	{ .reg_offset = 0, .mask = BIT_SYS_INT, 	},
++};
++
++static const struct regmap_irq_chip max77818_intsrc_irq_chip = {
++	.name = "max77818 intsrc",
++	.status_base = REG_INTSRC,
++	.mask_base = REG_INTSRCMASK,
++	.num_regs = 1,
++	.irqs = max77818_intsrc_irqs,
++	.num_irqs = ARRAY_SIZE(max77818_intsrc_irqs),
++};
++
++static struct mfd_cell max77818_devices[] = {
++	{
++		.name = MAX77818_REGULATOR_NAME,
++		.of_compatible = "maxim,"MAX77818_REGULATOR_NAME,
++	}, {
++		.name = MAX77818_CHARGER_NAME,
++		.of_compatible = "maxim,"MAX77818_CHARGER_NAME,
++	}, {
++		.name = MAX77818_FUELGAUGE_NAME,
++		.of_compatible = "maxim,"MAX77818_FUELGAUGE_NAME,
++	},
++};
++
++static int max77818_i2c_probe(struct i2c_client *client)
++{
++	struct max77818_dev *me;
++	u32 chip_id, chip_rev;
++	int ret;
++
++	me = devm_kzalloc(&client->dev, sizeof(*me), GFP_KERNEL);
++	if (!me)
++		return -ENOMEM;
++
++	i2c_set_clientdata(client, me);
++
++	mutex_init(&me->lock);
++	me->dev = &client->dev;
++	me->irq = client->irq;
++	me->pmic = client;
++
++	me->regmap_pmic = devm_regmap_init_i2c(client, &max77818_regmap_config);
++	if (IS_ERR(me->regmap_pmic)) {
++		ret = PTR_ERR(me->regmap_pmic);
++		dev_err(me->dev, "failed to initialize PMIC regmap: %d\n", ret);
++		return ret;
++	}
++
++	ret = regmap_read(me->regmap_pmic, REG_PMICID, &chip_id);
++	if (ret < 0) {
++		dev_err(me->dev, "failed to read chip id: %d\n", ret);
++		return ret;
++	} else {
++		regmap_read(me->regmap_pmic, REG_PMICREV, &chip_rev);
++		dev_info(me->dev, "device ID: 0x%x, REV: 0x%x\n",
++			 chip_id, chip_rev);
++	}
++
++	me->chg = i2c_new_dummy_device(client->adapter, I2C_ADDR_CHARGER);
++	if (IS_ERR(me->chg)) {
++		dev_err(me->dev, "failed to allocate I2C device for CHG\n");
++		return PTR_ERR(me->chg);
++	}
++	i2c_set_clientdata(me->chg, me);
++
++	me->fg = i2c_new_dummy_device(client->adapter, I2C_ADDR_FUEL_GAUGE);
++	if (IS_ERR(me->fg)) {
++		dev_err(me->dev, "failed to allocate I2C device for FG\n");
++		ret = PTR_ERR(me->fg);
++		goto unreg_chg;
++	}
++	i2c_set_clientdata(me->fg, me);
++
++	me->regmap_chg = devm_regmap_init_i2c(me->chg, &max77818_regmap_config);
++	if (IS_ERR_OR_NULL(me->regmap_chg)) {
++		ret = PTR_ERR(me->regmap_chg);
++		dev_warn(me->dev, "failed to initialize CHG regmap: %d\n", ret);
++		goto unreg_fg;
++	}
++
++	me->regmap_fg= devm_regmap_init_i2c(me->fg, &max77818_regmap_config_fg);
++	if (IS_ERR_OR_NULL(me->regmap_fg)) {
++		ret = PTR_ERR(me->regmap_fg);
++		dev_err(me->dev, "failed to initialize FG regmap: %d\n", ret);
++		goto unreg_fg;
++	}
++
++	/* Clear SPR_11 bit to disable FGCC */
++	regmap_clear_bits(me->regmap_fg, MAX17042_CONFIG, 1 << 11);
++
++	/* Disable all interrupt source */
++	regmap_write(me->regmap_pmic, REG_INTSRCMASK, 0xff);
++
++	/* Register overall interrupt source (sys, fg, chg) */
++	ret = regmap_add_irq_chip(me->regmap_pmic, me->irq,
++				  IRQF_ONESHOT | IRQF_SHARED, 0,
++				  &max77818_intsrc_irq_chip, &me->irqc_intsrc);
++	if (ret) {
++		dev_err(me->dev, "failed to add intsrc irq chip: %d\n", ret);
++		goto unreg_fg;
++	}
++
++	pm_runtime_set_active(me->dev);
++
++	/*
++	 * Clear DMA mask to avoid quirk with MFD system and the OF-parser. If
++	 * the mask is set, the OF-parser assumes the device will use DMA, and
++	 * will warn when it doesn't find the expected DMA entries in the DTS
++	 * node. This mask is inherited. By clearing it for the MFD top-level
++	 * device, sub-devices will also have their masks cleared. Note: this
++	 * does not affect parent devices/buses. F.ex. the I2C bus will use DMA
++	 * independent of the DMA mask of this device and its sub-devices.
++	 */
++	client->dev.coherent_dma_mask = 0;
++	client->dev.dma_mask = &client->dev.coherent_dma_mask;
++
++	ret = mfd_add_devices(me->dev, -1, max77818_devices,
++			      ARRAY_SIZE(max77818_devices), NULL, 0, NULL);
++	if (ret < 0) {
++		dev_err(me->dev, "failed to add mfd devices: %d\n", ret);
++		goto del_irqc_intsrc;
++	}
++
++	device_init_wakeup(me->dev, true);
++	dev_pm_set_wake_irq(me->dev, me->irq);
++
++	return 0;
++
++del_irqc_intsrc:
++	regmap_del_irq_chip(me->irq, me->irqc_intsrc);
++unreg_fg:
++	i2c_unregister_device(me->fg);
++unreg_chg:
++	i2c_unregister_device(me->chg);
++
++	return ret;
++}
++
++static void max77818_i2c_remove(struct i2c_client *client)
++{
++	struct max77818_dev *me = i2c_get_clientdata(client);
++
++	dev_pm_clear_wake_irq(me->dev);
++
++	mfd_remove_devices(me->dev);
++
++	regmap_del_irq_chip(me->irq, me->irqc_intsrc);
++
++	i2c_unregister_device(me->fg);
++	i2c_unregister_device(me->chg);
++}
++
++static int max77818_suspend(struct device *dev)
++{
++	struct i2c_client *i2c = to_i2c_client(dev);
++	struct max77818_dev *me = i2c_get_clientdata(i2c);
++
++	disable_irq(me->irq);
++
++	return 0;
++}
++
++static int max77818_resume(struct device *dev)
++{
++	struct i2c_client *i2c = to_i2c_client(dev);
++	struct max77818_dev *me = i2c_get_clientdata(i2c);
++
++	enable_irq(me->irq);
++
++	return 0;
++}
++
++static SIMPLE_DEV_PM_OPS(max77818_pm, max77818_suspend, max77818_resume);
++
++static struct of_device_id max77818_of_id[] = {
++	{ .compatible = "maxim,max77818" },
++	{ },
++};
++MODULE_DEVICE_TABLE(of, max77818_of_id);
++
++static const struct i2c_device_id max77818_i2c_id[] = {
++	{ "max77818" },
++	{ },
++};
++MODULE_DEVICE_TABLE(i2c, max77818_i2c_id);
++
++static struct i2c_driver max77818_i2c_driver = {
++	.driver = {
++		   .name = "max77818",
++		   .pm = &max77818_pm,
++		   .of_match_table = max77818_of_id,
++	},
++	.probe = max77818_i2c_probe,
++	.remove = max77818_i2c_remove,
++	.id_table = max77818_i2c_id,
++};
++module_i2c_driver(max77818_i2c_driver);
++
++MODULE_DESCRIPTION("MAX77818 MFD Driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+index f0ede1cec..8e7616516 100644
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -630,6 +630,22 @@ config CHARGER_MAX77650
+ 	  Say Y to enable support for the battery charger control of MAX77650
+ 	  PMICs.
+ 
++config BATTERY_MAX77818
++	tristate "Maxim MAX77818 Fuel Gauge"
++	depends on I2C
++	depends on MFD_MAX77818
++	help
++	  Say Y to enable support for Maxim MAX77818 battery fuel-gauge
++	  device (part of MAX77818 multi-function reg/chrg/fg device).
++
++config CHARGER_MAX77818
++	tristate "Maxim MAX77818 battery charger driver"
++	depends on I2C
++	depends on MFD_MAX77818
++	help
++	  Say Y to enable support for Maxim MAX77818 charger device (part
++	  of MAX77818 multi-function reg/chrg/fg device).
++
+ config CHARGER_MAX77693
+ 	tristate "Maxim MAX77693 battery charger driver"
+ 	depends on MFD_MAX77693
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+index 31fe4a145..0313e4d40 100644
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -85,6 +85,8 @@ obj-$(CONFIG_CHARGER_LTC4162L)	+= ltc4162-l-charger.o
+ obj-$(CONFIG_CHARGER_MAX14577)	+= max14577_charger.o
+ obj-$(CONFIG_CHARGER_DETECTOR_MAX14656)	+= max14656_charger_detector.o
+ obj-$(CONFIG_CHARGER_MAX77650)	+= max77650-charger.o
++obj-$(CONFIG_BATTERY_MAX77818)	+= max77818_battery.o
++obj-$(CONFIG_CHARGER_MAX77818)	+= max77818-charger.o
+ obj-$(CONFIG_CHARGER_MAX77693)	+= max77693_charger.o
+ obj-$(CONFIG_CHARGER_MAX77705)	+= max77705_charger.o
+ obj-$(CONFIG_CHARGER_MAX77976)	+= max77976_charger.o
+diff --git a/drivers/power/supply/max77818-charger.c b/drivers/power/supply/max77818-charger.c
+new file mode 100644
+index 000000000..15fa507e7
+--- /dev/null
++++ b/drivers/power/supply/max77818-charger.c
+@@ -0,0 +1,1202 @@
++/*
++ * Maxim MAX77818 Charger Driver
++ *
++ * Copyright (C) 2014 Maxim Integrated Product
++ *
++ * Copyright (C) 2019 reMarkable AS - http://www.remarkable.com/
++ *
++ * Author: Steinar Bakkemo <steinar.bakkemo@remarkable.com>
++ * Author: Shawn Guo  <shawn.guo@linaro.org>
++ * Author: Lars Ivar Miljeteig <lars.ivar.miljeteig@remarkable.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed "as is" WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * This driver is based on max77843.c
++ */
++
++#include <linux/kernel.h>
++#include <linux/version.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/err.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/mutex.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <linux/regmap.h>
++#include <linux/io.h>
++#include <linux/of.h>
++#include <linux/of_irq.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/pm.h>
++#include <linux/power_supply.h>
++#include <linux/mfd/max77818/max77818.h>
++#include <linux/gpio/consumer.h>
++#include <linux/suspend.h>
++#include <linux/thermal.h>
++#include <linux/regulator/consumer.h>
++
++/* Register map */
++#define REG_CHG_INT 			0xB0
++#define REG_CHG_INT_MASK		0xB1
++#define BIT_AICL			BIT(7)
++#define BIT_CHGIN			BIT(6)
++#define BIT_WCIN              		BIT(5)
++#define BIT_CHG                 	BIT(4)
++#define BIT_BAT                 	BIT(3)
++#define BIT_BATP                	BIT(2)
++#define BIT_BYP				BIT(0)
++
++#define REG_CHG_INT_OK			0xB2
++#define BIT_AICL_OK			BIT(7)
++#define BIT_CHGIN_OK			BIT(6)
++#define BIT_WCIN_OK			BIT(5)
++#define BIT_CHG_OK			BIT(4)
++#define BIT_BAT_OK			BIT(3)
++#define BIT_BATP_OK			BIT(2)
++#define BIT_BYP_OK			BIT(0)
++
++#define REG_CHG_DTLS_00			0xB3
++#define BIT_CHGIN_DTLS			GENMASK(6, 5)
++#define BIT_WCIN_DTLS       		GENMASK(4, 3)
++#define BIT_BATP_DTLS       		BIT(0)
++
++#define REG_CHG_DTLS_01			0xB4
++#define BIT_TREG        		BIT(7)
++#define BIT_BAT_DTLS        		GENMASK(6, 4)
++#define SHIFT_BAT_DTLS			4
++#define BIT_CHG_DTLS       	 	GENMASK(3, 0)
++
++#define REG_CHG_DTLS_02			0xB5
++#define BIT_BYP_DTLS			GENMASK(3, 0)
++#define BIT_BCKNegILIM			BIT(2)
++#define BIT_BSTILIM			BIT(1)
++#define BIT_OTGILIM			BIT(0)
++
++#define REG_CHG_CNFG_00			0xB7
++#define BIT_OTG_CTRL			BIT(7)
++#define BIT_DISIBS			BIT(6)
++#define BIT_SPREAD			BIT(5)
++#define BIT_WDTEN			BIT(4)
++#define BIT_MODE			GENMASK(3, 0)
++#define BIT_MODE_BOOST			BIT(3)
++#define BIT_MODE_BUCK			BIT(2)
++#define BIT_MODE_OTG			BIT(1)
++#define BIT_MODE_CHARGER		BIT(0)
++#define MODE_ALL_OFF			0x00
++#define MODE_OTG_BUCK_BOOST		0x0F
++#define MODE_CHARGER_BUCK		0x05
++
++/* Read back charger status ranges */
++#define MODE_ALL_OFF_MIN		0x00
++#define MODE_ALL_OFF_MAX		0x03
++#define MODE_CHARGER_MIN		0x04
++#define MODE_CHARGER_MAX		0x07
++#define MODE_OTG_MIN			0x0e
++#define MODE_OTG_MAX			0x0f
++
++#define REG_CHG_CNFG_01			0xB8
++#define BIT_PQEN			BIT(7)
++#define BIT_LSEL			BIT(6)
++#define BIT_CHG_RSTRT			GENMASK(5, 4)
++#define SHIFT_CHG_RSTRT			4
++#define BIT_FSW				BIT(3)
++#define BIT_FCHGTIME			GENMASK(2, 0)
++
++#define REG_CHG_CNFG_02			0xB9
++#define BIT_OTG_ILIM			GENMASK(7, 6)
++#define BIT_CHG_CC			GENMASK(5, 0)
++
++#define REG_CHG_CNFG_03			0xBA
++#define BIT_ILIM			GENMASK(7, 6)
++#define BIT_TO_TIME			GENMASK(5, 3)
++#define SHIFT_TO_TIME			3
++#define BIT_TO_ITH			GENMASK(2, 0)
++
++#define REG_CHG_CNFG_04			0xBB
++#define BIT_CHG_CV_PRM			GENMASK(5, 0)
++#define SHIFT_MINVSYS			6
++
++#define REG_CHG_CNFG_06			0xBD
++#define BIT_CHGPROT			GENMASK(3, 2)
++#define BIT_WDTCLR			GENMASK(1, 0)
++
++#define REG_CHG_CNFG_07			0xBE
++#define BIT_REGTEMP			GENMASK(6, 5)
++
++#define REG_CHG_CNFG_09			0xC0
++#define BIT_CHGIN_ILIM			GENMASK(6, 0)
++
++#define REG_CHG_CNFG_10			0xC1
++#define BIT_WCIN_ILIM			GENMASK(5, 0)
++
++#define REG_CHG_CNFG_11			0xC2
++#define BIT_VBYPSET			GENMASK(6, 0)
++
++#define REG_CHG_CNFG_12			0xC3
++#define BIT_WCINSEL			BIT(6)
++#define BIT_CHGINSEL			BIT(5)
++#define BIT_VCHGIN_REG			GENMASK(4, 3)
++#define BIT_B2SOVRC			GENMASK(2, 0)
++
++enum {
++	CHGIN_DTLS_UVLO,
++	CHGIN_DTLS_INVALID_01,
++	CHGIN_DTLS_OVLO,
++	CHGIN_DTLS_VALID,
++};
++
++enum {
++	CHG_DTLS_PREQUAL,
++	CHG_DTLS_FASTCHARGE_CC,
++	CHG_DTLS_FASTCHARGE_CV,
++	CHG_DTLS_TOPOFF,
++	CHG_DTLS_DONE,
++	CHG_DTLS_RESEVRED_05,
++	CHG_DTLS_OFF_TIMER_FAULT,
++	CHG_DTLS_OFF_SUSPEND,
++	CHG_DTLS_OFF_INPUT_INVALID,
++	CHG_DTLS_RESERVED_09,
++	CHG_DTLS_OFF_JUCTION_TEMP,
++	CHG_DTLS_OFF_WDT_EXPIRED,
++};
++
++enum {
++	BAT_DTLS_NO_BATTERY,
++	BAT_DTLS_RESERVED_01,
++	BAT_DTLS_TIMER_FAULT,
++	BAT_DTLS_OKAY,
++	BAT_DTLS_OKAY_LOW,
++	BAT_DTLS_OVERVOLTAGE,
++	BAT_DTLS_OVERCURRENT,
++	BAT_DTLS_RESERVED_07,
++};
++
++enum {
++	CHG_INT_BYP_I,
++	CHG_INT_BATP_I,
++	CHG_INT_BAT_I,
++	CHG_INT_CHG_I,
++	CHG_INT_WCIN_I,
++	CHG_INT_CHGIN_I,
++	CHG_INT_AICL_I,
++};
++
++enum {
++	MAX77818_THERMAL_STATE_GLACIAL,
++	MAX77818_THERMAL_STATE_COLD,
++	MAX77818_THERMAL_STATE_COOL,
++	MAX77818_THERMAL_STATE_WARM,
++	MAX77818_THERMAL_STATE_HOT,
++	MAX77818_THERMAL_STATE_END,
++};
++
++struct thermal_opp {
++	u32 thermal_state;
++	u32 current_limit;
++	u32 voltage_limit;
++} __packed;
++
++struct max77818_charger {
++	struct device *dev;
++	struct regmap *regmap;
++	struct power_supply *psy_chg;
++	struct mutex lock;
++
++	u8 dtls[3];
++
++	int charger_mode; /* OTG SUPPLY/CHARGER */
++
++	int fast_charge_timer;
++	int fast_charge_current;
++	int topoff_current;
++	int topoff_timer;
++	int restart_threshold;
++	int termination_voltage;
++	int termination_voltage_cached;
++	int vsys_min;
++	int default_current_limit;
++	int input_current_limit_chgin;
++	int input_current_limit_chgin_req;
++
++	struct thermal_opp thermal_opp_table[MAX77818_THERMAL_STATE_END];
++	struct thermal_cooling_device *tcd;
++	unsigned int tcd_state;
++
++	struct regulator *vbus_limit;
++};
++
++static enum power_supply_property max77818_charger_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_CHARGE_TYPE,
++	POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_CURRENT_MAX,
++	POWER_SUPPLY_PROP_CHARGER_MODE,
++};
++
++static int max77818_get_online(struct max77818_charger *chg, int *val)
++{
++	u32 chg_int_ok;
++	int ret;
++
++	ret = regmap_read(chg->regmap, REG_CHG_INT_OK, &chg_int_ok);
++	if (ret)
++		return ret;
++
++	*val = !!(chg_int_ok & BIT_CHGIN_OK);
++
++	return 0;
++}
++
++static int max77818_charger_get_input_current(struct max77818_charger *chg,
++					      int *input_current)
++{
++	int quotient, remainder;
++	int steps[3] = { 0, 33, 67 };
++	u32 val = 0;
++	int ret;
++
++	ret = regmap_read(chg->regmap, REG_CHG_CNFG_09, &val);
++	if (ret)
++		return ret;
++
++	quotient = val / 3;
++	remainder = val % 3;
++
++	if ((val & BIT_CHGIN_ILIM) < 3)
++		*input_current = 100;
++	else if ((val & BIT_CHGIN_ILIM) > 0x78)
++		*input_current = 4000;
++	else
++		*input_current = quotient * 100 + steps[remainder];
++
++	return 0;
++}
++
++static int
++max77818_charger_set_chgin_current_limit(struct max77818_charger *chg,
++					 int input_current)
++{
++	int quotient, remainder;
++	u8 val = 0;
++	int ret;
++
++	if (input_current == 0) {
++		ret = regmap_update_bits(chg->regmap, REG_CHG_CNFG_12,
++					 BIT_CHGINSEL, 0);
++		if (ret)
++			dev_warn(chg->dev, "Failed to clear CHGINSEL\n");
++	}
++	else {
++		ret = regmap_update_bits(chg->regmap, REG_CHG_CNFG_12,
++					 BIT_CHGINSEL, BIT_CHGINSEL);
++		if (ret)
++			dev_warn(chg->dev, "Failed to set CHGINSEL\n");
++
++		quotient = input_current / 100;
++		remainder = input_current % 100;
++
++		if (remainder >= 67)
++			val |= (quotient * 3) + 2;
++		else if (remainder >= 33)
++			val |= (quotient * 3) + 1;
++		else if (remainder < 33)
++			val |= quotient * 3;
++	}
++
++	dev_dbg(chg->dev, "Setting CHGIN_ILIM=0x%02x\n", val);
++	return regmap_update_bits(chg->regmap, REG_CHG_CNFG_09,
++				  BIT_CHGIN_ILIM, val);
++}
++
++static int max77818_charger_set_enable(struct max77818_charger *chg, int en)
++{
++	u8 mode;
++	int ret;
++
++	/* If enable = 0, just shut off charging/otg power */
++	if (!en) {
++		mode = MODE_ALL_OFF;
++		goto update_mode;
++	}
++
++	/*
++	 * Depending on configured mode, turn on charging or OTG
++	 * power.
++	 */
++	if (chg->charger_mode == POWER_SUPPLY_MODE_CHARGER) {
++		mode = MODE_CHARGER_BUCK;
++	} else if (chg->charger_mode == POWER_SUPPLY_MODE_OTG_SUPPLY) {
++		mode = MODE_OTG_BUCK_BOOST;
++	} else {
++		dev_err(chg->dev, "invalid charger_mode %d\n",
++			chg->charger_mode);
++		return -EINVAL;
++	}
++
++update_mode:
++	dev_info(chg->dev, "set MODE bits to 0x%x", mode);
++	ret = regmap_update_bits(chg->regmap, REG_CHG_CNFG_00, BIT_MODE, mode);
++	if (ret) {
++		dev_err(chg->dev, "failed to update MODE bits: %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int max77818_charger_get_charger_mode(struct max77818_charger *chg)
++{
++	int ret;
++	u32 read_val;
++
++	dev_dbg(chg->dev, "Trying to read current charger mode from device\n");
++
++	ret = regmap_read(chg->regmap, REG_CHG_CNFG_00, &read_val);
++	if (ret) {
++		return ret;
++	}
++	dev_dbg(chg->dev, "Read raw charger_mode register: 0x%02x\n", read_val);
++	dev_dbg(chg->dev, "Read charger_mode 0x%02lx\n", (read_val & BIT_MODE));
++
++	switch(read_val & BIT_MODE)
++	{
++	case MODE_ALL_OFF_MIN ... MODE_ALL_OFF_MAX:
++		chg->charger_mode = POWER_SUPPLY_MODE_ALL_OFF;
++		break;
++	case MODE_CHARGER_MIN ... MODE_CHARGER_MAX:
++		chg->charger_mode = POWER_SUPPLY_MODE_CHARGER;
++		break;
++	case MODE_OTG_MIN ... MODE_OTG_MAX:
++		chg->charger_mode = POWER_SUPPLY_MODE_OTG_SUPPLY;
++		break;
++	default:
++		dev_warn(chg->dev,
++			 "Unknown charger_mode read from device: 0x%02lx\n",
++			 (read_val & BIT_MODE));
++	}
++
++	return 0;
++}
++
++static int max77818_get_chgcc_limit(struct max77818_charger *chg, int *limit_ma)
++{
++	u32 val;
++	int ret;
++
++	ret = regmap_read(chg->regmap, REG_CHG_CNFG_02, &val);
++	if (ret)
++		return ret;
++
++	val &= 0x3f;
++
++	if (val < 0x3)
++		*limit_ma = 100;
++	else if (val > 0x3b)
++		*limit_ma = 3000;
++	else
++		*limit_ma = val * 50;
++
++	return 0;
++}
++
++static int max77818_set_chgcc_limit(struct max77818_charger *chg, int limit_ma)
++{
++	u32 val;
++
++	if (limit_ma > chg->fast_charge_current)
++		limit_ma = chg->fast_charge_current;
++
++	val = limit_ma / 50;
++
++	dev_dbg(chg->dev, "Setting CHG_CC to 0x%x (%d mA)\n", val, limit_ma);
++
++	return regmap_update_bits(chg->regmap, REG_CHG_CNFG_02, BIT_CHG_CC, val);
++}
++
++static int max77818_get_chgcv_limit(struct max77818_charger *chg, int *limit_mv)
++{
++	u32 val;
++	int ret;
++
++	ret = regmap_read(chg->regmap, REG_CHG_CNFG_04, &val);
++	if (ret)
++		return ret;
++
++	val &= 0x3f;
++
++	if (val < 0x1c)
++		*limit_mv = 3650 + val * 25;
++	else if (val == 0x1c)
++		*limit_mv = 4340;
++	else if (val < 0x2b)
++		*limit_mv = 3650 + (val - 1) * 25;
++	else
++		*limit_mv = 4700;
++
++	return 0;
++}
++
++static u32 max77818_chgcv_limit_mv_to_val(int mv)
++{
++	u32 val;
++
++	if (mv < 3650)
++		val = 0x0;
++	else if (mv <= 4325)
++		val = DIV_ROUND_UP(mv - 3650, 25);
++	else if (mv <= 4340)
++		val = 0x1c;
++	else if (mv <= 4700)
++		val = DIV_ROUND_UP(mv - 3650, 25) + 1;
++	else
++		val = 0x2b;
++
++	return val;
++}
++
++static int max77818_set_chgcv_limit(struct max77818_charger *chg, int limit_mv)
++{
++	u32 val = max77818_chgcv_limit_mv_to_val(limit_mv);
++
++	dev_dbg(chg->dev, "Setting CHG_CV_PRM to 0x%x (%d mV)\n", val, limit_mv);
++
++	return regmap_update_bits(chg->regmap, REG_CHG_CNFG_04, BIT_CHG_CV_PRM, val);
++}
++
++static int max77818_charger_initialize(struct max77818_charger *chg)
++{
++	struct device *dev = chg->dev;
++	u8 val, tmpval;
++	int ret;
++
++	/* unlock charger register */
++	ret = regmap_update_bits(chg->regmap, REG_CHG_CNFG_06,
++				 BIT_CHGPROT, BIT_CHGPROT);
++	if (ret) {
++		dev_err(dev, "failed to unlock: %d\n", ret);
++		return ret;
++	}
++
++	/* Initialize charger mode */
++	ret = regmap_update_bits(chg->regmap, REG_CHG_CNFG_00, BIT_MODE, MODE_CHARGER_BUCK);
++	if (ret) {
++		dev_err(dev, "failed to enable charger: %d\n", ret);
++		return ret;
++	}
++
++	/* charge current (mA) */
++	ret = max77818_set_chgcc_limit(chg, chg->fast_charge_current);
++	if (ret) {
++		dev_err(dev, "failed to set charge current: %d\n", ret);
++		return ret;
++	}
++
++	/* default max input current limited to safe value
++	 * Both chgin current limit, chgcc and chgcv will update once the
++	 * thermal device is registered.
++	 */
++	chg->input_current_limit_chgin_req = chg->default_current_limit;
++	ret = max77818_charger_set_chgin_current_limit(
++				chg,
++				chg->default_current_limit);
++	if (ret) {
++		dev_err(dev, "failed to set chgin input current: %d\n", ret);
++		return ret;
++	}
++
++	/* WCIN port is not used, so disable it */
++	ret = regmap_update_bits(chg->regmap, REG_CHG_CNFG_12, BIT_WCINSEL, 0);
++	if (ret) {
++		dev_err(dev, "failed to disable WCIN port: %d\n", ret);
++		return ret;
++	}
++
++	/* topoff current (mA) */
++	if (chg->topoff_current < 100)
++		val = 0x00;
++	else if (chg->topoff_current < 200)
++		val = (chg->topoff_current - 100) / 25;
++	else if (chg->topoff_current < 350)
++		val = chg->topoff_current / 50;
++	else
++		val = 0x07;
++
++	/* topoff timer (min) */
++	val |= (chg->topoff_timer / 10) << SHIFT_TO_TIME;
++
++	ret = regmap_update_bits(chg->regmap, REG_CHG_CNFG_03,
++				 BIT_TO_ITH | BIT_TO_TIME, val);
++	if (ret) {
++		dev_err(dev, "failed to update topoff bits: %d\n", ret);
++		return ret;
++	}
++
++	/* charge restart threshold(mV) */
++	if (chg->restart_threshold <= 0)
++		val = 0x03; /* disable */
++	else if (chg->restart_threshold > 200)
++		val = 0x02; /* 200 mV */
++	else
++		val = (chg->restart_threshold - 100) / 50;
++
++	/* fast-charge timer(hr) */
++	if (chg->fast_charge_timer <= 0 || chg->fast_charge_timer > 16)
++		tmpval = 0x00; /* disable */
++	else if (chg->fast_charge_timer > 16)
++		tmpval = 0x07; /* 16 hours */
++	else
++		tmpval = chg->fast_charge_timer / 2 - 1;
++
++	val = val << SHIFT_CHG_RSTRT | tmpval;
++
++	/* Enable Low Battery Prequalification Mode */
++	val |= BIT_PQEN;
++
++	ret = regmap_update_bits(chg->regmap, REG_CHG_CNFG_01,
++				 BIT_CHG_RSTRT | BIT_FCHGTIME | BIT_PQEN, val);
++	if (ret) {
++		dev_err(dev, "failed to update CNFG_01: %d\n", ret);
++		return ret;
++	}
++
++	/* charge termination voltage (mV) */
++	val = max77818_chgcv_limit_mv_to_val(chg->termination_voltage);
++
++	/* vsys min voltage */
++	if (chg->vsys_min < 3400)
++		tmpval = 0x00;
++	else if (chg->vsys_min <= 3700)
++		tmpval = DIV_ROUND_UP(chg->vsys_min - 3400, 100);
++	else
++		tmpval = 0x03;
++
++	val = val | tmpval << SHIFT_MINVSYS;
++
++	ret = regmap_write(chg->regmap, REG_CHG_CNFG_04, val);
++	if (ret) {
++		dev_err(dev, "failed to update CNFG_04: %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int max77818_get_status(struct max77818_charger *chg, int *val)
++{
++	int ret;
++	u32 reg;
++
++	ret = regmap_read(chg->regmap, REG_CHG_DTLS_01, &reg);
++	if (ret)
++		return ret;
++
++	switch (reg & BIT_CHG_DTLS) {
++	case CHG_DTLS_PREQUAL:
++	case CHG_DTLS_FASTCHARGE_CC:
++	case CHG_DTLS_FASTCHARGE_CV:
++	case CHG_DTLS_TOPOFF:
++		*val = POWER_SUPPLY_STATUS_CHARGING;
++		break;
++	case CHG_DTLS_DONE:
++		*val = POWER_SUPPLY_STATUS_FULL;
++		break;
++	case CHG_DTLS_OFF_TIMER_FAULT:
++	case CHG_DTLS_OFF_SUSPEND:
++		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		break;
++	case CHG_DTLS_OFF_INPUT_INVALID:
++	case CHG_DTLS_OFF_JUCTION_TEMP:
++	case CHG_DTLS_OFF_WDT_EXPIRED:
++		*val = POWER_SUPPLY_STATUS_DISCHARGING;
++		break;
++	default:
++		*val = POWER_SUPPLY_STATUS_UNKNOWN;
++	}
++
++	return 0;
++}
++
++static int max77818_get_charge_type(struct max77818_charger *chg, int *val)
++{
++	int ret;
++	u32 reg;
++
++	ret = regmap_read(chg->regmap, REG_CHG_DTLS_01, &reg);
++	if (ret)
++		return ret;
++
++	switch (reg & BIT_CHG_DTLS) {
++	case CHG_DTLS_PREQUAL:
++		*val = POWER_SUPPLY_CHARGE_TYPE_TRICKLE;
++		break;
++	case CHG_DTLS_FASTCHARGE_CC:
++	case CHG_DTLS_FASTCHARGE_CV:
++		*val = POWER_SUPPLY_CHARGE_TYPE_FAST;
++		break;
++	case CHG_DTLS_TOPOFF:
++		*val = POWER_SUPPLY_CHARGE_TYPE_STANDARD;
++		break;
++	case CHG_DTLS_DONE:
++	case CHG_DTLS_OFF_TIMER_FAULT:
++	case CHG_DTLS_OFF_SUSPEND:
++	case CHG_DTLS_OFF_INPUT_INVALID:
++	case CHG_DTLS_OFF_JUCTION_TEMP:
++	case CHG_DTLS_OFF_WDT_EXPIRED:
++		*val = POWER_SUPPLY_CHARGE_TYPE_NONE;
++		break;
++	default:
++		*val = POWER_SUPPLY_CHARGE_TYPE_UNKNOWN;
++	}
++
++	return 0;
++}
++
++static int max77818_get_health(struct max77818_charger *chg, int *val)
++{
++	int ret;
++	u32 reg;
++
++	ret = regmap_read(chg->regmap, REG_CHG_DTLS_01, &reg);
++	if (ret)
++		return ret;
++
++	switch ((reg & BIT_BAT_DTLS) >> SHIFT_BAT_DTLS) {
++	case BAT_DTLS_NO_BATTERY:
++		*val = POWER_SUPPLY_HEALTH_NO_BATTERY;
++		break;
++	case BAT_DTLS_OKAY:
++	case BAT_DTLS_OKAY_LOW:
++		*val = POWER_SUPPLY_HEALTH_GOOD;
++		break;
++	case BAT_DTLS_TIMER_FAULT:
++		*val = POWER_SUPPLY_HEALTH_SAFETY_TIMER_EXPIRE;
++		break;
++	case BAT_DTLS_OVERVOLTAGE:
++		*val = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
++		break;
++	case BAT_DTLS_OVERCURRENT:
++		*val = POWER_SUPPLY_HEALTH_OVERCURRENT;
++		break;
++	default:
++		*val = POWER_SUPPLY_HEALTH_UNKNOWN;
++	}
++
++	return 0;
++}
++
++static int max77818_charger_get_property(struct power_supply *psy,
++					 enum power_supply_property psp,
++					 union power_supply_propval *val)
++{
++	struct max77818_charger *chg = (struct max77818_charger*) psy->drv_data;
++	int ret = 0;
++
++	mutex_lock(&chg->lock);
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_ONLINE:
++		ret = max77818_get_online(chg, &val->intval);
++		break;
++	case POWER_SUPPLY_PROP_HEALTH:
++		ret = max77818_get_health(chg, &val->intval);
++		break;
++	case POWER_SUPPLY_PROP_STATUS:
++		ret = max77818_get_status(chg, &val->intval);
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_TYPE:
++		ret = max77818_get_charge_type(chg, &val->intval);
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_MAX:
++		ret = max77818_charger_get_input_current(chg, &val->intval);
++		if (ret) {
++			ret = -ENODEV;
++			goto out;
++		}
++		val->intval = val->intval * 1000; /* mA to uA */
++		break;
++	case POWER_SUPPLY_PROP_CHARGER_MODE:
++		ret = max77818_charger_get_charger_mode(chg);
++		if (ret) {
++			ret = -ENODEV;
++			goto out;
++		}
++		val->intval = chg->charger_mode;
++		break;
++	default:
++		ret = -EINVAL;
++		goto out;
++	}
++
++out:
++	mutex_unlock(&chg->lock);
++	return ret;
++}
++
++/*
++ * FG temperature register for special use to enable no battery operation,
++ * but still retain IEC-62368-1 compliance.
++ * The only way to know the battery is present or not is to use the NTC.
++ */
++#define MAX77818_TEMP	0x08
++
++static bool max77818_charger_battery_present(struct max77818_charger *chg)
++{
++	struct max77818_dev *max77818 = dev_get_drvdata(chg->dev->parent);
++	struct regmap *map = max77818->regmap_fg;
++	u32 data = 0xe1aa; /* -301 deci-centigrade, no ntc */
++	int temp;
++
++	regmap_read(map, MAX77818_TEMP, &data);
++	temp = sign_extend32(data, 15);
++
++	/* The value is converted into deci-centigrade scale */
++	/* Units of LSB = 1 / 256 degree Celsius */
++	temp = temp * 10 / 256;
++
++	if (temp < -100) /* deci-centigrade */
++		return false;
++
++	return true;
++}
++
++static int max77818_charger_set_property(struct power_supply *psy,
++					 enum power_supply_property psp,
++					 const union power_supply_propval *val)
++{
++	struct max77818_charger *chg = (struct max77818_charger *) psy->drv_data;
++	int current_max = 0;
++	int chgcc_limit = 0;
++	int ret = 0;
++
++	mutex_lock(&chg->lock);
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGER_MODE:
++		if (val->intval == POWER_SUPPLY_MODE_CHARGER ||
++		    val->intval == POWER_SUPPLY_MODE_ALL_OFF ||
++		    val->intval == POWER_SUPPLY_MODE_OTG_SUPPLY) {
++			chg->charger_mode = val->intval;
++		} else {
++			ret = -EINVAL;
++			goto out;
++		}
++
++		/*
++		 * Disable charger, but only if it's requested.
++		 */
++		if (val->intval == POWER_SUPPLY_MODE_ALL_OFF)
++			max77818_charger_set_enable(chg, 0);
++		else
++			max77818_charger_set_enable(chg, 1);
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_MAX:
++		current_max = min(val->intval / 1000, chg->input_current_limit_chgin);
++		dev_dbg(chg->dev,
++			"Setting new current max for chgin interface: %d\n",
++			current_max);
++
++		/*
++		 * Truncate to chgcc to follow the temperature jeita settings
++		 * but only if battery is present.
++		 */
++		chg->input_current_limit_chgin_req = current_max;
++		if (max77818_charger_battery_present(chg)) {
++			ret = max77818_get_chgcc_limit(chg, &chgcc_limit);
++			if (!ret)
++				current_max = min(chgcc_limit, current_max);
++		}
++
++		ret = max77818_charger_set_chgin_current_limit(chg, current_max);
++		if (ret) {
++			dev_err(chg->dev,
++				"failed to set chgin input current: %d\n",
++				ret);
++
++			goto out;
++		}
++		break;
++	default:
++		ret = -EINVAL;
++		goto out;
++	}
++
++out:
++	mutex_unlock(&chg->lock);
++	return ret;
++}
++
++static int max77818_charger_property_is_writeable(struct power_supply *psy,
++						  enum power_supply_property psp)
++{
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGER_MODE:
++	case POWER_SUPPLY_PROP_CURRENT_MAX:
++		return 1;
++	default:
++		return 0;
++	}
++}
++
++static int max77818_charger_parse_dt(struct max77818_charger *chg)
++{
++	struct device_node *np = chg->dev->of_node;
++
++	if (!np) {
++		dev_err(chg->dev, "no charger OF node\n");
++		return -ENODEV;
++	}
++
++	if (of_property_read_u32(np, "fast_charge_timer",
++				 &chg->fast_charge_timer))
++		chg->fast_charge_timer = 4; // 4 hours
++
++	if (of_property_read_u32(np, "fast_charge_current",
++				 &chg->fast_charge_current))
++		chg->fast_charge_current = 450; // 450mA
++
++	if (of_property_read_u32(np, "charge_termination_voltage",
++				 &chg->termination_voltage))
++		chg->termination_voltage = 4200; // 4200mV
++
++	if (of_property_read_u32(np, "topoff_timer", &chg->topoff_timer))
++		chg->topoff_timer = 30; // 30 min
++
++	if (of_property_read_u32(np, "topoff_current",
++				 &chg->topoff_current))
++		chg->topoff_current = 150; // 150mA
++
++	if (of_property_read_u32(np, "restart_threshold",
++				 &chg->restart_threshold))
++		chg->restart_threshold = 150; // 150mV
++
++	if (of_property_read_u32(np, "default_current_limit",
++				 &chg->default_current_limit))
++		chg->default_current_limit = 500; // 500mA
++
++	if (of_property_read_u32(np, "input_current_limit_chgin",
++				 &chg->input_current_limit_chgin))
++		chg->input_current_limit_chgin = chg->default_current_limit;
++
++	of_property_read_variable_u32_array(np, "thermal-charge-table",
++					    (u32 *)chg->thermal_opp_table,
++					    0, sizeof(chg->thermal_opp_table) / 4);
++
++	chg->vbus_limit = devm_regulator_get_optional(chg->dev, "vbus-limit");
++	if (IS_ERR(chg->vbus_limit)) {
++		if (PTR_ERR(chg->vbus_limit) == -EPROBE_DEFER)
++			return -EPROBE_DEFER;
++
++		chg->vbus_limit = NULL;
++	}
++
++	return 0;
++}
++
++static const struct power_supply_desc psy_chg_desc = {
++	.name = "max77818-charger",
++	.type = POWER_SUPPLY_TYPE_USB,
++	.properties = max77818_charger_props,
++	.num_properties = ARRAY_SIZE(max77818_charger_props),
++	.get_property = max77818_charger_get_property,
++	.set_property = max77818_charger_set_property,
++	.property_is_writeable = max77818_charger_property_is_writeable,
++};
++
++static int max77818_tcd_get_max_state(struct thermal_cooling_device *cdev,
++				      unsigned long *state)
++{
++	*state = MAX77818_THERMAL_STATE_HOT;
++	return 0;
++}
++
++static int max77818_tcd_get_cur_state(struct thermal_cooling_device *cdev,
++				      unsigned long *state)
++{
++	struct max77818_charger *chg = cdev->devdata;
++
++	*state = chg->tcd_state;
++	return 0;
++}
++
++static int max77818_tcd_set_cur_state(struct thermal_cooling_device *cdev,
++				      unsigned long state)
++{
++	struct max77818_charger *chg = cdev->devdata;
++	int mA_new, mA_now;
++	int mV_new, mV_now;
++	int chgin_current_max;
++	int ret;
++
++	WARN_ON(state >= ARRAY_SIZE(chg->thermal_opp_table));
++
++	mA_new = chg->thermal_opp_table[state].current_limit;
++	mV_new = chg->thermal_opp_table[state].voltage_limit;
++
++	ret = max77818_get_chgcc_limit(chg, &mA_now);
++	if (ret)
++		return ret;
++
++	ret = max77818_get_chgcv_limit(chg, &mV_now);
++	if (ret)
++		return ret;
++
++	chg->tcd_state = state;
++
++	if (mA_now == mA_new && mV_now == mV_new)
++		goto done;
++
++	dev_info(chg->dev, "Thermal regulation (%lu): %dmA/%dmV -> %dmA/%dmV\n",
++		 state, mA_now, mV_now, mA_new, mV_new);
++
++	/* if we increase mA, increase the vbus limit first */
++	if (chg->vbus_limit && (mA_new > mA_now))
++		regulator_set_current_limit(chg->vbus_limit, 0, mA_new * 1000);
++
++	if (mA_now != mA_new) {
++		ret = max77818_set_chgcc_limit(chg, mA_new);
++		if (ret)
++			return ret;
++	}
++
++	if (mV_now != mV_new) {
++		ret = max77818_set_chgcv_limit(chg, mV_new);
++		if (ret)
++			return ret;
++	}
++
++	chgin_current_max = min(mA_new, chg->input_current_limit_chgin_req);
++	ret = max77818_charger_set_chgin_current_limit(chg, chgin_current_max);
++	if (ret)
++		return ret;
++
++	/* if we decrease mA, reduce the vbus limit last */
++	if (chg->vbus_limit && (mA_new < mA_now)) {
++		/* delay to let the current settle before limiting the regulator */
++		usleep_range(1000, 2000);
++		regulator_set_current_limit(chg->vbus_limit, 0, mA_new * 1000);
++	}
++
++done:
++	return 0;
++}
++
++static const struct thermal_cooling_device_ops max77818_tcd_ops = {
++	.get_max_state = max77818_tcd_get_max_state,
++	.get_cur_state = max77818_tcd_get_cur_state,
++	.set_cur_state = max77818_tcd_set_cur_state,
++};
++
++static irqreturn_t max77818_charger_isr(int irq, void *data)
++{
++	struct max77818_charger *chg = data;
++	int chgcc_limit;
++	u32 val;
++
++	/* CHG_INT register bits are R/C */
++	regmap_read(chg->regmap, REG_CHG_INT, &val);
++
++	if (val & BIT_CHGIN) {
++		/*
++		 * Datasheet specifies a 150 ms delay from CHGIN OK (INOKB H → L) to
++		 * Start Switching.  Testing on boards suggests that 200 ms is more
++		 * reliable for "status" property to be updated with uevent.
++		 *
++		 * Also datesheet seems specify the delay only for charger attaching,
++		 * but testing suggests that the delay is needed for charger detaching
++		 * as well.
++		 */
++
++		/* Set a temporary high current limit while processing the CHGIN interrupt
++		 * The charger overshoots the current above ~1A when it starts switching, which
++		 * would trigger the current limit. This works around the issue by first setting
++		 * it to the higher fast charge limit, and then back to the same
++		 * as limited chgcc per temperature.
++		 */
++
++		if (chg->vbus_limit)
++			regulator_set_current_limit(chg->vbus_limit, 0,
++						    chg->fast_charge_current * 1000);
++
++		msleep(200);
++
++		if (max77818_charger_battery_present(chg) &&
++		    !max77818_get_chgcc_limit(chg, &chgcc_limit) && chg->vbus_limit)
++			regulator_set_current_limit(chg->vbus_limit, 0, chgcc_limit * 1000);
++	}
++
++	if (val & BIT_CHG)
++		dev_info(chg->dev, "charge state event\n");
++
++	power_supply_changed(chg->psy_chg);
++
++	return IRQ_HANDLED;
++}
++
++static int max77818_charger_init_interrupt(struct max77818_dev *max77818,
++					   struct max77818_charger *chg)
++{
++	u32 int_mask = BIT_CHGIN | BIT_CHG;
++	struct device *dev = chg->dev;
++	int irq;
++	int ret;
++
++	/* Unmask needed interrupts */
++	regmap_update_bits(chg->regmap, REG_CHG_INT_MASK, 0xff, ~int_mask);
++
++	/* Register irq handler for the charger interrupt */
++	irq = regmap_irq_get_virq(max77818->irqc_intsrc, MAX77818_CHGR_INT);
++	if (irq <= 0) {
++		dev_err(dev, "failed to get virq: %d\n", irq);
++		return -ENODEV;
++	}
++
++	ret = devm_request_threaded_irq(dev, irq, NULL,
++					max77818_charger_isr,
++					0, "charger", chg);
++	if (ret) {
++		dev_err(dev, "failed to request charger irq: %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int max77818_charger_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct max77818_dev *max77818 = dev_get_drvdata(dev->parent);
++	struct power_supply_config psy_cfg = {};
++	struct max77818_charger *chg;
++	int ret;
++
++	chg = devm_kzalloc(dev, sizeof(*chg), GFP_KERNEL);
++	if (!chg)
++		return -ENOMEM;
++
++	platform_set_drvdata(pdev, chg);
++	chg->dev = dev;
++	chg->regmap = max77818->regmap_chg;
++
++	mutex_init(&chg->lock);
++
++	ret = max77818_charger_parse_dt(chg);
++	if (ret)
++		return ret;
++
++	psy_cfg.drv_data = chg;
++	psy_cfg.fwnode = dev_fwnode(dev);
++
++	ret = max77818_charger_initialize(chg);
++	if (ret)
++		dev_warn(dev, "failed to init charger: %d\n", ret);
++
++	chg->psy_chg = devm_power_supply_register(dev, &psy_chg_desc, &psy_cfg);
++	if (IS_ERR(chg->psy_chg)) {
++		ret = PTR_ERR(chg->psy_chg);
++		dev_err(dev, "failed to register supply: %d\n", ret);
++		return ret;
++	}
++
++	ret = max77818_charger_init_interrupt(max77818, chg);
++	if (ret) {
++		dev_err(dev, "Failed to init interrupt: %d\n", ret);
++		return ret;
++	}
++
++	chg->tcd = devm_thermal_of_child_cooling_device_register(dev, dev->of_node, "max77818-cooling",
++							   chg, &max77818_tcd_ops);
++	if (IS_ERR(chg->tcd))
++		return dev_err_probe(dev, PTR_ERR(chg->tcd), "failed to register cooling device\n");
++
++	return 0;
++}
++
++static int max77818_charger_suspend(struct device *dev)
++{
++	struct max77818_charger *chg = dev_get_drvdata(dev);
++	int current_limit;
++
++	/* Cache charge termination voltage - FGCC might change it if activated */
++	max77818_get_chgcv_limit(chg, &chg->termination_voltage_cached);
++
++	/* Set a low current limit during suspend.
++	 * This is to avoid having thermal wakeup in all power modes
++	 */
++	current_limit = chg->thermal_opp_table[MAX77818_THERMAL_STATE_GLACIAL].current_limit;
++	max77818_charger_set_chgin_current_limit(chg, current_limit);
++
++	if (chg->vbus_limit) {
++		/* delay to let the current settle before limiting the regulator */
++		usleep_range(1000, 2000);
++		regulator_set_current_limit(chg->vbus_limit, 0,
++					    current_limit * 1000);
++	}
++
++	return 0;
++}
++
++static int max77818_charger_resume(struct device *dev)
++{
++	struct max77818_charger *chg = dev_get_drvdata(dev);
++	int current_max, chgcc_limit;
++
++	/* restore and truncate to chgcc to follow the temperature jeita settings */
++	current_max = chg->input_current_limit_chgin_req;
++	if (!max77818_get_chgcc_limit(chg, &chgcc_limit))
++		current_max = min(chgcc_limit, current_max);
++
++	/* Restore charge termination voltage - FGCC might have changed it */
++	max77818_set_chgcv_limit(chg, chg->termination_voltage_cached);
++
++	if (chg->vbus_limit)
++		regulator_set_current_limit(chg->vbus_limit, 0,
++					    chgcc_limit * 1000);
++
++	max77818_charger_set_chgin_current_limit(chg, current_max);
++
++	return 0;
++}
++
++static const struct dev_pm_ops max77818_chg_pm = {
++	.suspend = max77818_charger_suspend,
++	.resume = max77818_charger_resume,
++};
++
++static const struct platform_device_id max77818_charger_id_table[] = {
++	{ MAX77818_CHARGER_NAME },
++	{ }
++};
++MODULE_DEVICE_TABLE(platform, max77818_charger_id_table);
++
++static struct of_device_id max77818_charger_of_match[] = {
++	{ .compatible = "maxim,max77818-charger" },
++	{ },
++};
++MODULE_DEVICE_TABLE(of, max77818_charger_of_match);
++
++static struct platform_driver max77818_charger_driver = {
++	.driver = {
++		.name = MAX77818_CHARGER_NAME,
++		.owner = THIS_MODULE,
++		.of_match_table = max77818_charger_of_match,
++		.pm = &max77818_chg_pm,
++	},
++	.probe = max77818_charger_probe,
++	.id_table = max77818_charger_id_table,
++};
++module_platform_driver(max77818_charger_driver);
++
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("MAX77818 Charger Driver");
++MODULE_AUTHOR("TaiEup Kim <clark.kim@maximintegrated.com>");
+diff --git a/drivers/power/supply/max77818_battery.c b/drivers/power/supply/max77818_battery.c
+new file mode 100644
+index 000000000..e77d41672
+--- /dev/null
++++ b/drivers/power/supply/max77818_battery.c
+@@ -0,0 +1,1681 @@
++/*
++ * Fuel gauge driver for Maxim 77818
++ *  Note that Maxim 77818 is mfd and this is its subdevice.
++ *
++ * Copyright (C) 2011 Samsung Electronics
++ * MyungJoo Ham <myungjoo.ham@samsung.com>
++ *
++ * Copyright (C) 2019 reMarkable AS - http://www.remarkable.com/
++ *
++ * Author: Steinar Bakkemo <steinar.bakkemo@remarkable.com>
++ * Author: Shawn Guo  <shawn.guo@linaro.org>
++ * Author: Lars Ivar Miljeteig <lars.ivar.miljeteig@remarkable.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ *
++ * It is based on max17042_battery driver.
++ */
++
++#include <linux/acpi.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/i2c.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/pm.h>
++#include <linux/mod_devicetable.h>
++#include <linux/power_supply.h>
++#include <linux/power/max17042_battery.h>
++#include <linux/of.h>
++#include <linux/reboot.h>
++#include <linux/regmap.h>
++#include <linux/thermal.h>
++#include <linux/mfd/max77818/max77818.h>
++#include <linux/platform_device.h>
++#include <linux/debugfs.h>
++
++struct max77818_platform_data {
++	unsigned int r_sns;	/* in micro-ohms */
++	int vmin;		/* in millivolts */
++	int vmax;		/* in millivolts */
++	int temp_min;		/* in tenths of degree Celsius */
++	int temp_max;		/* in tenths of degree Celsius */
++	u8 min_soc_alrt;	/* in percent */
++	u8 max_soc_alrt;	/* in percent */
++	u8 critical_soc;	/* in percent */
++};
++
++/* Status register bits */
++#define STATUS_BR		BIT(15)
++#define STATUS_SMX		BIT(14)
++#define STATUS_TMX		BIT(13)
++#define STATUS_VMX		BIT(12)
++#define STATUS_BI		BIT(11)
++#define STATUS_SMN		BIT(10)
++#define STATUS_TMN		BIT(9)
++#define STATUS_VMN		BIT(8)
++#define STATUS_DSOCI		BIT(7)
++#define STATUS_BST		BIT(3)
++#define STATUS_POR		BIT(1)
++
++/* Config register bits */
++#define CONFIG_SPR_11		BIT(11)
++
++/* Config2 register bits */
++#define CONFIG2_DSOCEN		BIT(7)
++#define CONFIG2_TALRTEN		BIT(6)
++#define CONFIG2_LDMDL		BIT(5)
++
++#define VFSOC0_LOCK		0x0000
++#define VFSOC0_UNLOCK		0x0080
++#define MODEL_UNLOCK1		0X0059
++#define MODEL_UNLOCK2		0X00C4
++#define MODEL_LOCK1		0X0000
++#define MODEL_LOCK2		0X0000
++
++#define dQ_ACC_DIV		0x4
++#define dP_ACC_100		0x1900
++#define dP_ACC_200		0x3200
++
++#define MAX77818_VMAX_TOLERANCE	50 /* 50 mV */
++
++#define MIN_SOC_ALRT_DISABLE 0
++#define MAX_SOC_ALRT_DISABLE 0xFF
++
++#define CRITICAL_SOC_DEFAULT	6
++
++struct max77818_chip {
++	struct device *dev;
++	struct max77818_dev *max77818_dev;
++
++	int fg_irq;
++	int soc_min_cached;
++	int soc_max_cached;
++	int talrth_cached;
++
++	struct regmap *regmap;
++	struct power_supply *battery;
++	struct max77818_platform_data *pdata;
++	int usb_safe_max_current;
++	struct mutex lock;
++	char capacity_hires[8];
++	struct dentry *debugfs_root;
++	u8 capacity_overrule;
++
++	struct thermal_zone_device *tzd;
++	struct regulator *vbus_limit;
++};
++
++static enum power_supply_property max77818_battery_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_CYCLE_COUNT,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX,
++	POWER_SUPPLY_PROP_VOLTAGE_MIN,
++	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_VOLTAGE_AVG,
++	POWER_SUPPLY_PROP_VOLTAGE_OCV,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_CAPACITY_ALERT_MIN,
++	POWER_SUPPLY_PROP_CAPACITY_ALERT_MAX,
++	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
++	POWER_SUPPLY_PROP_CHARGE_FULL,
++	POWER_SUPPLY_PROP_CHARGE_NOW,
++	POWER_SUPPLY_PROP_CHARGE_COUNTER,
++	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_TEMP_ALERT_MIN,
++	POWER_SUPPLY_PROP_TEMP_ALERT_MAX,
++	POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_CURRENT_AVG,
++	POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW,
++	POWER_SUPPLY_PROP_TIME_TO_FULL_NOW,
++	POWER_SUPPLY_PROP_CAPACITY_HIRES,
++};
++
++struct max77818_of_property {
++	const char *property_name;
++	u8 register_addr;
++	int (*reg_write_op)(struct regmap *map,
++			    unsigned int reg,
++			    unsigned int value);
++	bool skip_verify;
++	bool require_lock;
++};
++
++#ifdef CONFIG_DEBUG_FS
++static ssize_t max77818_debugfs_capacity_overrule_read(struct file *filp, char __user *buf,
++						       size_t size, loff_t *off)
++{
++	struct max77818_chip *chip = filp->private_data;
++	char buffer[6];
++
++	snprintf(buffer, sizeof(buffer), "%u\n", chip->capacity_overrule);
++	return simple_read_from_buffer(buf, size, off, buffer, strlen(buffer));
++}
++
++static ssize_t max77818_debugfs_capacity_overrule_write(struct file *filp, const char __user *buf,
++							size_t size, loff_t *off)
++{
++	struct max77818_chip *chip = filp->private_data;
++	unsigned long res;
++	char buffer[6];
++	ssize_t ret;
++
++	if (size >= sizeof(buffer))
++		return -EINVAL;
++
++	/* 'sizeof(buffer) - 1' to secure a string terminator */
++	memset(buffer, 0, sizeof(buffer));
++	ret = simple_write_to_buffer(buffer, sizeof(buffer) - 1, off, buf, size);
++	if (ret < 0)
++		return ret;
++
++	ret = kstrtoul(buffer, 0, &res);
++	if (ret)
++		return ret;
++
++	chip->capacity_overrule = res;
++	if (res && res < chip->pdata->critical_soc) {
++		dev_info(chip->dev,
++			 "Debugfs overrule 'Battery capacity critical'. capacity: %lu\n",
++			 res);
++		__hw_protection_trigger("Debugfs overrule 'Battery critical capacity'", 10000, HWPROT_ACT_SHUTDOWN);
++	}
++	power_supply_changed(chip->battery);
++
++	return size;
++}
++
++static const struct file_operations max77818_debugfs_capacity_overrule_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = max77818_debugfs_capacity_overrule_read,
++	.write = max77818_debugfs_capacity_overrule_write,
++};
++
++static void max77818_debugfs_add(struct max77818_chip *chip)
++{
++	int ret;
++
++	chip->debugfs_root = debugfs_create_dir(dev_name(chip->dev), NULL);
++	if (IS_ERR_OR_NULL(chip->debugfs_root)) {
++		dev_err(chip->dev, "Failed to make debugfs directory '%s' (err %ld)\n",
++			dev_name(chip->dev), PTR_ERR(chip->debugfs_root));
++		chip->debugfs_root = NULL;
++		return;
++	}
++
++	ret = PTR_ERR_OR_ZERO(debugfs_create_file("capacity_overrule",
++						  0644, chip->debugfs_root, chip,
++						  &max77818_debugfs_capacity_overrule_fops));
++	if (ret)
++		dev_err(chip->dev,
++			"Failed to generate debugfs 'capacity_overrule' (err %d)\n", ret);
++}
++
++static void max77818_debugfs_remove(struct max77818_chip *chip)
++{
++	debugfs_remove_recursive(chip->debugfs_root);
++}
++#else
++static void max77818_debugfs_add(struct max77818_chip *chip) { }
++static void max77818_debugfs_remove(struct max77818_chip *chip) { }
++#endif
++
++static int max77818_init_chip(struct max77818_chip *chip);
++
++static ssize_t config_update_store(struct device *dev, struct device_attribute *attr,
++				   const char *buf, size_t count)
++{
++	struct power_supply *psy = dev_get_drvdata(dev);
++	struct max77818_chip *chip = power_supply_get_drvdata(psy);
++	u32 val;
++	int ret;
++
++	if (kstrtou32(buf, 0, &val))
++		return -EINVAL;
++
++	if (val != 1)
++		return -EINVAL;
++
++	ret = max77818_init_chip(chip);
++	if (ret)
++		return ret;
++
++	return count;
++}
++
++static DEVICE_ATTR_WO(config_update);
++
++static struct attribute *max77818_attrs[] = {
++	&dev_attr_config_update.attr,
++	NULL
++};
++
++ATTRIBUTE_GROUPS(max77818);
++
++static int max77818_get_temperature(struct max77818_chip *chip, int *temp)
++{
++	struct regmap *map = chip->regmap;
++	u32 data;
++	int ret;
++
++	ret = regmap_read(map, MAX17042_TEMP, &data);
++	if (ret < 0)
++		return ret;
++
++	*temp = sign_extend32(data, 15);
++	/* The value is converted into deci-centigrade scale */
++	/* Units of LSB = 1 / 256 degree Celsius */
++	*temp = *temp * 10 / 256;
++	return 0;
++}
++
++static int max77818_get_status(struct max77818_chip *chip, int *status)
++{
++	u32 val;
++	int ret;
++
++	ret = regmap_read(chip->regmap, MAX17042_Current, &val);
++	if (ret < 0)
++		return ret;
++
++	if ((val & 0x8000) == 0) /* Positive */
++		*status = POWER_SUPPLY_STATUS_CHARGING;
++	else
++		*status = POWER_SUPPLY_STATUS_DISCHARGING;
++
++	return 0;
++}
++
++static int max77818_get_battery_health(struct max77818_chip *chip, int *health)
++{
++	int temp, vavg, vbatt, ret;
++	u32 val;
++
++	ret = regmap_read(chip->regmap, MAX17042_AvgVCELL, &val);
++	if (ret < 0)
++		goto health_error;
++
++	/* bits [0-3] unused */
++	vavg = val * 625 / 8;
++	/* Convert to millivolts */
++	vavg /= 1000;
++
++	ret = regmap_read(chip->regmap, MAX17042_VCELL, &val);
++	if (ret < 0)
++		goto health_error;
++
++	/* bits [0-3] unused */
++	vbatt = val * 625 / 8;
++	/* Convert to millivolts */
++	vbatt /= 1000;
++
++	if (vavg < chip->pdata->vmin) {
++		*health = POWER_SUPPLY_HEALTH_DEAD;
++		goto out;
++	}
++
++	if (vbatt > chip->pdata->vmax + MAX77818_VMAX_TOLERANCE) {
++		*health = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
++		goto out;
++	}
++
++	ret = max77818_get_temperature(chip, &temp);
++	if (ret < 0)
++		goto health_error;
++
++	if (temp < chip->pdata->temp_min) {
++		*health = POWER_SUPPLY_HEALTH_COLD;
++		goto out;
++	}
++
++	if (temp > chip->pdata->temp_max) {
++		*health = POWER_SUPPLY_HEALTH_OVERHEAT;
++		goto out;
++	}
++
++	*health = POWER_SUPPLY_HEALTH_GOOD;
++
++out:
++	return 0;
++
++health_error:
++	return ret;
++}
++
++static int max77818_get_property(struct power_supply *psy,
++				 enum power_supply_property psp,
++				 union power_supply_propval *val)
++{
++	struct max77818_chip *chip = power_supply_get_drvdata(psy);
++	struct regmap *map = chip->regmap;
++	int temp;
++	int ret;
++	u32 data;
++	u64 data64;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_STATUS:
++		ret = max77818_get_status(chip, &val->intval);
++		if (ret < 0)
++			return ret;
++		break;
++	case POWER_SUPPLY_PROP_PRESENT:
++		/*
++		 * The BattAbsent status bit is not working properly.  ADI has
++		 * confirmed that they are using the thermistor voltage to
++		 * detect presence.  We are working around the issue here by
++		 * reading temperature register, and taking battery as absence
++		 * if the temperature is below -10 C.
++		 */
++		ret = max77818_get_temperature(chip, &temp);
++		if (ret < 0)
++			return ret;
++
++		if (temp < -100) /* deci-centigrade */
++			val->intval = 0;
++		else
++			val->intval = 1;
++		break;
++	case POWER_SUPPLY_PROP_CYCLE_COUNT:
++		ret = regmap_read(map, MAX17042_Cycles, &data);
++		if (ret < 0)
++			return ret;
++
++		val->intval = data / 100; /* Units of LSB = 1% */
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
++		ret = regmap_read(map, MAX17042_MinMaxVolt, &data);
++		if (ret < 0)
++			return ret;
++
++		val->intval = data >> 8;
++		val->intval *= 20000; /* Units of LSB = 20mV */
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MIN:
++		ret = regmap_read(map, MAX17042_MinMaxVolt, &data);
++		if (ret < 0)
++			return ret;
++
++		val->intval = (data & 0xff) * 20000; /* Units of 20mV */
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
++		ret = regmap_read(map, MAX17047_V_empty, &data);
++		if (ret < 0)
++			return ret;
++
++		val->intval = data >> 7;
++		val->intval *= 10000; /* Units of LSB = 10mV */
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		ret = regmap_read(map, MAX17042_VCELL, &data);
++		if (ret < 0)
++			return ret;
++
++		val->intval = data * 625 / 8;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_AVG:
++		ret = regmap_read(map, MAX17042_AvgVCELL, &data);
++		if (ret < 0)
++			return ret;
++
++		val->intval = data * 625 / 8;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
++		ret = regmap_read(map, MAX17042_OCVInternal, &data);
++		if (ret < 0)
++			return ret;
++
++		val->intval = data * 625 / 8;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		ret = regmap_read(map, MAX17042_RepSOC, &data);
++		if (ret < 0)
++			return ret;
++
++		if (!chip->capacity_overrule)
++			val->intval = data >> 8;
++		else
++			val->intval = chip->capacity_overrule;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY_ALERT_MIN:
++		val->intval = chip->soc_min_cached;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY_ALERT_MAX:
++		val->intval = chip->soc_max_cached;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		ret = regmap_read(map, MAX17042_DesignCap, &data);
++		if (ret < 0)
++			return ret;
++
++		data64 = data * 5000000ll;
++		do_div(data64, chip->pdata->r_sns);
++		val->intval = data64;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_FULL:
++		ret = regmap_read(map, MAX17042_FullCAP, &data);
++		if (ret < 0)
++			return ret;
++
++		data64 = data * 5000000ll;
++		do_div(data64, chip->pdata->r_sns);
++		val->intval = data64;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_NOW:
++		ret = regmap_read(map, MAX17042_RepCap, &data);
++		if (ret < 0)
++			return ret;
++
++		data64 = data * 5000000ll;
++		do_div(data64, chip->pdata->r_sns);
++		val->intval = data64;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
++		ret = regmap_read(map, MAX17042_QH, &data);
++		if (ret < 0)
++			return ret;
++
++		val->intval = data * 1000 / 2;
++		break;
++	case POWER_SUPPLY_PROP_TEMP:
++		ret = max77818_get_temperature(chip, &val->intval);
++		if (ret < 0)
++			return ret;
++		break;
++	case POWER_SUPPLY_PROP_TEMP_ALERT_MIN:
++		ret = regmap_read(map, MAX17042_TALRT_Th, &data);
++		if (ret < 0)
++			return ret;
++		/* LSB is Alert Minimum. In deci-centigrade */
++		val->intval = sign_extend32(data & 0xff, 7) * 10;
++		break;
++	case POWER_SUPPLY_PROP_TEMP_ALERT_MAX:
++		ret = regmap_read(map, MAX17042_TALRT_Th, &data);
++		if (ret < 0)
++			return ret;
++		/* MSB is Alert Maximum. In deci-centigrade */
++		val->intval = sign_extend32(data >> 8, 7) * 10;
++		break;
++	case POWER_SUPPLY_PROP_HEALTH:
++		ret = max77818_get_battery_health(chip, &val->intval);
++		if (ret < 0)
++			return ret;
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		ret = regmap_read(map, MAX17042_Current, &data);
++		if (ret < 0)
++			return ret;
++
++		val->intval = sign_extend32(data, 15);
++		val->intval *= 1562500 / chip->pdata->r_sns;
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_AVG:
++		ret = regmap_read(map, MAX17042_AvgCurrent, &data);
++		if (ret < 0)
++			return ret;
++
++		val->intval = sign_extend32(data, 15);
++		val->intval *= 1562500 / chip->pdata->r_sns;
++		break;
++	case POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW:
++		ret = regmap_read(map, MAX17042_TTE, &data);
++		val->intval = data * 5625 / 1000;
++		break;
++	case POWER_SUPPLY_PROP_TIME_TO_FULL_NOW:
++		ret = regmap_read(map, MAX77818_TTF, &data);
++		val->intval = data * 5625 / 1000;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY_HIRES:
++		ret = regmap_read(map, MAX17042_RepSOC, &data);
++		if (ret < 0)
++			return ret;
++		if (!chip->capacity_overrule)
++			/* RepSOC LSB: 1% (upper byte) 1/256% (lower byte) */
++			sprintf(chip->capacity_hires, "%d.%03d",
++				data >> 8, (data & 0xFF) * 1000 / 256);
++		else
++			sprintf(chip->capacity_hires, "%d.%03d", chip->capacity_overrule, 0);
++		val->strval = chip->capacity_hires;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int max77818_set_property(struct power_supply *psy,
++				 enum power_supply_property psp,
++				 const union power_supply_propval *val)
++{
++	struct max77818_chip *chip = power_supply_get_drvdata(psy);
++	struct regmap *map = chip->regmap;
++	int ret = 0;
++	u32 data;
++	int8_t temp;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_TEMP_ALERT_MIN:
++		ret = regmap_read(map, MAX17042_TALRT_Th, &data);
++		if (ret < 0)
++			return ret;
++
++		/* Input in deci-centigrade, convert to centigrade */
++		temp = val->intval / 10;
++		/* force min < max */
++		if (temp >= (int8_t)(data >> 8))
++			temp = (int8_t)(data >> 8) - 1;
++		/* Write both MAX and MIN ALERT */
++		data = (data & 0xff00) + temp;
++		ret = regmap_write(map, MAX17042_TALRT_Th, data);
++		break;
++	case POWER_SUPPLY_PROP_TEMP_ALERT_MAX:
++		ret = regmap_read(map, MAX17042_TALRT_Th, &data);
++		if (ret < 0)
++			return ret;
++
++		/* Input in Deci-Centigrade, convert to centigrade */
++		temp = val->intval / 10;
++		/* force max > min */
++		if (temp <= (int8_t)(data & 0xff))
++			temp = (int8_t)(data & 0xff) + 1;
++		/* Write both MAX and MIN ALERT */
++		data = (data & 0xff) + (temp << 8);
++		ret = regmap_write(map, MAX17042_TALRT_Th, data);
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY_ALERT_MIN:
++		if (val->intval < 0 || val->intval > 100) {
++			ret = -EINVAL;
++			break;
++		}
++		ret = regmap_update_bits(map, MAX17042_SALRT_Th,
++					 0xff, val->intval);
++		chip->soc_min_cached = val->intval;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY_ALERT_MAX:
++		if ((val->intval < 0 || val->intval > 100) &&
++		    val->intval != 255) {
++			ret = -EINVAL;
++			break;
++		}
++		ret = regmap_update_bits(map, MAX17042_SALRT_Th,
++					 0xff00, val->intval << 8);
++		chip->soc_max_cached = val->intval;
++		break;
++	default:
++		ret = -EINVAL;
++	}
++
++	return ret;
++}
++
++static int max77818_property_is_writeable(struct power_supply *psy,
++					  enum power_supply_property psp)
++{
++	int ret;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_TEMP_ALERT_MIN:
++	case POWER_SUPPLY_PROP_TEMP_ALERT_MAX:
++	case POWER_SUPPLY_PROP_CAPACITY_ALERT_MIN:
++	case POWER_SUPPLY_PROP_CAPACITY_ALERT_MAX:
++		ret = 1;
++		break;
++	default:
++		ret = 0;
++	}
++
++	return ret;
++}
++
++static void max77818_external_power_changed(struct power_supply *psy)
++{
++	power_supply_changed(psy);
++}
++
++static int max77818_write_and_verify_reg(struct regmap *map, unsigned int reg, unsigned int value)
++{
++	int retries = 8;
++	u32 read_value;
++	int ret;
++
++	do {
++		retries--;
++		ret = regmap_write(map, reg, value);
++		if (ret) {
++			continue;
++		}
++
++		ret = regmap_read(map, reg, &read_value);
++		if (ret) {
++			continue;
++		}
++
++		if (read_value != value) {
++			ret = -EIO;
++		}
++	} while (retries && read_value != value);
++
++	if (ret < 0)
++		pr_err("%s: err %d\n", __func__, ret);
++
++	return ret;
++}
++
++static inline int max77818_unlock_model(struct max77818_chip *chip)
++{
++	struct regmap *map = chip->regmap;
++	int ret;
++
++	ret = regmap_write(map, MAX17042_MLOCKReg1, MODEL_UNLOCK1);
++	if (ret)
++		return ret;
++
++	return regmap_write(map, MAX17042_MLOCKReg2, MODEL_UNLOCK2);
++}
++
++static inline int max77818_lock_model(struct max77818_chip *chip)
++{
++	struct regmap *map = chip->regmap;
++	int ret;
++
++	ret = regmap_write(map, MAX17042_MLOCKReg1, MODEL_LOCK1);
++	if (ret)
++		return ret;
++
++	return regmap_write(map, MAX17042_MLOCKReg2, MODEL_LOCK2);
++}
++
++static inline int max77818_write_model_data(struct max77818_chip *chip,
++					     u16 *data, int count)
++{
++	struct regmap *map = chip->regmap;
++	int i, ret;
++
++	for (i = 0; i < count; i++) {
++		ret = regmap_write(map, MAX17042_MODELChrTbl + i, data[i]);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static inline int max77818_read_model_data(struct max77818_chip *chip,
++					    u16 *data, int count)
++{
++	struct regmap *map = chip->regmap;
++	u32 tmp;
++	int ret, i;
++
++	for (i = 0; i < count; i++) {
++		ret = regmap_read(map, MAX17042_MODELChrTbl + i, &tmp);
++		if (ret)
++			return ret;
++		data[i] = (u16)tmp;
++	}
++	return 0;
++}
++
++static inline int max77818_model_data_compare(struct max77818_chip *chip,
++					u16 *expected, u16 *compareto, int size)
++{
++	int i;
++
++	if (memcmp(expected, compareto, size)) {
++		dev_err(chip->dev, "%s compare failed\n", __func__);
++		for (i = 0; i < size; i++)
++			dev_info(chip->dev,
++					"%03d: Expected: 0x%x, read: 0x%x\n",
++					i,
++					expected[i],
++					compareto[i]);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int max77818_init_model(struct max77818_chip *chip)
++{
++	struct device_node *np = chip->dev->of_node;
++	u16 *data, *rdata;
++	int count;
++	int ret;
++
++	count = of_property_count_u16_elems(np, "maxim,cell-model-data");
++	if (count < 0 || count != MAX17042_CHARACTERIZATION_DATA_SIZE) {
++		dev_err(chip->dev, "invalid or missing maxim,cell-model-data: %d\n",
++			count);
++		return -EINVAL;
++	}
++
++	data = kcalloc(count, sizeof(*data), GFP_KERNEL);
++	if (!data) {
++		dev_err(chip->dev, "failed to kcalloc for data\n");
++		return -ENOMEM;
++	}
++
++	/* Read cell model data */
++	of_property_read_u16_array(np, "maxim,cell-model-data", data, count);
++
++	rdata = kcalloc(count, sizeof(*rdata), GFP_KERNEL);
++	if (!rdata) {
++		dev_err(chip->dev, "failed to kcalloc for rdata\n");
++		ret = -ENOMEM;
++		goto free_data;
++	}
++
++	ret = max77818_unlock_model(chip);
++	if (ret) {
++		dev_err(chip->dev, "unable to unlock model data: %d\n", ret);
++		goto free_rdata;
++	}
++
++	ret = max77818_write_model_data(chip, data, count);
++	if (ret) {
++		dev_err(chip->dev, "unable to write model data: %d\n", ret);
++		goto lock_model;
++	}
++
++	ret = max77818_read_model_data(chip, rdata, count);
++	if (ret) {
++		dev_err(chip->dev, "unable to read model data: %d\n", ret);
++		goto lock_model;
++	}
++
++	ret = max77818_model_data_compare(chip, data, rdata, count);
++	if (ret)
++		dev_err(chip->dev, "model data compare failed: %d\n", ret);
++
++lock_model:
++	max77818_lock_model(chip);
++free_rdata:
++	kfree(rdata);
++free_data:
++	kfree(data);
++	return ret;
++}
++
++static int max77818_verify_model_lock(struct max77818_chip *chip)
++{
++	int count = MAX17042_CHARACTERIZATION_DATA_SIZE;
++	u16 *data;
++	int ret = 0;
++	int i;
++
++	data = kcalloc(count, sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	ret = max77818_read_model_data(chip, data, count);
++	if (ret)
++		goto done;
++
++	for (i = 0; i < count; i++) {
++		if (data[i]) {
++			ret = -EINVAL;
++			goto done;
++		}
++	}
++
++done:
++	kfree(data);
++	return ret;
++}
++
++static int max77818_model_loading(struct max77818_chip *chip)
++{
++	unsigned long timeout = jiffies + msecs_to_jiffies(400);
++	struct regmap *map = chip->regmap;
++	u32 config2;
++	int ret;
++
++	/* Setting LdMdl bit */
++	ret = regmap_read(map, MAX77818_Config2, &config2);
++	if (ret)
++		return ret;
++
++	ret = regmap_write(map, MAX77818_Config2, config2 | CONFIG2_LDMDL);
++	if (ret)
++		return ret;
++
++	/* Poll LdMdl bit to be 0 under 400ms */
++	do {
++		ret = regmap_read(map, MAX77818_Config2, &config2);
++		if (ret)
++			break;
++		if ((config2 & CONFIG2_LDMDL) == 0)
++			break;
++		if (time_after(jiffies, timeout))
++			break;
++	} while (1);
++
++	ret = regmap_read(map, MAX77818_Config2, &config2);
++	if (ret)
++		return ret;
++
++	return (config2 & CONFIG2_LDMDL) ? -ETIMEDOUT : 0;
++}
++
++static inline int max77818_read_of_property(struct max77818_chip *chip,
++				      const char *param,
++				      u16 *value)
++{
++	struct device_node *np = chip->dev->of_node;
++	int ret;
++
++	u16 read_value = 0;
++
++	ret = of_property_read_u16(np, param, &read_value);
++	if (!ret)
++		*value = read_value;
++
++	return ret;
++}
++
++static int  max77818_read_of_param_and_write(struct max77818_chip *chip,
++					  struct max77818_of_property *prop)
++{
++	u16 read_param;
++	int ret;
++
++	ret = max77818_read_of_property(chip, prop->property_name, &read_param);
++	if (!ret) {
++		dev_dbg(chip->dev, "Writing '%s' (reg 0x%02x): 0x%04x\n",
++			prop->property_name,
++			prop->register_addr,
++			read_param);
++
++		if (prop->require_lock) {
++			dev_dbg(chip->dev, "Applying lock\n");
++			mutex_lock(&chip->max77818_dev->lock);
++		}
++
++		ret = prop->reg_write_op(chip->regmap,
++					 prop->register_addr,
++					 read_param);
++		if (ret) {
++			dev_warn(chip->dev,
++				 "Failed to write '%s' property read from DT\n",
++				 prop->property_name);
++		}
++
++		if (prop->require_lock) {
++			dev_dbg(chip->dev, "Releasing lock\n");
++			mutex_unlock(&chip->max77818_dev->lock);
++		}
++	}
++	else if (ret == -EINVAL)
++		dev_warn(chip->dev,
++			 "'%s' property not given in DT, using default value\n",
++			 prop->property_name);
++	else
++		dev_warn(chip->dev,
++			 "Failed to read '%s' param from DT, check value\n",
++			 prop->property_name);
++
++	return ret;
++}
++
++static int max77818_unlock_extra_config_registers(struct max77818_chip *chip)
++{
++	struct regmap *map = chip->regmap;
++	u32 value;
++	int ret;
++
++	ret = regmap_write(map, MAX17042_VFSOC0Enable, VFSOC0_UNLOCK);
++	if (ret) {
++		dev_warn(chip->dev,
++			 "Failed to write VFSOC0Enable to unlock: %d\n", ret);
++		return ret;
++	}
++
++	ret = regmap_read(map, MAX17042_VFSOC, &value);
++	if (ret) {
++		dev_warn(chip->dev, "Failed to read VFSOC: %d\n", ret);
++		return ret;
++	}
++
++	return max77818_write_and_verify_reg(map, MAX17042_VFSOC0, value);
++}
++
++static int max77818_lock_extra_config_registers(struct max77818_chip *chip)
++{
++	struct regmap *map = chip->regmap;
++	int ret;
++
++	ret = regmap_write(map, MAX17042_VFSOC0Enable, VFSOC0_LOCK);
++	if (ret)
++		dev_warn(chip->dev,
++			 "Failed to write VFSOC0Enable to lock: %d\n", ret);
++
++	return ret;
++}
++
++static struct max77818_of_property max77818_temp_cfg[] = {
++	{ "maxim,tgain", MAX17042_TGAIN, regmap_write, false, false },
++	{ "maxim,toff", MAX17042_TOFF, regmap_write, false, false },
++	{ "maxim,tcurve", MAX77818_TCURVE, regmap_write, false, false },
++};
++
++static struct max77818_of_property max77818_relax_cfg =
++	{"maxim,relax-cfg", MAX17042_RelaxCFG, regmap_write, true, false };
++
++static struct max77818_of_property max77818_custom_param_list [] = {
++	{ "maxim,valrtth", MAX17042_VALRT_Th, regmap_write, false, false },
++
++	{ "maxim,learn-cfg", MAX17042_LearnCFG, regmap_write, true, false },
++
++	/* Verified and restored if required after reboot to ensure FGCC=1 */
++	/* Also marked to require lock */
++	{ "maxim,config", MAX17042_CONFIG, regmap_write, false, true},
++
++	{ "maxim,config2", MAX77818_Config2, regmap_write, false },
++	{ "maxim,full-soc-threshold", MAX17047_FullSOCThr, regmap_write, true, false },
++
++	/* learned value, skipped during verify/write operation at boot */
++	{ "maxim,fullcaprep", MAX17042_FullCAP0, max77818_write_and_verify_reg, true, false },
++
++	{ "maxim,design-cap", MAX17042_DesignCap, regmap_write, true, false },
++
++	/* learned values, skipped during verify/write operation at boot */
++	{ "maxim,dpacc", MAX17042_dPacc, max77818_write_and_verify_reg, true, false },
++	{ "maxim,dqacc", MAX17042_dQacc, max77818_write_and_verify_reg, true, false },
++	{ "maxim,fullcapnom", MAX17042_FullCAPNom, max77818_write_and_verify_reg, true, false },
++
++	{ "maxim,misc-cfg", MAX17042_MiscCFG, regmap_write, true, false },
++	{ "maxim,v-empty", MAX17047_V_empty, regmap_write, true, false },
++	{ "maxim,qresidual00", MAX17047_QRTbl00, max77818_write_and_verify_reg, true, false },
++	{ "maxim,qresidual10", MAX17047_QRTbl10, max77818_write_and_verify_reg, true, false },
++	{ "maxim,qresidual20", MAX17047_QRTbl20, max77818_write_and_verify_reg, true, false },
++	{ "maxim,qresidual30", MAX17047_QRTbl30, max77818_write_and_verify_reg, true, false },
++
++	/* learned value, skipped during verify/write operation at boot */
++	{ "maxim,rcomp0", MAX17042_RCOMP0, max77818_write_and_verify_reg, true, false },
++
++	{ "maxim,tempco", MAX17042_TempCo, max77818_write_and_verify_reg, true, false },
++	{ "maxim,ichg-term", MAX17042_ICHGTerm, regmap_write, true, false },
++	{ "maxim,filter-cfg", MAX17042_FilterCFG, regmap_write, true, false },
++
++	/* learned value, skipped during verify/write operation at boot */
++	{ "maxim,iavg-empty", MAX17042_IAvg_empty, regmap_write, true, false },
++
++	{ "maxim,talrt-th", MAX17042_TALRT_Th, regmap_write, false, false },
++	{ "maxim,talrt-th2", MAX77818_TALRT_Th2, regmap_write, false, false },
++	{ "maxim,jeita-curr", MAX77818_JEITA_Curr, regmap_write, false, false },
++	{ "maxim,jeita-volt", MAX77818_JEITA_Volt, regmap_write, false, false },
++	{ "maxim,chargestate0", MAX77818_ChargeState0, regmap_write, false, false },
++	{ "maxim,chargestate1", MAX77818_ChargeState1, regmap_write, false, false },
++	{ "maxim,chargestate2", MAX77818_ChargeState2, regmap_write, false, false },
++	{ "maxim,chargestate3", MAX77818_ChargeState3, regmap_write, false, false },
++	{ "maxim,chargestate4", MAX77818_ChargeState4, regmap_write, false, false },
++	{ "maxim,chargestate5", MAX77818_ChargeState5, regmap_write, false, false },
++	{ "maxim,chargestate6", MAX77818_ChargeState6, regmap_write, false, false },
++	{ "maxim,chargestate7", MAX77818_ChargeState7, regmap_write, false, false },
++
++	/* The order of the following ones should be respected */
++	{ "maxim,at-rate", MAX17042_AtRate, regmap_write, true, false },
++	{ "maxim,smart-chg-cfg", MAX77818_SmartChgCfg, regmap_write, false, false },
++	{ "maxim,convgcfg", MAX77818_ConvgCfg, regmap_write, true, false },
++};
++
++static int max77818_set_temperature_parameters(struct max77818_chip *chip)
++{
++	int ret = 0;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(max77818_temp_cfg); i++)
++		ret |= max77818_read_of_param_and_write(chip, &max77818_temp_cfg[i]);
++
++	return ret;
++}
++
++static bool max77818_write_all_custom_params(struct max77818_chip *chip)
++{
++	struct regmap *map = chip->regmap;
++	int ret, i;
++	bool is_success = true;
++
++	dev_dbg(chip->dev, "Writing custom params\n");
++
++	ret = regmap_write(map, MAX17042_RepCap, 0);
++	if (ret) {
++		dev_warn(chip->dev, "Failed to write RepCap: %d\n", ret);
++		is_success = false;
++	}
++
++	ret = max77818_read_of_param_and_write(chip, &max77818_relax_cfg);
++	if (ret)
++		is_success = false;
++
++	ret = max77818_unlock_extra_config_registers(chip);
++	if (ret)
++		is_success = false;
++
++	for(i = 0; i < ARRAY_SIZE(max77818_custom_param_list); i++) {
++		ret = max77818_read_of_param_and_write(chip,
++					      &max77818_custom_param_list[i]);
++		if (ret)
++			is_success = false;
++	}
++
++	max77818_lock_extra_config_registers(chip);
++
++	return is_success;
++}
++
++static int max77818_init_chip(struct max77818_chip *chip)
++{
++	struct regmap *map = chip->regmap;
++	int ret;
++	bool is_success;
++
++	/* Write cell characterization data */
++	ret = max77818_init_model(chip);
++	if (ret) {
++		dev_err(chip->dev, "init model failed: %d\n", ret);
++		return ret;
++	}
++
++	ret = max77818_verify_model_lock(chip);
++	if (ret) {
++		dev_err(chip->dev, "lock verify failed: %d\n", ret);
++		return ret;
++	}
++
++	/* Write custom parameters from device tree */
++	is_success = max77818_write_all_custom_params(chip);
++
++	/* Initiate model loading for MAX77818 */
++	ret = max77818_model_loading(chip);
++	if (ret) {
++		dev_err(chip->dev, "initiate model loading failed: %d\n", ret);
++		return ret;
++	}
++
++	/* Wait 500 ms for SOC to be calculated from the new parameters */
++	msleep(500);
++
++	/* Init complete, Clear the POR bit if successful */
++	if (is_success)
++		regmap_update_bits(map, MAX17042_STATUS, STATUS_POR, 0x0);
++
++	return 0;
++}
++
++static irqreturn_t max77818_fg_isr(int id, void *dev)
++{
++	struct max77818_chip *chip = dev;
++	struct power_supply *psy = chip->battery;
++	u32 val;
++	int ret;
++
++	ret = regmap_read(chip->regmap, MAX17042_STATUS, &val);
++	if (ret || val == 0)
++		goto done;
++
++	if (val & STATUS_DSOCI) {
++		u32 repsoc = 0;
++		int err;
++		union power_supply_propval pval;
++
++		/* Clear alert */
++		regmap_update_bits(chip->regmap, MAX17042_STATUS, STATUS_DSOCI, 0);
++
++		/* Force shutdown on critical capacity when battery is present */
++		power_supply_get_property(psy, POWER_SUPPLY_PROP_PRESENT, &pval);
++		err = regmap_read(chip->regmap, MAX17042_RepSOC, &repsoc);
++		if (err != 0)
++			dev_err(chip->dev, "Failed to read repsoc: %d\n", err);
++		else
++			dev_info(chip->dev, "Battery SOC change %d\n", repsoc >> 8);
++
++		if ((repsoc >> 8) < chip->pdata->critical_soc && pval.intval == 1) {
++			dev_err(chip->dev, "Battery capacity critical. repsoc: %x\n", repsoc);
++			__hw_protection_trigger("Battery critical capacity", 10000, HWPROT_ACT_SHUTDOWN);
++		}
++	}
++
++	if (val & STATUS_SMN) {
++		dev_info(chip->dev, "Alert: MIN SOC\n");
++		/* Set MinSocAlrt 0 to stop the alert */
++		regmap_update_bits(chip->regmap, MAX17042_SALRT_Th, 0xff,
++				   MIN_SOC_ALRT_DISABLE);
++		/* MAX77818 needs some time to get SOC alert actually stopped */
++		msleep(50);
++	}
++
++	if (val & STATUS_SMX) {
++		dev_info(chip->dev, "Alert: MAX SOC\n");
++		/* Set MaxSocAlrt 255 to stop the alert */
++		regmap_update_bits(chip->regmap, MAX17042_SALRT_Th, 0xff00,
++				   MAX_SOC_ALRT_DISABLE << 8);
++		msleep(50);
++	}
++
++	if (val & STATUS_TMN) {
++		dev_info(chip->dev, "Alert: MIN Temperature\n");
++		/* Set MinTempAlrt 0x80 to disable the alert */
++		regmap_update_bits(chip->regmap, MAX17042_TALRT_Th, 0xff, 0x80);
++		/* MAX77818 needs some time to get the alert actually stopped */
++		msleep(50);
++		thermal_zone_device_update(chip->tzd, THERMAL_EVENT_UNSPECIFIED);
++	}
++
++	if (val & STATUS_TMX) {
++		dev_info(chip->dev, "Alert: MAX Temperature\n");
++		/* Set MaxTempAlrt 0x7f to disable the alert */
++		regmap_update_bits(chip->regmap, MAX17042_TALRT_Th, 0xff00, 0x7f00);
++		msleep(50);
++		thermal_zone_device_update(chip->tzd, THERMAL_EVENT_UNSPECIFIED);
++	}
++
++	if (val & STATUS_VMN) {
++		dev_info(chip->dev, "Alert: MIN Voltage\n");
++		/* Set MinVoltageAlrt 0x00 to disable the alert */
++		regmap_update_bits(chip->regmap, MAX17042_VALRT_Th, 0xff, 0x0);
++		msleep(50);
++	}
++
++	if (val & STATUS_VMX) {
++		dev_info(chip->dev, "Alert: MAX Voltage\n");
++		/* Set MaxVoltageAlrt 0xff to disable the alert */
++		regmap_update_bits(chip->regmap, MAX17042_VALRT_Th, 0xff00, 0xff00);
++		msleep(50);
++	}
++
++	power_supply_changed(psy);
++
++done:
++	/* throttle low level interrupt as it does not clear immediately.
++	 * Typically it takes around 200ms to clear, after MAX17042_STATUS
++	 * has been cleared.
++	 */
++	msleep(200);
++
++	return IRQ_HANDLED;
++}
++
++static struct max77818_platform_data *
++max77818_get_pdata(struct max77818_chip *chip)
++{
++	struct max77818_platform_data *pdata;
++	struct device *dev = chip->dev;
++	struct device_node *np = dev->of_node;
++
++	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
++	if (!pdata)
++		return NULL;
++
++	if (of_property_read_u32(np, "maxim,rsns-microohm", &pdata->r_sns))
++		pdata->r_sns = MAX17042_DEFAULT_SNS_RESISTOR;
++
++	if (of_property_read_s32(np, "maxim,cold-temp", &pdata->temp_min))
++		pdata->temp_min = INT_MIN;
++	if (of_property_read_s32(np, "maxim,over-heat-temp", &pdata->temp_max))
++		pdata->temp_max = INT_MAX;
++
++	if (of_property_read_s32(np, "maxim,dead-volt", &pdata->vmin))
++		pdata->vmin = INT_MIN;
++	if (of_property_read_s32(np, "maxim,over-volt", &pdata->vmax))
++		pdata->vmax = INT_MAX;
++
++	if (of_property_read_u8(np, "maxim,min-soc-alert", &pdata->min_soc_alrt))
++		pdata->min_soc_alrt = MIN_SOC_ALRT_DISABLE;
++
++	if (of_property_read_u8(np, "maxim,max-soc-alert", &pdata->max_soc_alrt))
++		pdata->max_soc_alrt = MAX_SOC_ALRT_DISABLE;
++
++	if (of_property_read_u8(np, "maxim,critical-soc", &pdata->critical_soc))
++		pdata->critical_soc = CRITICAL_SOC_DEFAULT;
++
++	return pdata;
++}
++
++static void max77818_get_driver_config(struct max77818_chip *chip)
++{
++	struct device_node *np = chip->dev->of_node;
++	int read_value;
++	int ret;
++
++	ret = of_property_read_u32(np, "usb_safe_max_current", &read_value);
++	if (ret) {
++		dev_err(chip->dev,
++			"Failed to read usb_safe_max_current from DT\n");
++		chip->usb_safe_max_current = 100;
++	}
++	else {
++		dev_dbg(chip->dev,
++			"Read usb_safe_max_current: %d\n",
++			read_value);
++		chip->usb_safe_max_current = read_value;
++	}
++}
++
++static const struct regmap_config max77818_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 16,
++	.val_format_endian = REGMAP_ENDIAN_NATIVE,
++};
++
++static const struct power_supply_desc max77818_psy_desc = {
++	.name = "max77818_battery",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
++	.get_property = max77818_get_property,
++	.set_property = max77818_set_property,
++	.property_is_writeable = max77818_property_is_writeable,
++	.external_power_changed = max77818_external_power_changed,
++	.properties = max77818_battery_props,
++	.num_properties = ARRAY_SIZE(max77818_battery_props),
++	.no_thermal = true, /* self managed TZ */
++};
++
++/* Charger register bit for special use in FG thermal zone device
++ * This is to allow for powering device with only usb, but at the same time
++ * limiting the charger current/voltage. The IC does not support interrupt on
++ * values below 0C, so it is not able to transition into correct cooling trip
++ * when sudden jump in negative temperature.
++ * This happens in an open circuit NTC event.
++ */
++#define REG_CHG_CNFG_02			0xB9
++#define BIT_CHG_CC			GENMASK(5, 0)
++#define REG_CHG_CNFG_04			0xBB
++#define BIT_CHG_CV_PRM			GENMASK(5, 0)
++
++static int max77818_fg_tzd_read_temp(struct thermal_zone_device *tzd, int *temp)
++{
++	struct max77818_chip *chip = thermal_zone_device_priv(tzd);
++	struct max77818_dev *max77818 = chip->max77818_dev;
++	int ret;
++
++	ret = max77818_get_temperature(chip, temp);
++	if (ret)
++		return ret;
++
++	/* No battery - No NTC */
++	if (*temp < -100) {
++		regmap_update_bits(max77818->regmap_chg, REG_CHG_CNFG_02, BIT_CHG_CC, 0x0);
++		regmap_update_bits(max77818->regmap_chg, REG_CHG_CNFG_04, BIT_CHG_CV_PRM, 0x0);
++		*temp = THERMAL_TEMP_INVALID;
++		return ret;
++	}
++
++	/* Convert 0.1 degree Celsius to milli degree Celsius. */
++	*temp *= 100;
++
++	return ret;
++}
++
++static int max77818_fg_tzd_set_trips(struct thermal_zone_device *tzd, int low, int high)
++{
++	struct max77818_chip *chip = thermal_zone_device_priv(tzd);
++	u32 val;
++
++	/* MinTempAlrt */
++	if (low < 0)
++		val |= 0x80; /* Disable the alert */
++	else
++		val = (low / 1000) & 0xFF;
++
++	/* MaxTempAlrt */
++	val |= ((high / 1000) & 0xFF) << 8;
++
++	chip->talrth_cached = val;
++
++	regmap_write(chip->regmap, MAX17042_TALRT_Th, val);
++
++	return 0;
++}
++
++static struct thermal_zone_device_ops max77818_fg_tzd_ops = {
++	.get_temp = max77818_fg_tzd_read_temp,
++	.set_trips = max77818_fg_tzd_set_trips,
++};
++
++static int max77818_init_fg_interrupt_handling(struct max77818_dev *max77818,
++						struct max77818_chip *chip)
++{
++	struct device *dev = chip->dev;
++	int ret;
++	u32 val;
++
++	/* Enable temperature alert */
++	regmap_update_bits(chip->regmap, MAX77818_Config2, CONFIG2_TALRTEN, CONFIG2_TALRTEN);
++
++	/* Enable SOC 1% change alert */
++	regmap_set_bits(chip->regmap, MAX77818_Config2, CONFIG2_DSOCEN);
++
++	/* Set SAlrtTh */
++	val = chip->pdata->min_soc_alrt;
++	val |= chip->pdata->max_soc_alrt << 8;
++	regmap_write(chip->regmap, MAX17042_SALRT_Th, val);
++
++	chip->soc_min_cached = chip->pdata->min_soc_alrt;
++	chip->soc_max_cached = chip->pdata->max_soc_alrt;
++
++	/* Register irq handler for the FG interrupt */
++	chip->fg_irq = regmap_irq_get_virq(max77818->irqc_intsrc,
++					   MAX77818_FG_INT);
++	if (chip->fg_irq <= 0) {
++		dev_err(dev, "failed to get virq: %d\n", chip->fg_irq);
++		return -ENODEV;
++	}
++
++	ret = devm_request_threaded_irq(dev, chip->fg_irq, NULL,
++					max77818_fg_isr, 0,
++					chip->battery->desc->name,
++					chip);
++	if (ret) {
++		dev_err(dev, "failed to request irq: %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static const char *max77818_battery_status_str(int status)
++{
++	switch (status) {
++	case POWER_SUPPLY_STATUS_CHARGING:
++		return "charging";
++	case POWER_SUPPLY_STATUS_DISCHARGING:
++		return "discharging";
++	case POWER_SUPPLY_STATUS_NOT_CHARGING:
++		return "not-charging";
++	case POWER_SUPPLY_STATUS_FULL:
++		return "full";
++	default:
++		return "unknown";
++	}
++}
++
++static void max77818_log_battery_status(struct max77818_chip *chip)
++{
++	int err;
++	union power_supply_propval capacity;
++	union power_supply_propval status;
++
++	err = max77818_get_property(chip->battery,
++				    POWER_SUPPLY_PROP_CAPACITY_HIRES,
++				    &capacity);
++	if (err)
++		capacity.strval = "NA";
++
++	err = max77818_get_property(chip->battery,
++				    POWER_SUPPLY_PROP_STATUS,
++				    &status);
++	if (err)
++		status.intval = POWER_SUPPLY_STATUS_UNKNOWN;
++
++	dev_info(chip->dev, "Battery capacity: %s, Status: %s (%d)\n",
++		 capacity.strval, max77818_battery_status_str(status.intval), status.intval);
++}
++
++/* Charger register bit for special use in FG sys off handler */
++#define REG_CHG_INT_OK		0xB2
++#define BIT_CHGIN_OK		BIT(6)
++
++static int max77818_sys_off_handler(struct sys_off_data *sysoff)
++{
++	struct max77818_chip *chip = sysoff->cb_data;
++	struct max77818_dev *max77818 = chip->max77818_dev;
++	u32 val;
++
++	regmap_read(max77818->regmap_chg, REG_CHG_INT_OK, &val);
++	if (val & BIT_CHGIN_OK) {
++		dev_info(chip->dev, "Enable FGCC for charging in poweroff\n");
++
++		/* Set vbus limit to a safe/high value (3.2 A) to avoid vbus cut */
++		if (chip->vbus_limit)
++			regulator_set_current_limit(chip->vbus_limit, 0, 3200 * 1000);
++
++		regmap_set_bits(chip->regmap, MAX17042_CONFIG, CONFIG_SPR_11);
++
++		/* Wait a bit for kernel messages to be seen */
++		msleep(50);
++	}
++
++	return 0;
++}
++
++static int max77818_probe(struct platform_device *pdev)
++{
++	struct max77818_dev *max77818 = dev_get_drvdata(pdev->dev.parent);
++	struct power_supply_config psy_cfg = {};
++	struct device *dev = &pdev->dev;
++	struct max77818_chip *chip;
++	u32 val;
++	int ret;
++
++	chip = devm_kzalloc(dev, sizeof(*chip), GFP_KERNEL);
++	if (!chip)
++		return -ENOMEM;
++
++	mutex_init(&chip->lock);
++
++	chip->max77818_dev = max77818;
++	chip->dev = dev;
++	chip->regmap = max77818->regmap_fg;
++
++	chip->pdata = max77818_get_pdata(chip);
++	if (!chip->pdata) {
++		dev_err(dev, "no platform data provided\n");
++		return -EINVAL;
++	}
++
++	chip->vbus_limit = devm_regulator_get_optional(dev, "vbus-limit");
++	if (IS_ERR(chip->vbus_limit)) {
++		if (PTR_ERR(chip->vbus_limit) == -EPROBE_DEFER)
++			return -EPROBE_DEFER;
++
++		chip->vbus_limit = NULL;
++	}
++
++	/* Get non device related driver config from DT */
++	max77818_get_driver_config(chip);
++
++	platform_set_drvdata(pdev, chip);
++	psy_cfg.drv_data = chip;
++	psy_cfg.fwnode = dev_fwnode(dev);
++	psy_cfg.attr_grp = max77818_groups;
++
++	chip->battery = devm_power_supply_register(dev, &max77818_psy_desc,
++						   &psy_cfg);
++
++	if (IS_ERR(chip->battery)) {
++		ret = PTR_ERR(chip->battery);
++		dev_err_probe(dev, ret, "failed to register supply: %d \n", ret);
++		return ret;
++	}
++
++	chip->tzd = devm_thermal_of_zone_register(dev, 0, chip, &max77818_fg_tzd_ops);
++	if (IS_ERR(chip->tzd))
++		return dev_err_probe(dev, PTR_ERR(chip->tzd), "failed to register thermal zone\n");
++
++	regmap_read(chip->regmap, MAX17042_STATUS, &val);
++	if (val & STATUS_POR) {
++		ret = max77818_init_chip(chip);
++		if (ret) {
++			dev_err(chip->dev, "failed to init chip: %d\n", ret);
++			return ret;
++		}
++	}
++
++	ret = max77818_set_temperature_parameters(chip);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to set temperature parameters\n");
++
++	ret = max77818_init_fg_interrupt_handling(max77818, chip);
++	if (ret) {
++		dev_err(dev, "Failed to init FG interrupt handling\n");
++		return ret;
++	}
++
++	ret = devm_register_sys_off_handler(dev,
++					    SYS_OFF_MODE_POWER_OFF_PREPARE,
++					    SYS_OFF_PRIO_DEFAULT,
++					    max77818_sys_off_handler, chip);
++	if (ret) {
++		dev_err(dev, "Failed to register FG sys off handlder\n");
++		return ret;
++	}
++
++	device_init_wakeup(chip->dev, true);
++
++	max77818_log_battery_status(chip);
++
++	max77818_debugfs_add(chip);
++
++	return 0;
++}
++
++static void max77818_remove(struct platform_device *pdev)
++{
++	struct max77818_chip *chip = platform_get_drvdata(pdev);
++
++	max77818_debugfs_remove(chip);
++}
++
++static void max77818_recover_threshold_registers(struct max77818_chip *chip)
++{
++	u16 prev;
++	u32 cur;
++	int ret;
++	bool recovered = false;
++
++	/* Recover SAlrtTh */
++	prev = chip->soc_min_cached;
++	prev |= chip->soc_max_cached << 8;
++
++	ret = regmap_read(chip->regmap, MAX17042_SALRT_Th, &cur);
++	if (!ret && (cur != prev)) {
++		regmap_write(chip->regmap, MAX17042_SALRT_Th, prev);
++		dev_warn(chip->dev, "recovered SALRTTH %4x/%4x\n", prev, cur);
++		recovered = true;
++	}
++
++	/* Recover VAlrtTh */
++	max77818_read_of_property(chip, "maxim,valrtth", &prev);
++	ret = regmap_read(chip->regmap, MAX17042_VALRT_Th, &cur);
++	if (!ret && (cur != prev)) {
++		regmap_write(chip->regmap, MAX17042_VALRT_Th, prev);
++		dev_warn(chip->dev, "recovered VALRTTH %4x/%4x\n", prev, cur);
++		recovered = true;
++	}
++
++	/* Recover TAlrtTh */
++	prev = chip->talrth_cached;
++	ret = regmap_read(chip->regmap, MAX17042_TALRT_Th, &cur);
++	if (!ret && (cur != prev)) {
++		regmap_write(chip->regmap, MAX17042_TALRT_Th, prev);
++		dev_warn(chip->dev, "recovered TALRTTH %4x/%4x\n", prev, cur);
++		recovered = true;
++	}
++
++	/*
++	 * In case the interrupt was triggered because of wrong values,
++	 * sleep 200ms to let the interrupt release after we set
++	 * correct values. The IC has some internal timer, so this is not an
++	 * instant operation.
++	 */
++	if (recovered)
++		msleep(200);
++}
++
++static int max77818_fg_suspend(struct device *dev)
++{
++	struct max77818_chip *chip = dev_get_drvdata(dev);
++
++	disable_irq(chip->fg_irq);
++
++	return 0;
++}
++
++static int max77818_fg_resume(struct device *dev)
++{
++	struct max77818_chip *chip = dev_get_drvdata(dev);
++
++	max77818_recover_threshold_registers(chip);
++
++	enable_irq(chip->fg_irq);
++
++	return 0;
++}
++
++static int max77818_fg_suspend_noirq(struct device *dev)
++{
++	struct max77818_chip *chip = dev_get_drvdata(dev);
++
++	/*
++	 * Enable MAX77818 FG_INT at .noirq stage for wakeup, so that even if
++	 * there is an alert pending, FG driver won't be handling it.
++	 */
++	if (device_may_wakeup(dev)) {
++		/* We do not want to wake up on every 1% SOC drop */
++		regmap_clear_bits(chip->regmap, MAX77818_Config2, CONFIG2_DSOCEN);
++		max77818_unmask_intsrc(chip->max77818_dev, MAX77818_FG_INT);
++	}
++
++	return 0;
++}
++
++static int max77818_fg_resume_noirq(struct device *dev)
++{
++	struct max77818_chip *chip = dev_get_drvdata(dev);
++
++	if (device_may_wakeup(dev)) {
++		max77818_mask_intsrc(chip->max77818_dev, MAX77818_FG_INT);
++		regmap_set_bits(chip->regmap, MAX77818_Config2, CONFIG2_DSOCEN);
++	}
++
++	return 0;
++}
++
++static const struct dev_pm_ops max77818_fg_pm = {
++	SET_SYSTEM_SLEEP_PM_OPS(max77818_fg_suspend, max77818_fg_resume)
++	.suspend_noirq = max77818_fg_suspend_noirq,
++	.resume_noirq = max77818_fg_resume_noirq,
++};
++
++static const struct platform_device_id max77818_fg_id_table[] = {
++	{ MAX77818_FUELGAUGE_NAME },
++	{ }
++};
++MODULE_DEVICE_TABLE(platform, max77818_fg_id_table);
++
++static struct of_device_id max77818_fg_of_match[] = {
++	{ .compatible = "maxim,max77818-fuelgauge" },
++	{ },
++};
++MODULE_DEVICE_TABLE(of, max77818_fg_of_match);
++
++static struct platform_driver max77818_fg_driver = {
++	.driver = {
++		.name = MAX77818_FUELGAUGE_NAME,
++		.owner = THIS_MODULE,
++		.of_match_table = max77818_fg_of_match,
++		.pm = &max77818_fg_pm,
++	},
++	.probe = max77818_probe,
++	.remove = max77818_remove,
++	.id_table = max77818_fg_id_table,
++};
++module_platform_driver(max77818_fg_driver);
++
++MODULE_DESCRIPTION("MAX77818 Fuel Gauge");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/power/supply/power_supply_sysfs.c b/drivers/power/supply/power_supply_sysfs.c
+index f30a7b9cc..af3abd14c 100644
+--- a/drivers/power/supply/power_supply_sysfs.c
++++ b/drivers/power/supply/power_supply_sysfs.c
+@@ -148,6 +148,12 @@ static const char * const POWER_SUPPLY_CHARGE_BEHAVIOUR_TEXT[] = {
+ 	[POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE]		= "force-discharge",
+ };
+ 
++static const char * const POWER_SUPPLY_CHARGER_MODE_TEXT[] = {
++	[POWER_SUPPLY_MODE_CHARGER] = "Charger",
++	[POWER_SUPPLY_MODE_OTG_SUPPLY] = "OTG Supply",
++	[POWER_SUPPLY_MODE_ALL_OFF] = "Off",
++};
++
+ static struct power_supply_attr power_supply_attrs[] __ro_after_init = {
+ 	/* Properties of type `int' */
+ 	POWER_SUPPLY_ENUM_ATTR(STATUS),
+@@ -231,6 +237,8 @@ static struct power_supply_attr power_supply_attrs[] __ro_after_init = {
+ 	POWER_SUPPLY_ATTR(MODEL_NAME),
+ 	POWER_SUPPLY_ATTR(MANUFACTURER),
+ 	POWER_SUPPLY_ATTR(SERIAL_NUMBER),
++	POWER_SUPPLY_ENUM_ATTR(CHARGER_MODE),
++	POWER_SUPPLY_ATTR(CAPACITY_HIRES),
+ };
+ #define POWER_SUPPLY_ATTR_CNT ARRAY_SIZE(power_supply_attrs)
+ 
+@@ -399,6 +407,9 @@ static ssize_t power_supply_format_property(struct device *dev,
+ 	case POWER_SUPPLY_PROP_MODEL_NAME ... POWER_SUPPLY_PROP_SERIAL_NUMBER:
+ 		ret = sysfs_emit(buf, "%s\n", value.strval);
+ 		break;
++	case POWER_SUPPLY_PROP_CAPACITY_HIRES:
++		ret = sysfs_emit(buf, "%s\n", value.strval);
++		break;
+ 	default:
+ default_format:
+ 		if (ps_attr->text_values_len > 0 &&
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index d345e0289..e4c408764 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -447,6 +447,14 @@ config REGULATOR_G2194
+ 	help
+ 	  This driver supports the GMT G2194 e-paper display PMIC.
+ 
++config REGULATOR_MAX77818
++	tristate "Maxim MAX77818 voltage regulator"
++	depends on MFD_MAX77818
++	depends on I2C
++	help
++	  Say y here to support the regulator found in the Maxim Semiconductor
++	  MAX77818 multi-function device.
++
+ config REGULATOR_GPIO
+ 	tristate "GPIO regulator support"
+ 	depends on GPIOLIB || COMPILE_TEST
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index 873999859..b51319750 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -53,6 +53,7 @@ obj-$(CONFIG_REGULATOR_DB8500_PRCMU) += db8500-prcmu.o
+ obj-$(CONFIG_REGULATOR_FAN53555) += fan53555.o
+ obj-$(CONFIG_REGULATOR_FAN53880) += fan53880.o
+ obj-$(CONFIG_REGULATOR_G2194) += g2194-regulator.o
++obj-$(CONFIG_REGULATOR_MAX77818) += max77818-regulator.o
+ obj-$(CONFIG_REGULATOR_GPIO) += gpio-regulator.o
+ obj-$(CONFIG_REGULATOR_HI6421) += hi6421-regulator.o
+ obj-$(CONFIG_REGULATOR_HI6421V530) += hi6421v530-regulator.o
+diff --git a/drivers/regulator/max77818-regulator.c b/drivers/regulator/max77818-regulator.c
+new file mode 100644
+index 000000000..5ef2b3420
+--- /dev/null
++++ b/drivers/regulator/max77818-regulator.c
+@@ -0,0 +1,115 @@
++/*
++ * Copyright (c) 2014, The Linux Foundation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 and
++ * only version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * This driver is based on max77823-regulator.c
++ */
++
++#include <linux/version.h>
++#include <linux/err.h>
++#include <linux/slab.h>
++#include <linux/platform_device.h>
++#include <linux/regulator/driver.h>
++#include <linux/regmap.h>
++#include <linux/mfd/max77818/max77818.h>
++#include <linux/module.h>
++#include <linux/regulator/of_regulator.h>
++#include <linux/of.h>
++
++#define REG_SAFEOUTCTRL		0xC6
++#define BIT_SAFEOUT1		GENMASK(1, 0)
++#define BIT_SAFEOUT2		GENMASK(3, 2)
++#define BIT_ACTDISSAFEO1	BIT(4)
++#define BIT_ACTDISSAFEO2	BIT(5)
++#define BIT_ENSAFEOUT1		BIT(6)
++#define BIT_ENSAFEOUT2 		BIT(7)
++
++/* MAX77818 regulator IDs */
++enum max77818_regulators {
++	MAX77818_SAFEOUT1 = 0,
++	MAX77818_SAFEOUT2,
++};
++
++const static unsigned int max77818_safeout_volt_table[] =
++{
++	4850000, 4900000, 4950000, 3300000,
++};
++
++static struct regulator_ops max77818_safeout_ops = {
++	.list_voltage		= regulator_list_voltage_table,
++	.map_voltage		= regulator_map_voltage_ascend,
++	.is_enabled		= regulator_is_enabled_regmap,
++	.enable			= regulator_enable_regmap,
++	.disable		= regulator_disable_regmap,
++	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
++	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
++};
++
++#define REGULATOR_DESC_SFO(num, vsel_m, enable_m) { \
++	.name		= "SAFEOUT"#num, \
++	.of_match	= of_match_ptr("SAFEOUT"#num), \
++	.regulators_node = of_match_ptr("regulators"), \
++	.id		= MAX77818_SAFEOUT##num, \
++	.ops		= &max77818_safeout_ops, \
++	.type		= REGULATOR_VOLTAGE, \
++	.owner		= THIS_MODULE, \
++	.n_voltages	= ARRAY_SIZE(max77818_safeout_volt_table), \
++	.volt_table	= max77818_safeout_volt_table, \
++	.vsel_reg	= REG_SAFEOUTCTRL, \
++	.vsel_mask	= (vsel_m), \
++	.enable_reg	= REG_SAFEOUTCTRL, \
++	.enable_mask	= (enable_m), \
++}
++
++static const struct regulator_desc max77818_safeout_descs[] = {
++	REGULATOR_DESC_SFO(1, BIT_SAFEOUT1, BIT_ENSAFEOUT1),
++	REGULATOR_DESC_SFO(2, BIT_SAFEOUT2, BIT_ENSAFEOUT2),
++};
++
++static int max77818_regulator_probe(struct platform_device *pdev)
++{
++	struct max77818_dev *max77818 = dev_get_drvdata(pdev->dev.parent);
++	struct regulator_config config = {};
++	struct device *dev = &pdev->dev;
++	int i, ret;
++
++	config.dev = max77818->dev;
++	config.driver_data = max77818;
++	config.regmap = max77818->regmap_pmic;
++
++	for (i = 0; i < ARRAY_SIZE(max77818_safeout_descs); i++) {
++		struct regulator_dev *rdev;
++
++		rdev = devm_regulator_register(dev, &max77818_safeout_descs[i],
++					       &config);
++		if (IS_ERR(rdev)) {
++			ret = PTR_ERR(rdev);
++			dev_err(dev, "regulator init failed for %s: %d\n",
++				max77818_safeout_descs[i].name, ret);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++static struct platform_driver max77818_regulator_driver = {
++	.driver = {
++		   .name = MAX77818_REGULATOR_NAME,
++		   .owner = THIS_MODULE,
++	},
++	.probe = max77818_regulator_probe,
++};
++module_platform_driver(max77818_regulator_driver);
++
++MODULE_AUTHOR("TaiEup Kim<clark.kim@maximintegrated.com>");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("MAXIM 77818 Regulator Driver");
+diff --git a/include/linux/mfd/max77818/max77818.h b/include/linux/mfd/max77818/max77818.h
+new file mode 100644
+index 000000000..6a5c40fce
+--- /dev/null
++++ b/include/linux/mfd/max77818/max77818.h
+@@ -0,0 +1,58 @@
++/*
++ * MAX77818 Driver Core
++ *
++ * Copyright (C) 2014 Maxim Integrated
++ * TaiEup Kim <clark.kim@maximintegrated.com>
++ *
++ * Copyright and License statement to be determined with Customer.
++ * GNU Public License version 2 requires software code to be
++ * publically open source if the code is to be statically linked with
++ * the Linux kernel binary object.
++ */
++
++#include <linux/mutex.h>
++
++#ifndef __MAX77818_MFD_H__
++#define __MAX77818_MFD_H__
++
++#define MAX77818_REGULATOR_NAME		"max77818-regulator"
++#define MAX77818_CHARGER_NAME		"max77818-charger"
++#define MAX77818_FUELGAUGE_NAME		"max77818-fuelgauge"
++
++#define REG_INTSRCMASK			0x23
++
++/* Chip Interrupts */
++enum {
++	MAX77818_CHGR_INT = 0,
++	MAX77818_FG_INT,
++	MAX77818_SYS_INT,
++};
++
++struct max77818_dev {
++	struct device *dev;
++	int irq;
++
++	struct regmap_irq_chip_data *irqc_intsrc;
++
++	struct i2c_client *pmic;
++	struct i2c_client *chg;
++	struct i2c_client *fg;
++
++	struct regmap *regmap_pmic;
++	struct regmap *regmap_chg;
++	struct regmap *regmap_fg;
++
++	struct mutex lock;
++};
++
++static inline int max77818_mask_intsrc(struct max77818_dev *me, int id)
++{
++	return regmap_set_bits(me->regmap_pmic, REG_INTSRCMASK, 1 << id);
++}
++
++static inline int max77818_unmask_intsrc(struct max77818_dev *me, int id)
++{
++	return regmap_clear_bits(me->regmap_pmic, REG_INTSRCMASK, 1 << id);
++}
++
++#endif /* !__MAX77818_MFD_H__ */
+diff --git a/include/linux/power/max17042_battery.h b/include/linux/power/max17042_battery.h
+index 13aeab159..2d97dcc7a 100644
+--- a/include/linux/power/max17042_battery.h
++++ b/include/linux/power/max17042_battery.h
+@@ -170,6 +170,26 @@ enum max17047_register {
+ 	MAX17047_QRTbl30	= 0x42,
+ };
+ 
++/* Registers specific to max77818 */
++enum max77818_register {
++	MAX77818_TTF		= 0x20,
++	MAX77818_ConvgCfg	= 0x49,
++	MAX77818_TALRT_Th2	= 0xB2,
++	MAX77818_TCURVE		= 0xB9,
++	MAX77818_Config2	= 0xBB,
++	MAX77818_ChargeState0	= 0xD1,
++	MAX77818_ChargeState1	= 0xD2,
++	MAX77818_ChargeState2	= 0xD3,
++	MAX77818_ChargeState3	= 0xD4,
++	MAX77818_ChargeState4	= 0xD5,
++	MAX77818_ChargeState5	= 0xD6,
++	MAX77818_ChargeState6	= 0xD7,
++	MAX77818_ChargeState7	= 0xD8,
++	MAX77818_JEITA_Volt	= 0xD9,
++	MAX77818_JEITA_Curr	= 0xDA,
++	MAX77818_SmartChgCfg	= 0xDB,
++};
++
+ enum max77759_register {
+ 	MAX77759_AvgTA0		= 0x26,
+ 	MAX77759_AtTTF		= 0x33,
+@@ -195,6 +215,7 @@ enum max170xx_chip_type {
+ 	MAXIM_DEVICE_TYPE_MAX17047,
+ 	MAXIM_DEVICE_TYPE_MAX17050,
+ 	MAXIM_DEVICE_TYPE_MAX17055,
++	MAXIM_DEVICE_TYPE_MAX77818,
+ 	MAXIM_DEVICE_TYPE_MAX77759,
+ 
+ 	MAXIM_DEVICE_TYPE_NUM
+diff --git a/include/linux/power_supply.h b/include/linux/power_supply.h
+index 7a5e4c324..b507fd47e 100644
+--- a/include/linux/power_supply.h
++++ b/include/linux/power_supply.h
+@@ -100,6 +100,12 @@ enum {
+ 	POWER_SUPPLY_SCOPE_DEVICE,
+ };
+ 
++enum {
++	POWER_SUPPLY_MODE_CHARGER = 0,
++	POWER_SUPPLY_MODE_OTG_SUPPLY,
++	POWER_SUPPLY_MODE_ALL_OFF,
++};
++
+ enum power_supply_property {
+ 	/* Properties of type `int' */
+ 	POWER_SUPPLY_PROP_STATUS = 0,
+@@ -182,6 +188,12 @@ enum power_supply_property {
+ 	POWER_SUPPLY_PROP_MODEL_NAME,
+ 	POWER_SUPPLY_PROP_MANUFACTURER,
+ 	POWER_SUPPLY_PROP_SERIAL_NUMBER,
++
++	/* MAX77818 specific mode of operation (OTG supply/charger) */
++	POWER_SUPPLY_PROP_CHARGER_MODE,
++
++	/* MAX77818-battery specific property to get high resolution battery capacity */
++	POWER_SUPPLY_PROP_CAPACITY_HIRES,
+ };
+ 
+ enum power_supply_type {

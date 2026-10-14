@@ -1,0 +1,1427 @@
+From 402d11eae9e5ce9c82591f36dae71adfd89655cc Mon Sep 17 00:00:00 2001
+From: gitman-101111 <development@spamfolder.xyz>
+Date: Mon, 12 Oct 2026 10:23:09 -0600
+Subject: [PATCH] arm64: dts: freescale: add the reMarkable Paper Pro Move
+ (chiappa)
+
+NXP i.MX93 e-reader: eMMC root, IW611 WiFi on SDIO with Bluetooth over
+LPUART3, ChipIdea USB-C gadget behind a FUSB303B, MAX77818 charger and
+fuel gauge, PCA9451A system PMIC, G2194 EPD PMIC feeding the cumulus
+e-paper panel over the 16-bit parallel display bus, Elan SPI touch/pen,
+AW99703 front light, LIS2DW12 accelerometer, SLG46824 wake controller,
+CTN730 marker charger, and the BBNSM GPR cells reMarkable's U-Boot uses
+for A/B slot selection. Rewritten against the mainline SoC description
+from reMarkable's downstream chiappa.dtsi; a ramoops region is reserved
+since the serial console is only reachable by teardown.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ arch/arm64/boot/dts/freescale/Makefile        |    1 +
+ .../freescale/imx93-remarkable-chiappa.dts    | 1386 +++++++++++++++++
+ 2 files changed, 1387 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/freescale/imx93-remarkable-chiappa.dts
+
+diff --git a/arch/arm64/boot/dts/freescale/Makefile b/arch/arm64/boot/dts/freescale/Makefile
+index 8ddaab127..7232ac6c8 100644
+--- a/arch/arm64/boot/dts/freescale/Makefile
++++ b/arch/arm64/boot/dts/freescale/Makefile
+@@ -597,6 +597,7 @@ dtb-$(CONFIG_ARCH_MXC) += imx93-14x14-evk.dtb
+ dtb-$(CONFIG_ARCH_MXC) += imx93-kontron-bl-osm-s.dtb
+ dtb-$(CONFIG_ARCH_MXC) += imx93-phyboard-nash.dtb
+ dtb-$(CONFIG_ARCH_MXC) += imx93-phyboard-segin.dtb
++dtb-$(CONFIG_ARCH_MXC) += imx93-remarkable-chiappa.dtb
+ 
+ imx93-phyboard-nash-jtag-dtbs += imx93-phyboard-nash.dtb imx93-phyboard-nash-jtag.dtbo
+ imx93-phyboard-nash-peb-wlbt-07-dtbs += imx93-phyboard-nash.dtb imx93-phyboard-nash-peb-wlbt-07.dtbo
+diff --git a/arch/arm64/boot/dts/freescale/imx93-remarkable-chiappa.dts b/arch/arm64/boot/dts/freescale/imx93-remarkable-chiappa.dts
+new file mode 100644
+index 000000000..22b05eb5d
+--- /dev/null
++++ b/arch/arm64/boot/dts/freescale/imx93-remarkable-chiappa.dts
+@@ -0,0 +1,1386 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * reMarkable Paper Pro Move (codename chiappa)
++ *
++ * Board support derived from reMarkable's downstream chiappa.dtsi
++ * (Copyright 2022 NXP, Copyright 2025 reMarkable AS), rewritten against
++ * the mainline i.MX93 SoC description.
++ */
++
++/dts-v1/;
++
++#include <dt-bindings/clock/imx93-clock.h>
++#include <dt-bindings/input/input.h>
++#include "imx93.dtsi"
++
++/ {
++	/*
++	 * Keep the vendor DT's model string: userspace (KoReader among others)
++	 * identifies the device through /sys/devices/soc0/machine.
++	 */
++	model = "reMarkable Chiappa";
++	compatible = "remarkable,chiappa", "fsl,imx93";
++
++	aliases {
++		gpio0 = &gpio1;
++		gpio1 = &gpio2;
++		gpio2 = &gpio3;
++		gpio3 = &gpio4;
++		i2c0 = &lpi2c1;
++		i2c1 = &lpi2c2;
++		i2c4 = &lpi2c5;
++		mmc0 = &usdhc1;
++		mmc2 = &usdhc3;
++		rtc0 = &bbnsm_rtc;
++		serial1 = &lpuart2;
++		serial2 = &lpuart3;
++	};
++
++	chosen {
++		stdout-path = &lpuart2;
++	};
++
++	a55_opp_table: opp-table {
++		compatible = "operating-points-v2";
++		opp-shared;
++
++		opp-900000000 {
++			opp-hz = /bits/ 64 <900000000>;
++		};
++
++		opp-1700000000 {
++			opp-hz = /bits/ 64 <1700000000>;
++		};
++	};
++
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		linux,cma {
++			compatible = "shared-dma-pool";
++			reusable;
++			alloc-ranges = <0 0x80000000 0 0x40000000>;
++			size = <0 0x8000000>;
++			linux,cma-default;
++		};
++
++		/*
++		 * Crash log store. The device has no accessible UART, so a
++		 * panic is only readable through pstore on the next boot.
++		 */
++		ramoops@a4000000 {
++			compatible = "ramoops";
++			reg = <0 0xa4000000 0 0x100000>;
++			record-size = <0x20000>;
++			console-size = <0x80000>;
++			pmsg-size = <0x20000>;
++			ecc-size = <16>;
++		};
++
++		/* EdgeLock Enclave firmware communication area. */
++		ele_reserved: ele-reserved@a4120000 {
++			compatible = "shared-dma-pool";
++			reg = <0 0xa4120000 0 0x100000>;
++			no-map;
++		};
++	};
++
++	/*
++	 * A/B slot state, boot error counters and rescue flags shared with
++	 * the vendor U-Boot through the BBNSM general purpose registers.
++	 */
++	lpgpr {
++		compatible = "remarkable,lpgpr";
++		nvmem-cells = <&shutdown_state>,
++			      <&boot_flow>,
++			      <&root_state>,
++			      <&boot_id>,
++			      <&factory_mode>,
++			      <&secboot>,
++			      <&lock_dirty>,
++			      <&arb_index>,
++			      <&swu_status>,
++			      <&swu_recovery>,
++			      <&swu_applied>,
++			      <&wake_splash>,
++			      <&device_type>,
++			      <&srk_hash>,
++			      <&srk_revoke>,
++			      <&usb_vid_pid_ipl>;
++		nvmem-cell-names = "shutdown_state",
++				   "boot_flow",
++				   "root_state",
++				   "boot_id",
++				   "factory_mode",
++				   "secboot",
++				   "lock_dirty",
++				   "arb_index",
++				   "swu_status",
++				   "swu_recovery",
++				   "swu_applied",
++				   "wake_splash",
++				   "device_type",
++				   "srk_hash",
++				   "srk_revoke",
++				   "usb_vid_pid_ipl";
++	};
++
++	reboot-mode {
++		compatible = "nvmem-reboot-mode";
++		nvmem-cells = <&reboot_mode>;
++		nvmem-cell-names = "reboot-mode";
++		mode-normal = <0>;
++		mode-verity = <1>;
++		mode-factory-reset = <2>;
++		mode-bootloader = <4>;
++		mode-recovery = <8>;
++		mode-unlock = <12>;
++		mode-lock = <13>;
++	};
++
++	reg_vref_1v8: regulator-adc-vref {
++		compatible = "regulator-fixed";
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_adcref>;
++		regulator-name = "vref_1v8";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		gpio = <&gpio4 0 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <10000>;
++	};
++
++	reg_epd_pmic: regulator-epd-pmic {
++		compatible = "regulator-fixed";
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_g2194_ps>;
++		regulator-name = "G2194_PS";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		gpio = <&gpio4 19 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-always-on;
++		regulator-boot-on;
++	};
++
++	reg_nfc: regulator-nfc {
++		compatible = "regulator-fixed";
++		regulator-name = "NFC_PWR_EN";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		gpio = <&spld_gpio 6 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <1000>;
++		off-on-delay-us = <15000>;
++	};
++
++	reg_touch: regulator-touch {
++		compatible = "regulator-fixed";
++		regulator-name = "VDD_TOUCH_3V3";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_touch_pwr>;
++		gpio = <&gpio4 3 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		vin-supply = <&buck4>;
++		startup-delay-us = <500>;
++	};
++
++	reg_wifi: regulator-wifi {
++		compatible = "regulator-fixed";
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_wifi_reg>;
++		regulator-name = "WIFI_3V3";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		gpio = <&gpio4 1 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		vin-supply = <&buck4>;
++	};
++
++	wifi_pwrseq: wifi-pwrseq {
++		compatible = "mmc-pwrseq-simple";
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_wifi_pwrseq>;
++		reset-gpios = <&gpio4 15 GPIO_ACTIVE_LOW>;
++	};
++
++	/* Allow userspace to control NVCC_SD2 via sysfs */
++	nvcc-sd2-regulator {
++		compatible = "regulator-output";
++		vout-supply = <&ldo5>;
++	};
++
++	gpio_hall_sensors: gpio-hall-sensors {
++		compatible = "gpio-keys";
++		label = "Hall effect sensors";
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_hall_sensors>;
++
++		hall1: hall-sensor-1 {
++			label = "Folio sensor";
++			gpios = <&gpio3 7 GPIO_ACTIVE_HIGH>;
++			linux,input-type = <EV_SW>;
++			linux,code = <SW_LID>;
++			linux,can-disable;
++			wakeup-source;
++		};
++
++		hall2: hall-sensor-2 {
++			label = "Pen holder Sensor (NFC)";
++			gpios = <&gpio3 6 GPIO_ACTIVE_HIGH>;
++			linux,input-type = <EV_SW>;
++			linux,code = <SW_PEN_INSERTED>;
++			linux,can-disable;
++			wakeup-source;
++		};
++	};
++
++	/*
++	 * E Ink Gallery 3 panel behind reMarkable's "cumulus" controller,
++	 * fed RGB565 over the 16-bit parallel display interface. The node
++	 * name is part of the userspace ABI (/sys/devices/platform/cumulus-panel).
++	 */
++	cumulus-panel {
++		compatible = "remarkable,cumulus-panel";
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_cumulus>;
++		oeh-gpios = <&gpio2 20 GPIO_ACTIVE_HIGH>;
++		oev-gpios = <&gpio2 21 GPIO_ACTIVE_HIGH>;
++		vgl-supply = <&vgl_reg>;
++		vneg3-supply = <&vneg3_reg>;
++		vneg2-supply = <&vneg2_reg>;
++		vneg1-supply = <&vneg1_reg>;
++		vpos3-supply = <&vpos3_reg>;
++		vpos2-supply = <&vpos2_reg>;
++		vpos1-supply = <&vpos1_reg>;
++		vgh2-supply = <&vgh2_reg>;
++		vpdd-supply = <&vpdd_reg>;
++		vcom-supply = <&vcom_reg>;
++		vcom-voltage = <500000>;
++
++		port {
++			panel_in: endpoint {
++				remote-endpoint = <&dpi_to_panel>;
++			};
++		};
++
++		display-timings {
++			native-mode = <&timing0>;
++			timing0: timing {
++				clock-frequency = <56000000>;
++				hactive = <365>;
++				vactive = <1700>;
++				hfront-porch = <1>;
++				hback-porch = <1>;
++				hsync-len = <1>;
++				vback-porch = <1>;
++				vfront-porch = <88>;
++				vsync-len = <1>;
++				hsync-active = <0>;
++				vsync-active = <0>;
++				de-active = <0>;
++				pixelclk-active = <0>;
++			};
++		};
++	};
++
++	ntc: temp-sense1 {
++		compatible = "tdk,ntcg103jf103ft1";
++		io-channels = <&adc1 2>;
++		pullup-uv = <1800000>;
++		pullup-ohm = <10000>;
++		pulldown-ohm = <0>;
++		#thermal-sensor-cells = <0>;
++	};
++
++	thermal-zones {
++		batt_thermal_ntc: batt-thermal-ntc {
++			thermal-sensors = <&max77818_fg>;
++
++			trips {
++				batt_glacial: trip0 {
++					temperature = <0>;
++					hysteresis = <0>;
++					type = "passive";
++				};
++
++				batt_cold: trip1 {
++					temperature = <5000>;
++					hysteresis = <0>;
++					type = "passive";
++				};
++
++				batt_cool: trip2 {
++					temperature = <15000>;
++					hysteresis = <0>;
++					type = "passive";
++				};
++
++				batt_warm: trip3 {
++					temperature = <45000>;
++					hysteresis = <0>;
++					type = "passive";
++				};
++
++				batt_hot: trip4 {
++					temperature = <53000>;
++					hysteresis = <0>;
++					type = "passive";
++				};
++
++				/* HW protection shutdown at 55 C */
++				batt_critical: trip5 {
++					temperature = <55000>;
++					hysteresis = <0>;
++					type = "critical";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					trip = <&batt_glacial>;
++					cooling-device = <&max77818_chg 0 0>;
++				};
++
++				map1 {
++					trip = <&batt_cold>;
++					cooling-device = <&max77818_chg 1 1>;
++				};
++
++				map2 {
++					trip = <&batt_cool>;
++					cooling-device = <&max77818_chg 2 2>;
++				};
++
++				map3 {
++					trip = <&batt_warm>;
++					cooling-device = <&max77818_chg 3 3>;
++				};
++
++				map4 {
++					trip = <&batt_hot>;
++					cooling-device = <&max77818_chg 4 4>;
++				};
++			};
++		};
++	};
++};
++
++&A55_0 {
++	clocks = <&clk IMX93_CLK_A55_CORE>;
++	operating-points-v2 = <&a55_opp_table>;
++};
++
++&A55_1 {
++	clocks = <&clk IMX93_CLK_A55_CORE>;
++	operating-points-v2 = <&a55_opp_table>;
++};
++
++&adc1 {
++	vref-supply = <&reg_vref_1v8>;
++	#io-channel-cells = <1>;
++	status = "okay";
++};
++
++&bbnsm {
++	bbnsm_gpr: gpr {
++		compatible = "fsl,imx93-bbnsm-gpr";
++		#address-cells = <1>;
++		#size-cells = <1>;
++
++		reboot_mode: reboot-mode@0 {
++			/* GPR0[3:0] */
++			reg = <0x0 0x4>;
++			bits = <0 4>;
++		};
++
++		root_state: root-state@0 {
++			/* GPR0[9:4] */
++			reg = <0x0 0x4>;
++			bits = <4 6>;
++		};
++
++		boot_flow: boot-flow@0 {
++			/* GPR0[10] */
++			reg = <0x0 0x4>;
++			bits = <10 1>;
++		};
++
++		factory_mode: fac-mode@0 {
++			/* GPR0[13:12] */
++			reg = <0x0 0x4>;
++			bits = <12 2>;
++		};
++
++		secboot: secboot@0 {
++			/* GPR0[14] */
++			reg = <0x0 0x4>;
++			bits = <14 1>;
++		};
++
++		shutdown_state: shutdown-state@0 {
++			/* GPR0[17:16] */
++			reg = <0x0 0x4>;
++			bits = <16 2>;
++		};
++
++		swu_status: swu-status@0 {
++			/* GPR0[20:18] */
++			reg = <0x0 0x4>;
++			bits = <18 3>;
++		};
++
++		swu_recovery: swu-recovery@0 {
++			/* GPR0[21] */
++			reg = <0x0 0x4>;
++			bits = <21 1>;
++		};
++
++		swu_applied: swu-applied@0 {
++			/* GPR0[22] */
++			reg = <0x0 0x4>;
++			bits = <22 1>;
++		};
++
++		wake_splash: wake-splash@0 {
++			/* GPR0[24] */
++			reg = <0x0 0x4>;
++			bits = <24 1>;
++		};
++
++		boot_id: boot-id@8 {
++			/* GPR2[31:0] + GPR3[31:0] */
++			reg = <0x8 0x8>;
++		};
++	};
++};
++
++&bbnsm_pwrkey {
++	linux,keycode = <KEY_POWER>;
++	wakeup-source;
++};
++
++&dpi_bridge {
++	pinctrl-names = "default", "gpio";
++	pinctrl-0 = <&pinctrl_parallel_disp>;
++	pinctrl-1 = <&pinctrl_parallel_disp_gpio>;
++	status = "okay";
++};
++
++&dpi_to_panel {
++	remote-endpoint = <&panel_in>;
++};
++
++&gpio2 {
++	/* avoid power leakage */
++	disp-clk-hog {
++		gpio-hog;
++		gpios = <0 GPIO_ACTIVE_HIGH>;
++		output-low;
++	};
++};
++
++&gpio4 {
++	gpio-line-names =
++		"ADC_EN",
++		"WIFI_PWR_EN",
++		"LIGHT_SENSE_C",
++		"TOUCH_PWR_EN",
++		"BT_UART_RTS",
++		"BT_UART_TXD",
++		"IND_RST_BT",
++		"IND_RST_WL",
++		"BT_HOST_WAKE",
++		"BT_DEV_WAKE",
++		"BT_UART_RXD",
++		"BT_UART_CTS",
++		"WIFI_DEV_WAKE",
++		"WIFI_HOST_WAKE",
++		"LED_EN",
++		"WIFI_PWDN_N",
++		"I2S_DOUT",
++		"G2194_EN",
++		"G2194_PG",
++		"G2194_PS",
++		"I2S_LRCLK",
++		"I2S_BCLK",
++		"I2S_DIN",
++		"G2194_VCOM_TOGGLE_SEL1",
++		"TOUCH_RESET_1V8",
++		"G2194_VCOM_EN",
++		"I2S_CCLK",
++		"G2194_VCOM_TOGGLE_SEL0";
++};
++
++&lcdif {
++	/* 56 MHz panel clock = video PLL at 168 MHz / 3 */
++	assigned-clocks = <&clk IMX93_CLK_VIDEO_PLL>,
++			  <&clk IMX93_CLK_MEDIA_DISP_PIX>;
++	assigned-clock-rates = <168000000>, <56000000>;
++	status = "okay";
++};
++
++&lpi2c1 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	clock-frequency = <400000>;
++	pinctrl-names = "default", "sleep";
++	pinctrl-0 = <&pinctrl_lpi2c1>;
++	pinctrl-1 = <&pinctrl_lpi2c1>;
++	status = "okay";
++
++	max77818: pmic@66 {
++		compatible = "maxim,max77818";
++		reg = <0x66>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_max77818>;
++		interrupt-parent = <&gpio3>;
++		interrupts = <2 IRQ_TYPE_LEVEL_HIGH>;
++
++		max77818_chg: charger {
++			compatible = "maxim,max77818-charger";
++			fast_charge_current = <2300>; /* mA */
++			fast_charge_timer = <16>; /* 16h */
++			charge_termination_voltage = <4400>; /* mV */
++			vsys_min = <3400>; /* mV */
++			default_current_limit = <900>; /* mA */
++			input_current_limit_chgin = <3000>; /* mA */
++			topoff_current = <100>; /* mA */
++			#cooling-cells = <2>;
++			thermal-charge-table = <0 100 3650>,  /* glacial (below 5 C): not charge */
++					       <1 700 4400>,  /* cold (5 ~ 15 C): 700mA 4.4V */
++					       <2 2300 4400>, /* cool (15 ~ 45 C): 2300mA 4.4V */
++					       <3 800 4100>,  /* warm (45 ~ 53 C): 800mA 4.1V */
++					       <4 100 3650>;  /* hot (53 ~ 55 C): not charge */
++		};
++
++		max77818_fg: fuelgauge {
++			compatible = "maxim,max77818-fuelgauge";
++			#thermal-sensor-cells = <0>;
++			usb_safe_max_current = <500>; /* mA */
++			maxim,over-heat-temp = <600>; /* tenths of degree Celsius */
++			maxim,cold-temp = <(-200)>;
++			maxim,over-volt = <4400>; /* mV */
++			maxim,dead-volt = <3000>;
++			maxim,valrtth = /bits/ 16 <0xFF00>; /* 0xFF00 == Disable */
++			maxim,min-soc-alert = /bits/ 8 <10>; /* in percent, 0 means disable */
++			maxim,max-soc-alert = /bits/ 8 <255>; /* in percent, 255 means disable */
++			maxim,critical-soc = /bits/ 8 <6>; /* force shutdown if SOC goes below it */
++			maxim,at-rate = /bits/ 16 <0x1900>;
++			maxim,design-cap = /bits/ 16 <0x11f1>;
++			maxim,config = /bits/ 16 <0x0214>; /* FGCC disabled */
++			maxim,config2 = /bits/ 16 <0x0010>;
++			maxim,convgcfg = /bits/ 16 <0x2241>;
++			maxim,dpacc = /bits/ 16 <0x3200>;
++			maxim,dqacc = /bits/ 16 <0x047c>;
++			maxim,filter-cfg = /bits/ 16 <0xcea4>;
++			maxim,fullcapnom = /bits/ 16 <0x11f0>;
++			maxim,fullcaprep = /bits/ 16 <0x11f0>;
++			maxim,full-soc-threshold = /bits/ 16 <0x5f00>;
++			maxim,iavg-empty = /bits/ 16 <0x0e5a>;
++			maxim,ichg-term = /bits/ 16 <0x0780>;
++			maxim,learn-cfg = /bits/ 16 <0x2602>;
++			maxim,misc-cfg = /bits/ 16 <0x3870>;
++			maxim,qresidual00 = /bits/ 16 <0x2200>;
++			maxim,qresidual10 = /bits/ 16 <0x1080>;
++			maxim,qresidual20 = /bits/ 16 <0x0780>;
++			maxim,qresidual30 = /bits/ 16 <0x0580>;
++			maxim,rcomp0 = /bits/ 16 <0x0026>;
++			maxim,relax-cfg = /bits/ 16 <0x043c>;
++			/* SmartChg Enabled, SmartFull enabled */
++			maxim,smart-chg-cfg = /bits/ 16 <0x0013>;
++			maxim,tempco = /bits/ 16 <0x1114>;
++			maxim,v-empty = /bits/ 16 <0x965a>;
++			maxim,tgain = /bits/ 16 <0xee56>; /* 0xee56 => -4522/64=-70.656 C */
++			maxim,toff = /bits/ 16 <0x1da4>; /* 0x1da4 => 7588*(2^-7)=59.28 */
++			maxim,tcurve = /bits/ 16 <0x0025>;
++			maxim,talrt-th = /bits/ 16 <0x2d0a>; /* T2 = 10 deg/T2 = 45 deg */
++			maxim,talrt-th2 = /bits/ 16 <0x3700>; /* T1 = 0 deg/T4 = 55 deg */
++			maxim,jeita-curr = /bits/ 16 <0x18d0>; /* 19%/100%/19% */
++			maxim,jeita-volt = /bits/ 16 <0xfc9f>; /* 4.4V/4.4V/4.1V */
++			maxim,chargestate0 = /bits/ 16 <0x101e>;
++			maxim,chargestate1 = /bits/ 16 <0x0c1e>;
++			maxim,chargestate2 = /bits/ 16 <0x0c1e>;
++			maxim,chargestate3 = /bits/ 16 <0x0c1e>;
++			maxim,chargestate4 = /bits/ 16 <0x0c1e>;
++			maxim,chargestate5 = /bits/ 16 <0x0c1e>;
++			maxim,chargestate6 = /bits/ 16 <0x0c1e>;
++			maxim,chargestate7 = /bits/ 16 <0x0c1e>;
++			maxim,cell-model-data = /bits/ 16 <
++				0x9640 0xb720 0xb800 0xb910
++				0xbab0 0xbc90 0xbd90 0xbf20
++				0xbfe0 0xc150 0xc460 0xc790
++				0xca90 0xcc80 0xd260 0xd810
++				0x0060 0x1d20 0x1400 0x0c00
++				0x1410 0x1e10 0x0d00 0x29c0
++				0x0ef0 0x08f0 0x07f0 0x07a0
++				0x0ad0 0x06e0 0x06d0 0x06d0
++				0x0200 0x0200 0x0200 0x0200
++				0x0200 0x0200 0x0200 0x0200
++				0x0200 0x0200 0x0200 0x0200
++				0x0200 0x0200 0x0200 0x0200
++			>;
++		};
++	};
++
++	spld: spld@8 {
++		compatible = "renesas,slg46824";
++		reg = <0x8>;
++
++		spld_gpio: gpio {
++			compatible = "renesas,slg46824-gpio";
++			gpio-controller;
++			#gpio-cells = <2>;
++			gpio-line-names =
++				"EN_FOLIO_INT",
++				"",
++				"EN_PEN_HALL_INT",
++				"EN_1V8_PERIPH",
++				"EN_LOW_BAT_INT",
++				"SOC_IS_IN_SUSPEND",
++				"EN_NFC_PWR",
++				"LATCH_RESET_N";
++		};
++
++		wakeup-controller {
++			compatible = "renesas,slg46824-wakeup";
++			irq-mask-folio-gpios = <&spld_gpio 0 GPIO_ACTIVE_LOW>;
++			irq-mask-pen-gpios = <&spld_gpio 2 GPIO_ACTIVE_LOW>;
++			en-1v8-periph-gpios = <&spld_gpio 3 GPIO_ACTIVE_HIGH>;
++			irq-mask-low-bat-gpios = <&spld_gpio 4 GPIO_ACTIVE_LOW>;
++			flag-soc-in-suspend-gpios = <&spld_gpio 5 GPIO_ACTIVE_HIGH>;
++			latch-reset-gpios = <&spld_gpio 7 GPIO_ACTIVE_LOW>;
++		};
++	};
++
++	accelerometer: accelerometer@19 {
++		compatible = "st,lis2dw12";
++		reg = <0x19>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_accelerometer>;
++		interrupt-parent = <&gpio3>;
++		/* INT1 sits low while the sensor is powered down, so no level IRQ */
++		interrupts = <3 IRQ_TYPE_EDGE_FALLING>;
++		st,drdy-int-pin = <1>;
++		wakeup-source;
++		mount-matrix = "1", "0", "0",
++			       "0", "-1", "0",
++			       "0", "0", "-1";
++	};
++
++	g2194: pmic@48 {
++		compatible = "gmt,g2194-regulator";
++		reg = <0x48>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_g2194>;
++		enable-gpios = <&gpio4 17 GPIO_ACTIVE_HIGH>;
++		power-good-gpios = <&gpio4 18 GPIO_ACTIVE_HIGH>;
++		epd-vdd-gpios = <&gpio2 26 GPIO_ACTIVE_HIGH>;
++		epd-xon-gpios = <&gpio2 24 GPIO_ACTIVE_HIGH>;
++		vin-power-supply = <&max77818_fg>;
++		en-supply = <&reg_epd_pmic>;
++		min-battery = <6>;
++		gmt,soft-start = <0x03>;
++		gmt,7-level-vgh2-only;
++		gmt,enable-pdd;
++
++		regulators {
++			vpx_reg: VPX {
++				regulator-min-microvolt = <24000000>;
++				gmt,tdly = <0x00>;
++			};
++
++			vgl_reg: VGL {
++				regulator-min-microvolt = <38000000>;
++				gmt,tdly = <0x00>;
++			};
++
++			vneg3_reg: VNEG3 {
++				regulator-min-microvolt = <9000000>;
++				regulator-max-microvolt = <30483000>;
++				gmt,tdly = <0x00>;
++			};
++
++			vneg2_reg: VNEG2 {
++				regulator-min-microvolt = <5000000>;
++				regulator-max-microvolt = <20345000>;
++				gmt,tdly = <0x00>;
++			};
++
++			vneg1_reg: VNEG1 {
++				regulator-min-microvolt = <2000000>;
++				regulator-max-microvolt = <12230000>;
++				gmt,tdly = <0x00>;
++			};
++
++			vpos3_reg: VPOS3 {
++				regulator-min-microvolt = <9000000>;
++				regulator-max-microvolt = <30483000>;
++				gmt,tdly = <0x00>;
++			};
++
++			vpos2_reg: VPOS2 {
++				regulator-min-microvolt = <5000000>;
++				regulator-max-microvolt = <20345000>;
++				gmt,tdly = <0x00>;
++			};
++
++			vpos1_reg: VPOS1 {
++				regulator-min-microvolt = <2000000>;
++				regulator-max-microvolt = <12230000>;
++				gmt,tdly = <0x00>;
++			};
++
++			vgh1_reg: VGH1 {
++				regulator-min-microvolt = <38000000>;
++				gmt,tdly = <0x00>;
++				regulator-active-discharge = <0>;
++			};
++
++			vgh2_reg: VGH2 {
++				regulator-min-microvolt = <38000000>;
++				regulator-active-discharge = <1>;
++			};
++
++			vpdd_reg: VPDD {
++				regulator-min-microvolt = <2000000>;
++				regulator-max-microvolt = <10000000>;
++			};
++
++			vcom_reg: VCOM {
++				regulator-min-microvolt = <19600>;
++				regulator-max-microvolt = <4998000>;
++				regulator-active-discharge = <1>;
++			};
++		};
++	};
++};
++
++&lpi2c2 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	clock-frequency = <400000>;
++	pinctrl-names = "default", "sleep", "gpio";
++	pinctrl-0 = <&pinctrl_lpi2c2>;
++	pinctrl-1 = <&pinctrl_lpi2c2>;
++	pinctrl-2 = <&pinctrl_lpi2c2_gpio>;
++	sda-gpios = <&gpio1 3 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++	scl-gpios = <&gpio1 2 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++	status = "okay";
++
++	pmic@25 {
++		compatible = "nxp,pca9451a";
++		reg = <0x25>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_pmic>;
++		interrupt-parent = <&gpio3>;
++		interrupts = <5 IRQ_TYPE_EDGE_FALLING>;
++
++		regulators {
++			buck1: BUCK1 {
++				regulator-name = "BUCK1";
++				regulator-min-microvolt = <650000>;
++				regulator-max-microvolt = <2237500>;
++				regulator-boot-on;
++				regulator-always-on;
++				regulator-ramp-delay = <3125>;
++			};
++
++			buck2: BUCK2 {
++				regulator-name = "BUCK2";
++				regulator-min-microvolt = <600000>;
++				regulator-max-microvolt = <2187500>;
++				regulator-boot-on;
++				regulator-always-on;
++				regulator-ramp-delay = <3125>;
++			};
++
++			buck4: BUCK4 {
++				regulator-name = "BUCK4";
++				regulator-min-microvolt = <600000>;
++				regulator-max-microvolt = <3400000>;
++				regulator-boot-on;
++			};
++
++			buck5: BUCK5 {
++				regulator-name = "BUCK5";
++				regulator-min-microvolt = <600000>;
++				regulator-max-microvolt = <3400000>;
++				regulator-boot-on;
++				regulator-always-on;
++			};
++
++			buck6: BUCK6 {
++				regulator-name = "BUCK6";
++				regulator-min-microvolt = <600000>;
++				regulator-max-microvolt = <3400000>;
++				regulator-boot-on;
++				regulator-always-on;
++			};
++
++			ldo1: LDO1 {
++				regulator-name = "LDO1";
++				regulator-min-microvolt = <1600000>;
++				regulator-max-microvolt = <3300000>;
++				regulator-boot-on;
++				regulator-always-on;
++			};
++
++			ldo4: LDO4 {
++				regulator-name = "LDO4";
++				regulator-min-microvolt = <800000>;
++				regulator-max-microvolt = <3300000>;
++				regulator-boot-on;
++				regulator-always-on;
++			};
++
++			ldo5: LDO5 {
++				regulator-name = "LDO5";
++				regulator-min-microvolt = <1800000>;
++				regulator-max-microvolt = <3300000>;
++				regulator-boot-on;
++			};
++		};
++	};
++
++	fusb303b: tcpc@21 {
++		compatible = "onnn,fusb303b";
++		reg = <0x21>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_fusb303b>;
++		interrupt-parent = <&gpio3>;
++		interrupts = <4 IRQ_TYPE_LEVEL_LOW>;
++		enable-gpios = <&gpio2 27 GPIO_ACTIVE_LOW>;
++		vbus-power-supply = <&max77818_chg>;
++		fuelgauge = <&max77818_fg>;
++		usb-phy = <&usbphynop1>;
++
++		connector {
++			compatible = "usb-c-connector";
++			label = "USB-C";
++			power-role = "sink";
++			data-role = "sink";
++			try-power-role = "sink";
++
++			port {
++				typec_ep: endpoint {
++					remote-endpoint = <&usb1_drd_sw>;
++				};
++			};
++		};
++	};
++
++	backlight@36 {
++		compatible = "awinic,aw99703";
++		reg = <0x36>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_leddriver>;
++		enable-gpios = <&gpio4 14 GPIO_ACTIVE_HIGH>;
++		default-brightness = <0>;
++		led-sources = <1 1 0>;
++		awinic,big-inductor;
++		awinic,max-full-scale-current = <9>; /* 12.0 mA */
++		awinic,ramp-time = <9>;          /* 640 ms */
++		awinic,ramp-up-diff-down-time = <(-3)>;  /* 9-3=6, up 448 ms */
++		awinic,off-time = <8>;           /* 128 ms */
++		awinic,on-time = <8>;            /* 128 ms */
++		awinic,ocp = <0>;                /* 0.9 A */
++		awinic,ovp = <2>;                /* 31 V */
++		awinic,expose-sysfs-entries;
++	};
++};
++
++&lpi2c5 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	clock-frequency = <400000>;
++	pinctrl-names = "default";
++	pinctrl-0 = <&pinctrl_lpi2c5>;
++	status = "okay";
++
++	/* NXP CTN730 NFC wireless charger for the marker (pen) */
++	wlc: nfc@28 {
++		compatible = "nxp,ctn730-rm";
++		reg = <0x28>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_nfc>;
++		interrupt-parent = <&gpio2>;
++		interrupts = <1 IRQ_TYPE_EDGE_RISING>;
++		nfc-supply = <&reg_nfc>;
++		nfc-comm-power-step-index = <7>;
++	};
++};
++
++&lpspi1 {
++	fsl,spi-num-chipselects = <1>;
++	pinctrl-names = "default", "sleep";
++	pinctrl-0 = <&pinctrl_lpspi1>;
++	pinctrl-1 = <&pinctrl_lpspi1>;
++	cs-gpios = <&gpio1 10 GPIO_ACTIVE_LOW>;
++	status = "okay";
++
++	elan_touch: touchscreen@0 {
++		compatible = "elan,elants_spi";
++		reg = <0>;
++		spi-max-frequency = <8000000>;
++		spi-cs-inactive-delay-us = <10>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_touch>;
++		interrupt-parent = <&gpio3>;
++		interrupts = <0 IRQ_TYPE_EDGE_RISING>;
++		irq-gpios = <&gpio3 0 GPIO_ACTIVE_HIGH>;
++		reset-gpios = <&gpio4 24 GPIO_ACTIVE_LOW>;
++		vcc33-supply = <&reg_touch>;
++		marker-resolution-x = <11960>;
++		marker-resolution-y = <6760>;
++		touch-resolution-x = <2208>;
++		touch-resolution-y = <1248>;
++		flip-pos-x;
++		swap-axes;
++		sensor-pitch = /bits/ 8 <0x2A>;
++		firmware-id-file-offset = <0x1fb4e>;
++		firmware-ver-file-offset = <0x1f63a>;
++		firmware-name = "elants_spi.bin";
++	};
++};
++
++&lpuart2 { /* console (test pads only) */
++	pinctrl-names = "default";
++	pinctrl-0 = <&pinctrl_uart2>;
++	status = "okay";
++};
++
++&lpuart3 {
++	pinctrl-names = "default";
++	pinctrl-0 = <&pinctrl_uart3>;
++	uart-has-rtscts;
++	status = "okay";
++
++	bluetooth {
++		compatible = "nxp,88w8987-bt";
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_bluetooth>;
++		reset-gpios = <&gpio4 6 GPIO_ACTIVE_LOW>;
++		device-wakeup-gpios = <&gpio4 9 GPIO_ACTIVE_HIGH>;
++		interrupt-parent = <&gpio4>;
++		interrupts = <8 IRQ_TYPE_LEVEL_LOW>;
++		interrupt-names = "wakeup";
++		wakeup-source;
++		nxp,wakein-pin = /bits/ 8 <18>;
++		nxp,wakeout-pin = /bits/ 8 <19>;
++		vcc-supply = <&reg_wifi>;
++	};
++};
++
++&media_blk_ctrl {
++	status = "okay";
++};
++
++/*
++ * No NPU driver is built; left enabled, the unbound consumer keeps the ML
++ * power domain from ever being switched off.
++ */
++&{/soc@0/npu@4a900000} {
++	status = "disabled";
++};
++
++&ocotp {
++	/* offset = 4 * fuse word index */
++	srk_hash: srk-hash@200 {
++		reg = <0x200 32>;
++	};
++
++	srk_revoke: srk-revoke@e8 {
++		reg = <0xe8 4>;
++		bits = <0 4>;
++	};
++
++	usb_vid_pid_ipl: usb-vid-pid-ipl@4e0 {
++		/* Fused USB VID/PID, bank 39 word 0 => word 312 */
++		reg = <0x4e0 4>;
++	};
++
++	device_type: device-type@5e4 {
++		/* GP2 bit 34 => GP2.1 bit 2 => word 377 */
++		reg = <0x5e4 4>;
++		bits = <2 1>;
++	};
++
++	lock_dirty: lock-dirty@5e4 {
++		/* GP2 bit 35 => GP2.1 bit 3 => word 377 */
++		reg = <0x5e4 4>;
++		bits = <3 1>;
++	};
++
++	arb_index: arb-index@5e8 {
++		/* GP2, bank 47 word 2 => word 378, 384 bits */
++		reg = <0x5e8 48>;
++	};
++};
++
++&usbotg1 {
++	dr_mode = "otg";
++	hnp-disable;
++	srp-disable;
++	adp-disable;
++	usb-role-switch;
++	disable-over-current;
++	samsung,picophy-pre-emp-curr-control = <3>;
++	samsung,picophy-dc-vol-level-adjust = <7>;
++	status = "okay";
++
++	port {
++		usb1_drd_sw: endpoint {
++			remote-endpoint = <&typec_ep>;
++		};
++	};
++};
++
++&usbotg2 {
++	dr_mode = "otg";
++	hnp-disable;
++	srp-disable;
++	adp-disable;
++	usb-role-switch;
++	disable-over-current;
++	samsung,picophy-pre-emp-curr-control = <3>;
++	samsung,picophy-dc-vol-level-adjust = <7>;
++	status = "okay";
++};
++
++&usdhc1 {
++	pinctrl-names = "default", "state_100mhz", "state_200mhz";
++	pinctrl-0 = <&pinctrl_usdhc1>;
++	pinctrl-1 = <&pinctrl_usdhc1_100mhz>;
++	pinctrl-2 = <&pinctrl_usdhc1_200mhz>;
++	bus-width = <8>;
++	non-removable;
++	status = "okay";
++};
++
++&usdhc3 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	pinctrl-names = "default", "state_100mhz", "state_200mhz";
++	pinctrl-0 = <&pinctrl_usdhc3>;
++	pinctrl-1 = <&pinctrl_usdhc3_100mhz>;
++	pinctrl-2 = <&pinctrl_usdhc3_200mhz>;
++	bus-width = <4>;
++	keep-power-in-suspend;
++	non-removable;
++	vmmc-supply = <&reg_wifi>;
++	mmc-pwrseq = <&wifi_pwrseq>;
++	wakeup-source;
++	status = "okay";
++
++	/* NXP IW611 WLAN; the properties are read by the out-of-tree driver */
++	iw611: sdxxx-wlan@1 {
++		reg = <1>;
++		drv_mode = <0x1>; /* STA only mode */
++		fw_name = "nxp/sd_w61x_v1.bin.se";
++		sta_name = "wlan";
++		drvdbg = <0x6>; /* MFATAL|MERROR */
++		pmqos = <0>; /* no latency constraint */
++		cal_data_cfg = "nxp/WlanCalData_ext.conf";
++		txpwrlimit_cfg = "nxp/rgpower.bin";
++		reject_addba_req = <1>; /* Reject the addba request when HS activated */
++		ps_mode = <1>; /* Enable IEEE802.11 PS mode */
++		hs_auto_arp = <1>; /* Reply ARP in firmware for deep sleep */
++		country_ie_ignore = <0>; /* Follow countryIE from AP */
++		beacon_hints = <0>; /* Enable beacon hints */
++		/*
++		 * The PCBAs carry no factory MAC address; an empty string
++		 * makes U-Boot derive one from the SoC unique ID.
++		 */
++		mac_address = "";
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_wifi_wake>;
++	};
++};
++
++&wdog3 {
++	status = "okay";
++};
++
++&iomuxc {
++	pinctrl_bluetooth: bluetoothgrp {
++		fsl,pins = <
++			MX93_PAD_ENET1_RXC__GPIO4_IO09		0x0000011e /* BT_DEV_WAKE */
++			MX93_PAD_ENET1_RX_CTL__GPIO4_IO08	0x0000011e /* BT_HOST_WAKE */
++			MX93_PAD_ENET1_TX_CTL__GPIO4_IO06	0x0000011e /* IND_RST_BT */
++		>;
++	};
++
++	pinctrl_lpi2c1: lpi2c1grp {
++		fsl,pins = <
++			MX93_PAD_I2C1_SCL__LPI2C1_SCL		0x40000b9e
++			MX93_PAD_I2C1_SDA__LPI2C1_SDA		0x40000b9e
++		>;
++	};
++
++	pinctrl_lpi2c2: lpi2c2grp {
++		fsl,pins = <
++			MX93_PAD_I2C2_SCL__LPI2C2_SCL		0x40000b9e
++			MX93_PAD_I2C2_SDA__LPI2C2_SDA		0x40000b9e
++		>;
++	};
++
++	pinctrl_lpi2c2_gpio: lpi2c2-gpiogrp {
++		fsl,pins = <
++			MX93_PAD_I2C2_SCL__GPIO1_IO02		0x00000b9e
++			MX93_PAD_I2C2_SDA__GPIO1_IO03		0x00000b9e
++		>;
++	};
++
++	pinctrl_lpi2c5: lpi2c5grp {
++		fsl,pins = <
++			MX93_PAD_GPIO_IO23__LPI2C5_SCL		0x4000099e
++			MX93_PAD_GPIO_IO22__LPI2C5_SDA		0x4000099e
++		>;
++	};
++
++	pinctrl_uart2: uart2grp {
++		fsl,pins = <
++			MX93_PAD_UART2_RXD__LPUART2_RX		0x0000031e
++			MX93_PAD_UART2_TXD__LPUART2_TX		0x0000031e
++		>;
++	};
++
++	pinctrl_uart3: uart3grp {
++		fsl,pins = <
++			MX93_PAD_ENET1_RD0__LPUART3_RX		0x0000031e	/* BT_UART_RXD */
++			MX93_PAD_ENET1_TD0__LPUART3_TX		0x0000031e	/* BT_UART_TXD */
++			MX93_PAD_ENET1_RD1__LPUART3_CTS_B	0x0000031e	/* BT_UART_CTS */
++			MX93_PAD_ENET1_TD1__LPUART3_RTS_B	0x0000031e	/* BT_UART_RTS */
++		>;
++	};
++
++	pinctrl_lpspi1: lpspi1grp {
++		fsl,pins = <
++			MX93_PAD_PDM_BIT_STREAM1__GPIO1_IO10	0x0000019e /* SPI1_CS */
++			MX93_PAD_SAI1_RXD0__LPSPI1_SOUT		0x0000019e /* SPI1_MISO */
++			MX93_PAD_SAI1_TXC__LPSPI1_SIN		0x0000019e /* SPI1_MOSI */
++			MX93_PAD_SAI1_TXD0__LPSPI1_SCK		0x0000019e /* SPI1_SCK */
++		>;
++	};
++
++	pinctrl_usdhc1: usdhc1grp {
++		fsl,pins = <
++			MX93_PAD_SD1_CLK__USDHC1_CLK		0x00001582
++			MX93_PAD_SD1_CMD__USDHC1_CMD		0x40001382
++			MX93_PAD_SD1_DATA0__USDHC1_DATA0	0x40001382
++			MX93_PAD_SD1_DATA1__USDHC1_DATA1	0x40001382
++			MX93_PAD_SD1_DATA2__USDHC1_DATA2	0x40001382
++			MX93_PAD_SD1_DATA3__USDHC1_DATA3	0x40001382
++			MX93_PAD_SD1_DATA4__USDHC1_DATA4	0x40001382
++			MX93_PAD_SD1_DATA5__USDHC1_DATA5	0x40001382
++			MX93_PAD_SD1_DATA6__USDHC1_DATA6	0x40001382
++			MX93_PAD_SD1_DATA7__USDHC1_DATA7	0x40001382
++			MX93_PAD_SD1_STROBE__USDHC1_STROBE	0x00001582
++		>;
++	};
++
++	pinctrl_usdhc1_100mhz: usdhc1-100mhzgrp {
++		fsl,pins = <
++			MX93_PAD_SD1_CLK__USDHC1_CLK		0x0000158e
++			MX93_PAD_SD1_CMD__USDHC1_CMD		0x4000138e
++			MX93_PAD_SD1_DATA0__USDHC1_DATA0	0x4000138e
++			MX93_PAD_SD1_DATA1__USDHC1_DATA1	0x4000138e
++			MX93_PAD_SD1_DATA2__USDHC1_DATA2	0x4000138e
++			MX93_PAD_SD1_DATA3__USDHC1_DATA3	0x4000138e
++			MX93_PAD_SD1_DATA4__USDHC1_DATA4	0x4000138e
++			MX93_PAD_SD1_DATA5__USDHC1_DATA5	0x4000138e
++			MX93_PAD_SD1_DATA6__USDHC1_DATA6	0x4000138e
++			MX93_PAD_SD1_DATA7__USDHC1_DATA7	0x4000138e
++			MX93_PAD_SD1_STROBE__USDHC1_STROBE	0x0000158e
++		>;
++	};
++
++	pinctrl_usdhc1_200mhz: usdhc1-200mhzgrp {
++		fsl,pins = <
++			MX93_PAD_SD1_CLK__USDHC1_CLK		0x000015fe
++			MX93_PAD_SD1_CMD__USDHC1_CMD		0x400013fe
++			MX93_PAD_SD1_DATA0__USDHC1_DATA0	0x400013fe
++			MX93_PAD_SD1_DATA1__USDHC1_DATA1	0x400013fe
++			MX93_PAD_SD1_DATA2__USDHC1_DATA2	0x400013fe
++			MX93_PAD_SD1_DATA3__USDHC1_DATA3	0x400013fe
++			MX93_PAD_SD1_DATA4__USDHC1_DATA4	0x400013fe
++			MX93_PAD_SD1_DATA5__USDHC1_DATA5	0x400013fe
++			MX93_PAD_SD1_DATA6__USDHC1_DATA6	0x400013fe
++			MX93_PAD_SD1_DATA7__USDHC1_DATA7	0x400013fe
++			MX93_PAD_SD1_STROBE__USDHC1_STROBE	0x000015fe
++		>;
++	};
++
++	pinctrl_usdhc3: usdhc3grp {
++		fsl,pins = <
++			MX93_PAD_SD3_CLK__USDHC3_CLK		0x00001582
++			MX93_PAD_SD3_CMD__USDHC3_CMD		0x40001182
++			MX93_PAD_SD3_DATA0__USDHC3_DATA0	0x40001182
++			MX93_PAD_SD3_DATA1__USDHC3_DATA1	0x40001182
++			MX93_PAD_SD3_DATA2__USDHC3_DATA2	0x40001182
++			MX93_PAD_SD3_DATA3__USDHC3_DATA3	0x40001182
++		>;
++	};
++
++	pinctrl_usdhc3_100mhz: usdhc3-100mhzgrp {
++		fsl,pins = <
++			MX93_PAD_SD3_CLK__USDHC3_CLK		0x0000158e
++			MX93_PAD_SD3_CMD__USDHC3_CMD		0x4000118e
++			MX93_PAD_SD3_DATA0__USDHC3_DATA0	0x4000118e
++			MX93_PAD_SD3_DATA1__USDHC3_DATA1	0x4000118e
++			MX93_PAD_SD3_DATA2__USDHC3_DATA2	0x4000118e
++			MX93_PAD_SD3_DATA3__USDHC3_DATA3	0x4000118e
++		>;
++	};
++
++	pinctrl_usdhc3_200mhz: usdhc3-200mhzgrp {
++		fsl,pins = <
++			MX93_PAD_SD3_CLK__USDHC3_CLK		0x000015fe
++			MX93_PAD_SD3_CMD__USDHC3_CMD		0x400011fe
++			MX93_PAD_SD3_DATA0__USDHC3_DATA0	0x400011fe
++			MX93_PAD_SD3_DATA1__USDHC3_DATA1	0x400011fe
++			MX93_PAD_SD3_DATA2__USDHC3_DATA2	0x400011fe
++			MX93_PAD_SD3_DATA3__USDHC3_DATA3	0x400011fe
++		>;
++	};
++
++	pinctrl_pmic: pmicgrp {
++		fsl,pins = <
++			MX93_PAD_SD2_DATA2__GPIO3_IO05		0x0000011e /* PMIC_nINT */
++		>;
++	};
++
++	pinctrl_fusb303b: fusb303bgrp {
++		fsl,pins = <
++			MX93_PAD_SD2_DATA1__GPIO3_IO04		0x0000011e /* USB_C_INT_N */
++			MX93_PAD_GPIO_IO27__GPIO2_IO27		0x0000011e /* FUSB_EN_N */
++		>;
++	};
++
++	pinctrl_leddriver: leddrivergrp {
++		fsl,pins = <
++			MX93_PAD_ENET2_MDC__GPIO4_IO14		0x0000011e /* LED_EN */
++		>;
++	};
++
++	pinctrl_accelerometer: accelerometergrp {
++		fsl,pins = <
++			MX93_PAD_SD2_DATA0__GPIO3_IO03		0x0000011e /* ACC_INT1_N */
++		>;
++	};
++
++	pinctrl_adcref: adcrefgrp {
++		fsl,pins = <
++			MX93_PAD_ENET1_MDC__GPIO4_IO00		0x0000011e /* ADC_EN */
++		>;
++	};
++
++	pinctrl_parallel_disp: parallel-dispgrp {
++		fsl,pins = <
++			MX93_PAD_GPIO_IO00__MEDIAMIX_DISP_CLK		0x0000031e
++			MX93_PAD_GPIO_IO02__MEDIAMIX_DISP_VSYNC		0x0000031e
++			MX93_PAD_GPIO_IO04__MEDIAMIX_DISP_DATA00	0x0000031e
++			MX93_PAD_GPIO_IO05__MEDIAMIX_DISP_DATA01	0x0000031e
++			MX93_PAD_GPIO_IO06__MEDIAMIX_DISP_DATA02	0x0000031e
++			MX93_PAD_GPIO_IO07__MEDIAMIX_DISP_DATA03	0x0000031e
++			MX93_PAD_GPIO_IO08__MEDIAMIX_DISP_DATA04	0x0000031e
++			MX93_PAD_GPIO_IO09__MEDIAMIX_DISP_DATA05	0x0000031e
++			MX93_PAD_GPIO_IO10__MEDIAMIX_DISP_DATA06	0x0000031e
++			MX93_PAD_GPIO_IO11__MEDIAMIX_DISP_DATA07	0x0000031e
++			MX93_PAD_GPIO_IO12__MEDIAMIX_DISP_DATA08	0x0000031e
++			MX93_PAD_GPIO_IO13__MEDIAMIX_DISP_DATA09	0x0000031e
++			MX93_PAD_GPIO_IO14__MEDIAMIX_DISP_DATA10	0x0000031e
++			MX93_PAD_GPIO_IO15__MEDIAMIX_DISP_DATA11	0x0000031e
++			MX93_PAD_GPIO_IO16__MEDIAMIX_DISP_DATA12	0x0000031e
++			MX93_PAD_GPIO_IO17__MEDIAMIX_DISP_DATA13	0x0000031e
++			MX93_PAD_GPIO_IO18__MEDIAMIX_DISP_DATA14	0x0000039e
++			MX93_PAD_GPIO_IO19__MEDIAMIX_DISP_DATA15	0x0000039e
++		>;
++	};
++
++	pinctrl_parallel_disp_gpio: parallel-disp-gpiogrp {
++		fsl,pins = <
++			MX93_PAD_GPIO_IO00__GPIO2_IO00			0x0000051e /* EPD_CKH */
++		>;
++	};
++
++	pinctrl_cumulus: cumulusgrp {
++		fsl,pins = <
++			MX93_PAD_GPIO_IO20__GPIO2_IO20		0x0000011e /* EPD_OEH */
++			MX93_PAD_GPIO_IO21__GPIO2_IO21		0x0000011e /* EPD_OEV */
++		>;
++	};
++
++	pinctrl_g2194_ps: g2194psgrp {
++		fsl,pins = <
++			MX93_PAD_ENET2_TD0__GPIO4_IO19		0x0000011e /* G2194_PS */
++		>;
++	};
++
++	pinctrl_g2194: g2194grp {
++		fsl,pins = <
++			MX93_PAD_ENET2_RD1__GPIO4_IO25		0x0000011e /* G2194_VCOM_EN */
++			MX93_PAD_ENET2_TD2__GPIO4_IO17		0x0000011e /* G2194_EN */
++			MX93_PAD_ENET2_TD1__GPIO4_IO18		0x0000011e /* G2194_PG */
++			MX93_PAD_GPIO_IO26__GPIO2_IO26		0x0000011e /* EPD_PWR_EN */
++			MX93_PAD_GPIO_IO24__GPIO2_IO24		0x0000011e /* EPD_XON */
++		>;
++	};
++
++	pinctrl_touch_pwr: touchpwrgrp {
++		fsl,pins = <
++			MX93_PAD_ENET1_TD2__GPIO4_IO03		0x0000011e /* TOUCH_PWR_EN */
++		>;
++	};
++
++	pinctrl_touch: touchgrp {
++		fsl,pins = <
++			MX93_PAD_SD2_CD_B__GPIO3_IO00		0x0000011e /* TOUCH_INT */
++			MX93_PAD_ENET2_RD0__GPIO4_IO24		0x0000011e /* TOUCH_RESET */
++		>;
++	};
++
++	pinctrl_wifi_reg: wifireggrp {
++		fsl,pins = <
++			MX93_PAD_ENET1_MDIO__GPIO4_IO01		0x0000011e /* WIFI_PWR_EN */
++		>;
++	};
++
++	pinctrl_wifi_pwrseq: wifipwrseqgrp {
++		fsl,pins = <
++			MX93_PAD_ENET2_MDIO__GPIO4_IO15		0x0000011e /* WIFI_PWRDN_N */
++		>;
++	};
++
++	pinctrl_wifi_wake: wifiwakegrp {
++		fsl,pins = <
++			MX93_PAD_ENET1_RD2__GPIO4_IO12		0x0000011e /* WIFI_DEV_WAKE */
++			MX93_PAD_ENET1_RD3__GPIO4_IO13		0x0000011e /* WIFI_HOST_WAKE */
++		>;
++	};
++
++	pinctrl_hall_sensors: hallsensorsgrp {
++		fsl,pins = <
++			MX93_PAD_SD2_RESET_B__GPIO3_IO07	0x0000011e /* FOLIO_HALL_INT_N */
++			MX93_PAD_SD2_DATA3__GPIO3_IO06		0x0000011e /* PEN_HALL_INT_N */
++		>;
++	};
++
++	pinctrl_nfc: nfcgrp {
++		fsl,pins = <
++			MX93_PAD_GPIO_IO01__GPIO2_IO01		0x0000051e /* NFC_INT */
++		>;
++	};
++
++	pinctrl_max77818: max77818grp {
++		fsl,pins = <
++			MX93_PAD_SD2_CMD__GPIO3_IO02		0x00000000 /* CHARGER_INT_N */
++			MX93_PAD_GPIO_IO28__GPIO2_IO28		0x00000000 /* CHARGER_INOK */
++		>;
++	};
++};

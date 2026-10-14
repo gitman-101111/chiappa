@@ -1,0 +1,117 @@
+From 215747474e70ac602f2fb0533aaf77788f885833 Mon Sep 17 00:00:00 2001
+From: gitman-101111 <development@spamfolder.xyz>
+Date: Mon, 12 Oct 2026 10:23:09 -0600
+Subject: [PATCH] hwmon: ntc_thermistor: add the TDK NTCG103JF103FT1
+
+The Paper Pro Move senses its panel temperature with a TDK
+NTCG103JF103FT1 on an i.MX93 ADC channel; the e-paper waveform engine
+reads it through hwmon. Add the resistance table and compatible from
+reMarkable's linux-imx-rm tree.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../bindings/hwmon/ntc-thermistor.yaml        |  1 +
+ drivers/hwmon/ntc_thermistor.c                | 43 +++++++++++++++++++
+ 2 files changed, 44 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/hwmon/ntc-thermistor.yaml b/Documentation/devicetree/bindings/hwmon/ntc-thermistor.yaml
+index efd10bcfb..a1f146371 100644
+--- a/Documentation/devicetree/bindings/hwmon/ntc-thermistor.yaml
++++ b/Documentation/devicetree/bindings/hwmon/ntc-thermistor.yaml
+@@ -76,6 +76,7 @@ properties:
+       - const: murata,ncp03wf104
+       - const: murata,ncp15xh103
+       - const: murata,ncp18wm474
++      - const: tdk,ntcg103jf103ft1
+       - const: samsung,1404-001221
+       # Deprecated "ntc," compatible strings
+       - const: ntc,ncp15wb473
+diff --git a/drivers/hwmon/ntc_thermistor.c b/drivers/hwmon/ntc_thermistor.c
+index 1ac0288fb..aaea4cf20 100644
+--- a/drivers/hwmon/ntc_thermistor.c
++++ b/drivers/hwmon/ntc_thermistor.c
+@@ -24,6 +24,7 @@ enum ntc_thermistor_type {
+ 	TYPE_NCPXXWL333,
+ 	TYPE_NCPXXXH103,
+ 	TYPE_NCPXXWM474,
++	TYPE_NTCG103JF103FT1,
+ };
+ 
+ struct ntc_compensation {
+@@ -47,6 +48,7 @@ enum {
+ 	NTC_NCP21WB473,
+ 	NTC_SSG1404001221,
+ 	NTC_NCP18WM474,
++	NTC_NTCG103JF103FT1,
+ 	NTC_LAST,
+ };
+ 
+@@ -62,6 +64,7 @@ static const struct platform_device_id ntc_thermistor_id[] = {
+ 	[NTC_NCP21WB473]      = { .name = "ncp21wb473",     .driver_data = TYPE_NCPXXWB473 },
+ 	[NTC_SSG1404001221]   = { .name = "ssg1404_001221", .driver_data = TYPE_NCPXXWB473 },
+ 	[NTC_NCP18WM474]      = { .name = "ncp18wm474",     .driver_data = TYPE_NCPXXWM474 },
++	[NTC_NTCG103JF103FT1] = { .name = "ntcg103jf103ft1", .driver_data = TYPE_NTCG103JF103FT1 },
+ 	[NTC_LAST]            = { }
+ };
+ MODULE_DEVICE_TABLE(platform, ntc_thermistor_id);
+@@ -219,6 +222,43 @@ static const struct ntc_compensation ncpXXxh103[] = {
+ 	{ .temp_c	= 125, .ohm	= 531 },
+ };
+ 
++static const struct ntc_compensation ntcg103jf103ft1[] = {
++	{ .temp_c	= -40, .ohm	= 188500 },
++	{ .temp_c	= -35, .ohm	= 144300 },
++	{ .temp_c	= -30, .ohm	= 111300 },
++	{ .temp_c	= -25, .ohm	= 86580 },
++	{ .temp_c	= -20, .ohm	= 67790 },
++	{ .temp_c	= -15, .ohm	= 53460 },
++	{ .temp_c	= -10, .ohm	= 42450 },
++	{ .temp_c	= -5, .ohm	= 33930 },
++	{ .temp_c	= 0, .ohm	= 27280 },
++	{ .temp_c	= 5, .ohm	= 22070 },
++	{ .temp_c	= 10, .ohm	= 17960 },
++	{ .temp_c	= 15, .ohm	= 14700 },
++	{ .temp_c	= 20, .ohm	= 12090 },
++	{ .temp_c	= 25, .ohm	= 10000 },
++	{ .temp_c	= 30, .ohm	= 8312 },
++	{ .temp_c	= 35, .ohm	= 6942 },
++	{ .temp_c	= 40, .ohm	= 5826 },
++	{ .temp_c	= 45, .ohm	= 4911 },
++	{ .temp_c	= 50, .ohm	= 4158 },
++	{ .temp_c	= 55, .ohm	= 3536 },
++	{ .temp_c	= 60, .ohm	= 3019 },
++	{ .temp_c	= 65, .ohm	= 2588 },
++	{ .temp_c	= 70, .ohm	= 2227 },
++	{ .temp_c	= 75, .ohm	= 1924 },
++	{ .temp_c	= 80, .ohm	= 1668 },
++	{ .temp_c	= 85, .ohm	= 1451 },
++	{ .temp_c	= 90, .ohm	= 1267 },
++	{ .temp_c	= 95, .ohm	= 1110 },
++	{ .temp_c	= 100, .ohm	= 975 },
++	{ .temp_c	= 105, .ohm	= 860 },
++	{ .temp_c	= 110, .ohm	= 760 },
++	{ .temp_c	= 115, .ohm	= 674 },
++	{ .temp_c	= 120, .ohm	= 599 },
++	{ .temp_c	= 125, .ohm	= 534 },
++};
++
+ static const struct ntc_compensation ncpXXwm474[] = {
+ 	{ .temp_c	= -40, .ohm	= 10900000 },
+ 	{ .temp_c	= -35, .ohm	= 9600000 },
+@@ -359,6 +399,7 @@ static const struct ntc_type ntc_type[] = {
+ 	NTC_TYPE(TYPE_NCPXXWL333,  ncpXXwl333),
+ 	NTC_TYPE(TYPE_NCPXXXH103,  ncpXXxh103),
+ 	NTC_TYPE(TYPE_NCPXXWM474,  ncpXXwm474),
++	NTC_TYPE(TYPE_NTCG103JF103FT1, ntcg103jf103ft1),
+ };
+ 
+ /*
+@@ -717,6 +758,8 @@ static const struct of_device_id ntc_match[] = {
+ 		.data = &ntc_thermistor_id[NTC_SSG1404001221] },
+ 	{ .compatible = "murata,ncp18wm474",
+ 		.data = &ntc_thermistor_id[NTC_NCP18WM474] },
++	{ .compatible = "tdk,ntcg103jf103ft1",
++		.data = &ntc_thermistor_id[NTC_NTCG103JF103FT1] },
+ 
+ 	/* Usage of vendor name "ntc" is deprecated */
+ 	{ .compatible = "ntc,ncp03wb473",

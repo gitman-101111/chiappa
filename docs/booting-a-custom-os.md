@@ -23,14 +23,12 @@ need for deploys.
    **OEM-Open / `unlocked=yes`** (U-Boot skips AHAB auth). No keys/fuses needed.
 2. There are **two symmetric rootfs slots** (A=`mmcblk0p2`, B=`mmcblk0p3`). U-Boot loads
    `/boot/fitImage.ahab` **from the active slot's rootfs**.
-3. The **active slot is stored in the `lpgpr` SNVS registers**, not in the eMMC
-   boot partition. U-Boot reads it there (and honours the per-slot error
-   counter). The stock `rootdev` tool reads/writes it; `rootdev --next-boot` is
-   the authoritative "what boots next". The eMMC boot partitions (`boot0`/`boot1`)
-   just hold `imx-boot` — toggling them with `mmc bootpart` does **not** change
-   the rootfs slot.
-4. So: put your OS on the **inactive** slot, point `lpgpr` at it (`rootdev
-   --switch`), reboot.
+3. The **active slot is the enabled eMMC boot partition**: `boot0` boots
+   `root_a`, `boot1` boots `root_b`. U-Boot then records the slot it booted and
+   the per-slot error counters in the `lpgpr` SNVS registers; writing those
+   from Linux does not change what boots next.
+4. So: put your OS on the **inactive** slot, enable its boot partition
+   (`mmc bootpart enable 1|2 0 /dev/mmcblk0`), reboot.
 
 ## The FIT image (`fitImage.ahab`)
 
@@ -66,23 +64,18 @@ U-Boot keeps a per-slot error counter in SNVS:
 
 ## Switching the active slot (userspace, no UART)
 
-The active slot lives in the `lpgpr` SNVS registers, and the stock OS's
-`/usr/sbin/rootdev` is the tool that manages it:
+U-Boot boots the rootfs slot that matches the enabled eMMC boot partition, so
+the switch is the EXT_CSD boot-partition-enable bit (mmc-utils):
 
 ```sh
-rootdev --active      # rootfs the running system booted from
-rootdev --inactive    # the other slot (deploy target)
-rootdev --next-boot   # what U-Boot will boot next — authoritative
-rootdev --switch      # flip active/inactive for the next boot
+mmc bootpart enable 1 0 /dev/mmcblk0   # boot0 -> root_a next
+mmc bootpart enable 2 0 /dev/mmcblk0   # boot1 -> root_b next
 ```
 
-`rootdev --switch` persists the choice via `lpgpr` (it does **not** simply write
-the read-only `root_part` sysfs — that always reflects the *currently booted*
-slot). Confirm the target with `rootdev --next-boot` before rebooting.
-
-> **Not** `mmc bootpart`: the enabled eMMC boot partition (`boot0`/`boot1`) only
-> selects which copy of `imx-boot` runs — both then read `lpgpr` for the rootfs
-> slot — so `mmc bootpart enable …` does not switch which OS boots. Use `rootdev`.
+`/sys/devices/platform/lpgpr/root_part` always reflects the *currently booted*
+slot (U-Boot writes it), and writing the `lpgpr` root-state bits from Linux is
+overridden at the next boot. The 3-strike rollback flips the same bit; how the
+stock OS's `rootdev --switch` does it was not checked.
 
 ## Deploy recipe (generic)
 
@@ -96,8 +89,8 @@ cp fitImage.ahab /mnt/boot/fitImage.ahab
 # 3) point root= at that slot in your kernel cmdline / FIT bootargs
 # 4) reset that slot's error counter so U-Boot will try it:
 echo 0 > /sys/devices/platform/lpgpr/rootX_errcnt
-# 5) point lpgpr at that slot + reboot
-rootdev --switch          # then verify: rootdev --next-boot
+# 5) enable that slot's boot partition + reboot
+mmc bootpart enable <1|2> 0 /dev/mmcblk0
 sync && reboot
 ```
 

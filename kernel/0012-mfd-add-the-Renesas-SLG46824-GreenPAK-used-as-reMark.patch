@@ -1,0 +1,904 @@
+From 7340e1b86dba38958c3fc6a75a7f6a0564ca989d Mon Sep 17 00:00:00 2001
+From: gitman-101111 <development@spamfolder.xyz>
+Date: Mon, 12 Oct 2026 10:23:09 -0600
+Subject: [PATCH] mfd: add the Renesas SLG46824 GreenPAK used as reMarkable's
+ wake controller
+
+The SLG46824 on the Paper Pro Move latches wake sources (power button,
+folio, pen, charger) while the SoC sleeps and gates a few peripheral
+rails through its I2C virtual inputs (the NFC pen charger's supply among
+them). Add the MFD core, the GPIO view of the virtual inputs, the
+comparator reference regulator, and the wakeup controller that arms the
+latches around suspend. Ported from reMarkable's linux-imx-rm 6.12 tree.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/gpio/Kconfig                          |  11 +
+ drivers/gpio/Makefile                         |   1 +
+ drivers/gpio/gpio-slg46824.c                  | 123 +++++++
+ drivers/mfd/Kconfig                           |  12 +
+ drivers/mfd/Makefile                          |   1 +
+ drivers/mfd/slg46824-mfd.c                    | 135 ++++++++
+ drivers/platform/remarkable/Kconfig           |   5 +
+ drivers/platform/remarkable/Makefile          |   1 +
+ drivers/platform/remarkable/slg46824_wakeup.c | 314 ++++++++++++++++++
+ drivers/regulator/Kconfig                     |   9 +
+ drivers/regulator/Makefile                    |   1 +
+ drivers/regulator/slg46824-regulator.c        | 151 +++++++++
+ 12 files changed, 764 insertions(+)
+ create mode 100644 drivers/gpio/gpio-slg46824.c
+ create mode 100644 drivers/mfd/slg46824-mfd.c
+ create mode 100644 drivers/platform/remarkable/slg46824_wakeup.c
+ create mode 100644 drivers/regulator/slg46824-regulator.c
+
+diff --git a/drivers/gpio/Kconfig b/drivers/gpio/Kconfig
+index 28cf6d2e8..ef5e7ea79 100644
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -1283,6 +1283,17 @@ config GPIO_PCF857X
+ 	  This driver provides an in-kernel interface to those GPIOs using
+ 	  platform-neutral GPIO calls.
+ 
++config GPIO_SLG46824
++	tristate "Renesas SLG46824 GPIO support"
++	depends on I2C
++	select REGMAP_I2C
++	help
++	  This enables support for the Virtual Inputs on the I2C port on the
++	  SLG46824 and exposes them as gpio outputs from the CPU point of view.
++
++	  This driver can also be built as a module. If so, the module will be
++	  called gpio-slg46824.
++
+ config GPIO_TPIC2810
+ 	tristate "TPIC2810 8-Bit I2C GPO expander"
+ 	help
+diff --git a/drivers/gpio/Makefile b/drivers/gpio/Makefile
+index 4d0e90040..139ea4b98 100644
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -185,6 +185,7 @@ obj-$(CONFIG_GPIO_TEGRA)		+= gpio-tegra.o
+ obj-$(CONFIG_GPIO_THUNDERX)		+= gpio-thunderx.o
+ obj-$(CONFIG_GPIO_TIMBERDALE)		+= gpio-timberdale.o
+ obj-$(CONFIG_GPIO_TN48M_CPLD)		+= gpio-tn48m.o
++obj-$(CONFIG_GPIO_SLG46824)		+= gpio-slg46824.o
+ obj-$(CONFIG_GPIO_TPIC2810)		+= gpio-tpic2810.o
+ obj-$(CONFIG_GPIO_TPS65086)		+= gpio-tps65086.o
+ obj-$(CONFIG_GPIO_TPS65218)		+= gpio-tps65218.o
+diff --git a/drivers/gpio/gpio-slg46824.c b/drivers/gpio/gpio-slg46824.c
+new file mode 100644
+index 000000000..89593c2aa
+--- /dev/null
++++ b/drivers/gpio/gpio-slg46824.c
+@@ -0,0 +1,123 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2024 reMarkable
++ * GPIO driver for controlling the i2c virtual inputs (output from cpu pov)
++ */
++
++#include <linux/gpio/driver.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/kernel.h>
++
++#define SLG46824_REG_I2C_VIRTUAL_INPUT	0x7A
++
++/* gpio0 is MSB */
++#define SLG46824_GPIO(x) BIT(7-x)
++
++struct slg46824_gpio {
++	struct device *dev;
++	struct regmap *regmap;
++	struct gpio_chip chip;
++};
++
++static int slg46824_gpio_get_direction(struct gpio_chip *chip, unsigned int offset)
++{
++	/* This device is output only */
++	return GPIO_LINE_DIRECTION_OUT;
++}
++
++static int slg46824_gpio_direction_input(struct gpio_chip *chip, unsigned int offset)
++{
++	/* This device is output only */
++	return -EINVAL;
++}
++
++static int slg46824_gpio_direction_output(struct gpio_chip *chip, unsigned int offset, int value)
++{
++	struct slg46824_gpio *priv = gpiochip_get_data(chip);
++
++	return regmap_update_bits(priv->regmap, SLG46824_REG_I2C_VIRTUAL_INPUT,
++				  SLG46824_GPIO(offset), value ? SLG46824_GPIO(offset) : 0);
++}
++
++static int slg46824_gpio_get(struct gpio_chip *chip, unsigned int offset)
++{
++	struct slg46824_gpio *priv = gpiochip_get_data(chip);
++	int ret, val;
++
++	ret = regmap_read(priv->regmap, SLG46824_REG_I2C_VIRTUAL_INPUT, &val);
++	if (ret < 0)
++		return ret;
++
++	return val & SLG46824_GPIO(offset);
++}
++
++static int slg46824_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
++{
++	return slg46824_gpio_direction_output(chip, offset, value);
++}
++
++static const struct gpio_chip slg46824_chip = {
++	.label = "slg46824-gpio",
++	.owner = THIS_MODULE,
++	.get_direction		= slg46824_gpio_get_direction,
++	.direction_input	= slg46824_gpio_direction_input,
++	.direction_output	= slg46824_gpio_direction_output,
++	.get			= slg46824_gpio_get,
++	.set			= slg46824_gpio_set,
++	.base			= -1,
++	.ngpio			= 8,
++	.can_sleep		= true,
++};
++
++static int slg46824_gpio_probe(struct platform_device *pdev)
++{
++	struct slg46824_gpio *priv;
++	struct regmap *regmap;
++	int ret;
++
++	regmap = dev_get_regmap(pdev->dev.parent, NULL);
++	if (!regmap) {
++		dev_err(&pdev->dev, "Parent device not found\n");
++		return -ENODEV;
++	}
++
++	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->chip = slg46824_chip;
++	priv->chip.parent = &pdev->dev;
++
++	priv->dev = &pdev->dev;
++	priv->regmap = regmap;
++
++	ret = devm_gpiochip_add_data(&pdev->dev, &priv->chip, priv);
++	if (ret) {
++		dev_err(&pdev->dev, "Failed to register gpiochip: %d\n", ret);
++		return ret;
++	}
++
++	platform_set_drvdata(pdev, priv);
++	return 0;
++}
++
++static const struct of_device_id slg46824_gpio_of_match[] = {
++	{ .compatible = "renesas,slg46824-gpio", },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, slg46824_gpio_of_match);
++
++static struct platform_driver slg46824_gpio_driver = {
++	.driver = {
++		.name = "slg46824-gpio",
++		.of_match_table = slg46824_gpio_of_match,
++	},
++	.probe = slg46824_gpio_probe,
++};
++module_platform_driver(slg46824_gpio_driver);
++
++MODULE_AUTHOR("Morten Schade Fla <morten.schade.fla@remarkable.no>");
++MODULE_DESCRIPTION("Renesas SLG46824 GPIO driver for i2c virtual inputs");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/mfd/Kconfig b/drivers/mfd/Kconfig
+index faf7051d6..063306063 100644
+--- a/drivers/mfd/Kconfig
++++ b/drivers/mfd/Kconfig
+@@ -1059,6 +1059,18 @@ config MFD_MAX77818
+ 	  The device has a regulator part, a charger part and a fuel-gauge part
+ 	  which may be enabled as required (power management devices).
+ 
++config MFD_SLG46824
++	tristate "Renesas SLG46824 Simple Programmable Logic Device"
++	depends on I2C
++	select MFD_CORE
++	select REGMAP_I2C
++	help
++	  This is the core driver for the Renesas SLG46824 Simple
++	  Programmable Logic Device (SPLD).
++
++	  This driver provides common support for accessing the device I2C
++	  using regmap.
++
+ config MFD_MAX77843
+ 	bool "Maxim Semiconductor MAX77843 PMIC Support"
+ 	depends on I2C=y
+diff --git a/drivers/mfd/Makefile b/drivers/mfd/Makefile
+index ba83a6944..b9b6ff622 100644
+--- a/drivers/mfd/Makefile
++++ b/drivers/mfd/Makefile
+@@ -177,6 +177,7 @@ obj-$(CONFIG_MFD_MAX77705)	+= max77705.o
+ obj-$(CONFIG_MFD_MAX77714)	+= max77714.o
+ obj-$(CONFIG_MFD_MAX77759)	+= max77759.o
+ obj-$(CONFIG_MFD_MAX77818)	+= max77818.o
++obj-$(CONFIG_MFD_SLG46824)	+= slg46824-mfd.o
+ obj-$(CONFIG_MFD_MAX77843)	+= max77843.o
+ obj-$(CONFIG_MFD_MAX8907)	+= max8907.o
+ max8925-objs			:= max8925-core.o max8925-i2c.o
+diff --git a/drivers/mfd/slg46824-mfd.c b/drivers/mfd/slg46824-mfd.c
+new file mode 100644
+index 000000000..47a05c1e4
+--- /dev/null
++++ b/drivers/mfd/slg46824-mfd.c
+@@ -0,0 +1,135 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2025 reMarkable
++ * MFD driver for SLG46824
++ */
++
++#include <linux/i2c.h>
++#include <linux/kernel.h>
++#include <linux/mfd/core.h>
++#include <linux/module.h>
++#include <linux/of_platform.h>
++#include <linux/regmap.h>
++
++#define SLG46824_REG_PATTERN_ID 0xCB
++
++struct slg46824 {
++	struct device *dev;
++	struct regmap *regmap;
++	u8 pattern_id;
++};
++
++static const struct regmap_config slg46824_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++};
++
++static ssize_t pattern_id_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct slg46824 *priv = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "0x%02x\n", priv->pattern_id);
++}
++
++static DEVICE_ATTR_RO(pattern_id);
++
++static struct attribute *slg46824_attrs[] = {
++	&dev_attr_pattern_id.attr,
++	NULL,
++};
++
++static const struct attribute_group slg46824_attr_group = {
++	.attrs = slg46824_attrs,
++};
++
++static const struct mfd_cell slg46824_cells[] = {
++	{
++		.name = "slg46824-wakeup",
++		.of_compatible = "renesas,slg46824-wakeup",
++	},
++	{
++		.name = "slg46824-gpio",
++		.of_compatible = "renesas,slg46824-gpio",
++	},
++	{
++		.name = "slg46824-regulator",
++		.of_compatible = "renesas,slg46824-regulator",
++	},
++};
++
++static int slg46824_i2c_probe(struct i2c_client *i2c)
++{
++	struct slg46824 *priv;
++	int ret;
++
++	priv = devm_kzalloc(&i2c->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	i2c_set_clientdata(i2c, priv);
++	priv->dev = &i2c->dev;
++
++	priv->regmap = devm_regmap_init_i2c(i2c, &slg46824_regmap_config);
++	if (IS_ERR(priv->regmap)) {
++		dev_err(&i2c->dev, "Failed to initialize regmap: %d\n", ret);
++		return PTR_ERR(priv->regmap);
++	}
++
++	/* Read pattern ID */
++	ret = regmap_read(priv->regmap, SLG46824_REG_PATTERN_ID, (int *)&priv->pattern_id);
++	if (ret) {
++		dev_err(&i2c->dev, "Failed to read pattern ID: %d\n", ret);
++		return ret;
++	}
++
++	/*
++	 * Clear DMA mask to avoid quirk with MFD system and the OF-parser. If
++	 * the mask is set, the OF-parser assumes the device will use DMA, and
++	 * will warn when it doesn't find the expected DMA entries in the DTS
++	 * node. This mask is inherited. By clearing it for the MFD top-level
++	 * device, sub-devices will also have their masks cleared. Note: this
++	 * does not affect parent devices/buses. F.ex. the I2C bus will use DMA
++	 * independent of the DMA mask of this device and its sub-devices.
++	 */
++	i2c->dev.coherent_dma_mask = 0;
++	i2c->dev.dma_mask = &i2c->dev.coherent_dma_mask;
++
++	ret = devm_mfd_add_devices(priv->dev, PLATFORM_DEVID_AUTO, slg46824_cells,
++				   ARRAY_SIZE(slg46824_cells), NULL, 0, NULL);
++	if (ret) {
++		dev_err(&i2c->dev, "Failed to add MFD devices: %d\n", ret);
++		return ret;
++	}
++
++	ret = sysfs_create_group(&i2c->dev.kobj, &slg46824_attr_group);
++	if (ret)
++		dev_err(&i2c->dev, "Failed to create sysfs group: %d\n", ret);
++
++	return ret;
++}
++
++static void slg46824_i2c_remove(struct i2c_client *i2c)
++{
++	sysfs_remove_group(&i2c->dev.kobj, &slg46824_attr_group);
++}
++
++static const struct of_device_id slg46824_of_match[] = {
++	{ .compatible = "renesas,slg46824" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, slg46824_of_match);
++
++static struct i2c_driver slg46824_i2c_driver = {
++	.driver = {
++		.name = "slg46824",
++		.of_match_table = of_match_ptr(slg46824_of_match),
++	},
++	.probe = slg46824_i2c_probe,
++	.remove = slg46824_i2c_remove,
++};
++module_i2c_driver(slg46824_i2c_driver);
++
++MODULE_AUTHOR("Viktor Korsnes <viktor.korsnes@remarkable.no>");
++MODULE_DESCRIPTION("MFD driver for SLG46824");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/platform/remarkable/Kconfig b/drivers/platform/remarkable/Kconfig
+index 13d13cd5b..417c96d66 100644
+--- a/drivers/platform/remarkable/Kconfig
++++ b/drivers/platform/remarkable/Kconfig
+@@ -21,4 +21,9 @@ config REMARKABLE_LPGPR
+ 	  This driver supports reMarkable custom use of SNVS LPGPR bits via
+ 	  NVMEM interface.
+ 
++config SLG46824_WAKEUP
++	tristate "SLG46824 wakeup driver support"
++	help
++	  This driver supports SLG46824 wakeup controller.
++
+ endif # REMARKABLE_PLATFORM
+diff --git a/drivers/platform/remarkable/Makefile b/drivers/platform/remarkable/Makefile
+index a66f60f23..b4b9b2638 100644
+--- a/drivers/platform/remarkable/Makefile
++++ b/drivers/platform/remarkable/Makefile
+@@ -3,3 +3,4 @@
+ # reMarkable Platform-Specific Drivers
+ #
+ obj-$(CONFIG_REMARKABLE_LPGPR)	+= lpgpr.o
++obj-$(CONFIG_SLG46824_WAKEUP)	+= slg46824_wakeup.o
+diff --git a/drivers/platform/remarkable/slg46824_wakeup.c b/drivers/platform/remarkable/slg46824_wakeup.c
+new file mode 100644
+index 000000000..84dad5071
+--- /dev/null
++++ b/drivers/platform/remarkable/slg46824_wakeup.c
+@@ -0,0 +1,314 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2025 reMarkable
++ * Wakeup controller for use with the slg46824-mfg
++ */
++
++#include <linux/kernel.h>
++#include <linux/regmap.h>
++#include <linux/platform_device.h>
++#include <linux/of_platform.h>
++#include <linux/sysfs.h>
++#include <linux/gpio/consumer.h>
++#include <linux/reboot.h>
++#include <linux/suspend.h>
++
++#define SLG46824_REG_LATCH_STATUS       0x76
++
++#define SLG46824_WAKEUP_MASK		GENMASK(5, 2)
++
++enum wakeup_reason {
++	wakeup_reason_powerbutton	= BIT(2),
++	wakeup_reason_folio		= BIT(3),
++	wakeup_reason_marker		= BIT(4),
++	wakeup_reason_charger_connected	= BIT(5),
++};
++
++struct slg46824_wakeup {
++	struct device *dev;
++	struct regmap *regmap;
++	u8 wakeup_mask;
++	struct notifier_block pm_notifier;
++	bool hibernate;
++	struct gpio_desc *irq_mask_folio;
++	struct gpio_desc *irq_mask_pen;
++	struct gpio_desc *en_1v8_periph;
++	struct gpio_desc *irq_mask_low_battery;
++	struct gpio_desc *flag_soc_is_in_suspend;
++	struct gpio_desc *latch_reset;
++};
++
++static int slg46824_get_wakeup_mask(struct slg46824_wakeup *priv)
++{
++	unsigned int reg = 0;
++	int ret;
++
++	ret = regmap_read(priv->regmap, SLG46824_REG_LATCH_STATUS, &reg);
++	if (ret < 0)
++		return ret;
++
++	priv->wakeup_mask = (u8)reg & SLG46824_WAKEUP_MASK;
++
++	return ret;
++}
++
++static void slg46824_reset_wakeup_latches(struct slg46824_wakeup *priv)
++{
++	gpiod_set_value_cansleep(priv->latch_reset, 1);
++	gpiod_set_value_cansleep(priv->latch_reset, 0);
++}
++
++static void slg46824_unmask_wakeup_irqs(struct slg46824_wakeup *priv)
++{
++	gpiod_set_value_cansleep(priv->irq_mask_folio, 0);
++	gpiod_set_value_cansleep(priv->irq_mask_pen, 0);
++	gpiod_set_value_cansleep(priv->irq_mask_low_battery, 0);
++}
++
++static void slg46824_mask_wakeup_irqs(struct slg46824_wakeup *priv)
++{
++	gpiod_set_value_cansleep(priv->irq_mask_folio, 1);
++	gpiod_set_value_cansleep(priv->irq_mask_pen, 1);
++	gpiod_set_value_cansleep(priv->irq_mask_low_battery, 1);
++}
++
++static void slg46824_wakeup_mask_to_string(u8 mask, char *string, size_t len)
++{
++	if (mask == 0) {
++		strlcat(string, "N/A ", len);
++		return;
++	}
++
++	if (mask & wakeup_reason_powerbutton)
++		strlcat(string, "powerbutton ", len);
++	if (mask & wakeup_reason_folio)
++		strlcat(string, "folio ", len);
++	if (mask & wakeup_reason_marker)
++		strlcat(string, "marker ", len);
++	if (mask & wakeup_reason_charger_connected)
++		strlcat(string, "charger_connected ", len);
++}
++
++static ssize_t wakeup_reason_show(struct device *dev,
++				  struct device_attribute *attr, char *buf)
++{
++	struct slg46824_wakeup *priv = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "0x%02x\n", priv->wakeup_mask);
++}
++
++static DEVICE_ATTR_RO(wakeup_reason);
++
++static struct attribute *slg46824_wakeup_attrs[] = {
++	&dev_attr_wakeup_reason.attr,
++	NULL,
++};
++
++static const struct attribute_group slg46824_wakeup_attr_group = {
++	.attrs = slg46824_wakeup_attrs,
++};
++
++static int slg46824_wakeup_pm_notifier(struct notifier_block *nb,
++				       unsigned long pm_event, void *_unused)
++{
++	struct slg46824_wakeup *priv =
++		container_of(nb, struct slg46824_wakeup, pm_notifier);
++
++	switch (pm_event) {
++	case PM_HIBERNATION_PREPARE:
++		priv->hibernate = true;
++		break;
++	case PM_POST_HIBERNATION:
++		priv->hibernate = false;
++		break;
++	default:
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
++static void slg46824_prepare_for_suspend(struct slg46824_wakeup *priv)
++{
++	slg46824_reset_wakeup_latches(priv);
++	slg46824_unmask_wakeup_irqs(priv);
++	gpiod_set_value_cansleep(priv->en_1v8_periph, 1);
++	gpiod_set_value_cansleep(priv->flag_soc_is_in_suspend, 1);
++}
++
++static int slg46824_poweroff_handler(struct sys_off_data *data)
++{
++	struct slg46824_wakeup *priv = data->cb_data;
++
++	if (!priv->hibernate)
++		return NOTIFY_DONE;
++
++	slg46824_prepare_for_suspend(priv);
++
++	return NOTIFY_DONE;
++}
++
++static void slg46824_wakeup_initialize(struct slg46824_wakeup *priv)
++{
++	slg46824_reset_wakeup_latches(priv);
++	slg46824_mask_wakeup_irqs(priv);
++	gpiod_set_value_cansleep(priv->en_1v8_periph, 0);
++	gpiod_set_value_cansleep(priv->flag_soc_is_in_suspend, 0);
++}
++
++static int slg46824_wakeup_probe(struct platform_device *pdev)
++{
++	struct slg46824_wakeup *priv;
++	struct regmap *regmap;
++	int ret;
++
++	regmap = dev_get_regmap(pdev->dev.parent, NULL);
++	if (!regmap) {
++		dev_err(&pdev->dev, "Parent device not found\n");
++		return -ENODEV;
++	}
++
++	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dev = &pdev->dev;
++	priv->regmap = regmap;
++
++	priv->irq_mask_folio = devm_gpiod_get(&pdev->dev, "irq-mask-folio", GPIOD_OUT_LOW);
++	if (IS_ERR(priv->irq_mask_folio)) {
++		dev_err(&pdev->dev, "Failed to get irq-mask-folio gpio\n");
++		return PTR_ERR(priv->irq_mask_folio);
++	}
++
++	priv->irq_mask_pen = devm_gpiod_get(&pdev->dev, "irq-mask-pen", GPIOD_OUT_LOW);
++	if (IS_ERR(priv->irq_mask_pen)) {
++		dev_err(&pdev->dev, "Failed to get irq-mask-pen gpio\n");
++		return PTR_ERR(priv->irq_mask_pen);
++	}
++
++	priv->en_1v8_periph = devm_gpiod_get(&pdev->dev, "en-1v8-periph", GPIOD_OUT_LOW);
++	if (IS_ERR(priv->en_1v8_periph)) {
++		dev_err(&pdev->dev, "Failed to get en-1v8-periph gpio\n");
++		return PTR_ERR(priv->en_1v8_periph);
++	}
++
++	priv->irq_mask_low_battery = devm_gpiod_get(&pdev->dev, "irq-mask-low-bat", GPIOD_OUT_LOW);
++	if (IS_ERR(priv->irq_mask_low_battery)) {
++		dev_err(&pdev->dev, "Failed to get irq-mask-low-battery gpio\n");
++		return PTR_ERR(priv->irq_mask_low_battery);
++	}
++
++	priv->flag_soc_is_in_suspend =
++		devm_gpiod_get(&pdev->dev, "flag-soc-in-suspend", GPIOD_OUT_LOW);
++	if (IS_ERR(priv->flag_soc_is_in_suspend)) {
++		dev_err(&pdev->dev, "Failed to get flag-soc-is-in-suspend gpio\n");
++		return PTR_ERR(priv->flag_soc_is_in_suspend);
++	}
++
++	priv->latch_reset = devm_gpiod_get(&pdev->dev, "latch-reset", GPIOD_OUT_LOW);
++	if (IS_ERR(priv->latch_reset)) {
++		dev_err(&pdev->dev, "Failed to get latch-reset gpio\n");
++		return PTR_ERR(priv->latch_reset);
++	}
++
++	ret = slg46824_get_wakeup_mask(priv);
++	if (ret) {
++		dev_err(&pdev->dev, "Failed to get wakeup mask: %d\n", ret);
++		return ret;
++	}
++
++	slg46824_reset_wakeup_latches(priv);
++
++	ret = devm_register_sys_off_handler(priv->dev,
++					    SYS_OFF_MODE_POWER_OFF_PREPARE,
++					    SYS_OFF_PRIO_DEFAULT,
++					    slg46824_poweroff_handler, priv);
++	if (ret) {
++		dev_err(&pdev->dev, "Failed to register poweroff handler: %d\n", ret);
++		return ret;
++	}
++
++	priv->pm_notifier.notifier_call = slg46824_wakeup_pm_notifier;
++	ret = register_pm_notifier(&priv->pm_notifier);
++	if (ret)
++		return ret;
++
++	ret = sysfs_create_group(&pdev->dev.kobj, &slg46824_wakeup_attr_group);
++	if (ret) {
++		dev_err(&pdev->dev, "Failed to create sysfs group: %d\n", ret);
++		unregister_pm_notifier(&priv->pm_notifier);
++		return ret;
++	}
++
++	slg46824_wakeup_initialize(priv);
++
++	platform_set_drvdata(pdev, priv);
++	return 0;
++}
++
++static int slg46824_wakeup_suspend_hibernate(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct slg46824_wakeup *priv = platform_get_drvdata(pdev);
++
++	slg46824_reset_wakeup_latches(priv);
++
++	slg46824_prepare_for_suspend(priv);
++
++	return 0;
++}
++
++static int slg46824_wakeup_resume_restore(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct slg46824_wakeup *priv = platform_get_drvdata(pdev);
++	char log_buf[40] = {0};
++	int ret;
++
++	ret = slg46824_get_wakeup_mask(priv);
++	if (ret) {
++		dev_warn(dev, "unable to get wakeup reason\n");
++	} else {
++		slg46824_wakeup_mask_to_string(priv->wakeup_mask, log_buf, sizeof(log_buf));
++		dev_info(dev, "SPLD wakeup-reason (0x%02x): %s\n",
++			 priv->wakeup_mask, log_buf);
++	}
++
++	slg46824_wakeup_initialize(priv);
++
++	return 0;
++}
++
++static void slg46824_wakeup_remove(struct platform_device *pdev)
++{
++	struct slg46824_wakeup *priv = platform_get_drvdata(pdev);
++
++	sysfs_remove_group(&pdev->dev.kobj, &slg46824_wakeup_attr_group);
++	unregister_pm_notifier(&priv->pm_notifier);
++}
++
++static const struct dev_pm_ops slg46824_wakeup_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(slg46824_wakeup_suspend_hibernate, slg46824_wakeup_resume_restore)
++};
++
++static const struct of_device_id slg46824_wakeup_of_match[] = {
++	{ .compatible = "renesas,slg46824-wakeup", },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, slg46824_wakeup_of_match);
++
++static struct platform_driver slg46824_wakeup_driver = {
++	.driver = {
++		.name = "slg46824-wakeup",
++		.of_match_table = slg46824_wakeup_of_match,
++		.pm = &slg46824_wakeup_pm_ops,
++	},
++	.probe = slg46824_wakeup_probe,
++	.remove = slg46824_wakeup_remove,
++};
++module_platform_driver(slg46824_wakeup_driver);
++
++MODULE_AUTHOR("Viktor Korsnes <viktor.korsnes@remarkable.no>");
++MODULE_DESCRIPTION("SLG46824 Wakeup Controller");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index e4c408764..141ac429f 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -455,6 +455,15 @@ config REGULATOR_MAX77818
+ 	  Say y here to support the regulator found in the Maxim Semiconductor
+ 	  MAX77818 multi-function device.
+ 
++config REGULATOR_SLG46824
++	tristate "Renesas SLG46824 Analog comparator regulator"
++	depends on MFD_SLG46824
++	select REGMAP_I2C
++	help
++	  Say y here to support for the SLG46824 analog comparator.
++	  This driver support adjusting the vref input on the comparator
++	  to adjust for different limit thresholds.
++
+ config REGULATOR_GPIO
+ 	tristate "GPIO regulator support"
+ 	depends on GPIOLIB || COMPILE_TEST
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index b51319750..deae2f391 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -54,6 +54,7 @@ obj-$(CONFIG_REGULATOR_FAN53555) += fan53555.o
+ obj-$(CONFIG_REGULATOR_FAN53880) += fan53880.o
+ obj-$(CONFIG_REGULATOR_G2194) += g2194-regulator.o
+ obj-$(CONFIG_REGULATOR_MAX77818) += max77818-regulator.o
++obj-$(CONFIG_REGULATOR_SLG46824) += slg46824-regulator.o
+ obj-$(CONFIG_REGULATOR_GPIO) += gpio-regulator.o
+ obj-$(CONFIG_REGULATOR_HI6421) += hi6421-regulator.o
+ obj-$(CONFIG_REGULATOR_HI6421V530) += hi6421v530-regulator.o
+diff --git a/drivers/regulator/slg46824-regulator.c b/drivers/regulator/slg46824-regulator.c
+new file mode 100644
+index 000000000..0c900b494
+--- /dev/null
++++ b/drivers/regulator/slg46824-regulator.c
+@@ -0,0 +1,151 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2025 reMarkable
++ * Current limiter for use with the slg46824-mfd
++ */
++
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/regulator/driver.h>
++
++#define SLG46824_REG_ACMP1L_VREF	0x8C
++#define SLG46824_ACMP1L_VREF_MASK	GENMASK(7, 2)
++#define SLG46824_ACMP1L_VREF_SHIFT	2
++#define SLG46824_COMPARATOR_STEPSIZE	32
++
++struct slg46824 {
++	u32 acmp1_input_factor;
++};
++
++static int slg46824_regulator_set_current_limit(struct regulator_dev *rdev,
++						int min_uA, int max_uA)
++{
++	struct slg46824 *priv = rdev_get_drvdata(rdev);
++	u64 step_vref = max_uA;
++	u64 step_rem;
++
++	/* vref = (current(ma) * acmp1_input_factor) / (1000000 * stepsize) */
++	do_div(step_vref, 1000);
++	step_vref *= priv->acmp1_input_factor;
++	do_div(step_vref, 1000000);
++	step_rem = do_div(step_vref, SLG46824_COMPARATOR_STEPSIZE);
++
++	/* In case of reminder, check if we should round up vref */
++	if (step_rem) {
++		step_rem *= 10;
++		do_div(step_rem, SLG46824_COMPARATOR_STEPSIZE);
++		if (step_rem >= 5)
++			step_vref += 1;
++	}
++
++	step_vref <<= SLG46824_ACMP1L_VREF_SHIFT;
++
++	dev_info(&rdev->dev, "%s ua %d vref %llx\n", __func__, max_uA, step_vref);
++
++	return regmap_update_bits(rdev->regmap, SLG46824_REG_ACMP1L_VREF,
++				  SLG46824_ACMP1L_VREF_MASK, step_vref);
++}
++
++static int slg46824_regulator_get_current_limit(struct regulator_dev *rdev)
++{
++	struct slg46824 *priv = rdev_get_drvdata(rdev);
++	unsigned int vref;
++	u64 current_ma;
++	int ret;
++
++	ret = regmap_read(rdev->regmap, SLG46824_REG_ACMP1L_VREF, &vref);
++	if (ret)
++		return ret;
++
++	vref >>= SLG46824_ACMP1L_VREF_SHIFT;
++
++	/* 0 = 32mV */
++	vref = (vref + 1) * SLG46824_COMPARATOR_STEPSIZE;
++
++	current_ma = vref * 1000000;
++	do_div(current_ma, priv->acmp1_input_factor);
++
++	/* report in uA */
++	return current_ma * 1000;
++}
++
++static int slg46824_regulator_acmp1_of_parse_cb(struct device_node *np,
++						const struct regulator_desc *desc,
++						struct regulator_config *cfg)
++{
++	struct slg46824 *priv = cfg->driver_data;
++	u32 input_factor;
++	int ret;
++
++	ret = of_property_read_u32(np, "acmp1,input-factor", &input_factor);
++	if (ret)
++		return ret;
++
++	priv->acmp1_input_factor = input_factor;
++
++	return ret;
++}
++
++static const struct regulator_ops slg46824_current_acmp1_ops = {
++	.set_current_limit = slg46824_regulator_set_current_limit,
++	.get_current_limit = slg46824_regulator_get_current_limit
++};
++
++static struct regulator_desc slg46824_acmp1_desc = {
++	.name = "acmp1",
++	.id = 0,
++	.ops = &slg46824_current_acmp1_ops,
++	.type = REGULATOR_CURRENT,
++	.owner = THIS_MODULE,
++	.regulators_node = of_match_ptr("regulators"),
++	.of_match = of_match_ptr("acmp1"),
++	.of_parse_cb = slg46824_regulator_acmp1_of_parse_cb,
++};
++
++static int slg46824_regulator_probe(struct platform_device *pdev)
++{
++	struct regulator_config config = { };
++	struct regulator_dev *rdev;
++	struct regmap *regmap;
++	struct slg46824 *priv;
++
++	priv = devm_kzalloc(&pdev->dev, sizeof(struct slg46824), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	regmap = dev_get_regmap(pdev->dev.parent, NULL);
++	if (!regmap)
++		return dev_err_probe(&pdev->dev, -ENODEV, "Parent device not found\n");
++
++	config.dev = &pdev->dev;
++	config.driver_data = priv;
++	config.regmap = regmap;
++
++	rdev = devm_regulator_register(&pdev->dev, &slg46824_acmp1_desc, &config);
++	if (IS_ERR(rdev))
++		return dev_err_probe(pdev->dev.parent, PTR_ERR(rdev),
++				     "Failed to register %s regulator\n",
++				     pdev->name);
++
++	return 0;
++}
++
++static const struct of_device_id slg46824_regulator_of_match[] = {
++	{ .compatible = "renesas,slg46824-regulator", },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, slg46824_regulator_of_match);
++
++static struct platform_driver slg46824_regulator_driver = {
++	.driver = {
++		.name = "slg46824-regulator",
++		.of_match_table = slg46824_regulator_of_match,
++	},
++	.probe = slg46824_regulator_probe,
++};
++module_platform_driver(slg46824_regulator_driver);
++
++MODULE_AUTHOR("Morten Schade Fla <morten.schade.fla@remarkable.no>");
++MODULE_DESCRIPTION("SLG46824 Regulator Controller");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,77 @@
+From cf4915487b549b9f4527a1121bb45940511bf1c6 Mon Sep 17 00:00:00 2001
+From: gitman-101111 <development@spamfolder.xyz>
+Date: Mon, 12 Oct 2026 17:36:09 -0600
+Subject: [PATCH] pmdomain: imx93-blk-ctrl: hold the bus domain across system
+ suspend
+
+The block control's domains are powered on and off with runtime PM of
+its own device, which the PM core has disabled by the time the noirq
+resume phase asks genpd to power the LCDIF domain back up, so
+imx93_blk_ctrl_power_on() fails ("failed to power up domain") and the
+later power-off unbalances the clocks (clk_core_disable warnings,
+"Runtime PM usage count underflow"). After a real deep sleep the media
+mix comes back unpowered and the display path hits dead registers.
+
+Do what imx8m-blk-ctrl and the downstream i.MX tree do: take a runtime
+PM reference in the system suspend callback and drop it on resume, so
+the domain transitions happen through the ordered system sleep path.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/pmdomain/imx/imx93-blk-ctrl.c | 29 +++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/drivers/pmdomain/imx/imx93-blk-ctrl.c b/drivers/pmdomain/imx/imx93-blk-ctrl.c
+index 243ce939b..7a3ddb619 100644
+--- a/drivers/pmdomain/imx/imx93-blk-ctrl.c
++++ b/drivers/pmdomain/imx/imx93-blk-ctrl.c
+@@ -242,6 +242,7 @@ static int imx93_blk_ctrl_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	bc->dev = dev;
++	dev_set_drvdata(dev, bc);
+ 
+ 	base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(base))
+@@ -494,6 +495,33 @@ static const struct imx93_blk_ctrl_data imx93_media_blk_ctl_dev_data = {
+ 	.reg_access_table = &imx93_media_blk_ctl_access_table,
+ };
+ 
++static int imx93_blk_ctrl_suspend(struct device *dev)
++{
++	struct imx93_blk_ctrl *bc = dev_get_drvdata(dev);
++
++	/*
++	 * This may look strange, but is done so the generic PM_SLEEP code
++	 * can power down our domains and more importantly power them up again
++	 * after resume, without tripping over our usage of runtime PM to
++	 * control the upstream GPC domains. Things happen in the right order
++	 * in the system suspend/resume paths due to the device parent/child
++	 * hierarchy.
++	 */
++	return pm_runtime_resume_and_get(bc->dev);
++}
++
++static int imx93_blk_ctrl_resume(struct device *dev)
++{
++	struct imx93_blk_ctrl *bc = dev_get_drvdata(dev);
++
++	pm_runtime_put(bc->dev);
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(imx93_blk_ctrl_pm_ops, imx93_blk_ctrl_suspend,
++				imx93_blk_ctrl_resume);
++
+ static const struct of_device_id imx93_blk_ctrl_of_match[] = {
+ 	{
+ 		.compatible = "fsl,imx91-media-blk-ctrl",
+@@ -512,6 +540,7 @@ static struct platform_driver imx93_blk_ctrl_driver = {
+ 	.driver = {
+ 		.name = "imx93-blk-ctrl",
+ 		.of_match_table = imx93_blk_ctrl_of_match,
++		.pm = pm_sleep_ptr(&imx93_blk_ctrl_pm_ops),
+ 	},
+ };
+ module_platform_driver(imx93_blk_ctrl_driver);

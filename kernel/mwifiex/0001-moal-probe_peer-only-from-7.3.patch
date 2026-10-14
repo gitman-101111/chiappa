@@ -1,0 +1,19 @@
+From: gitman-101111 <development@spamfolder.xyz>
+Subject: [PATCH] moal: the probe_peer cfg80211 op only exists from 7.3
+
+Linux 7.2.y still calls the hook probe_client; the rename this release
+guards at 7.2 landed in 7.3.
+
+diff --git a/mlinux/moal_sta_cfg80211.c b/mlinux/moal_sta_cfg80211.c
+index 2605630..e246aeb 100644
+--- a/mlinux/moal_sta_cfg80211.c
++++ b/mlinux/moal_sta_cfg80211.c
+@@ -12247,7 +12247,7 @@ mlan_status woal_register_cfg80211(moal_private *priv)
+ 		woal_cfg80211_ops.disconnect = NULL;
+ 		woal_cfg80211_ops.connect = NULL;
+ #ifdef UAP_SUPPORT
+-#if CFG80211_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
++#if CFG80211_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
+ 		woal_cfg80211_ops.probe_peer = woal_cfg80211_probe_client;
+ #else
+ 		woal_cfg80211_ops.probe_client = woal_cfg80211_probe_client;

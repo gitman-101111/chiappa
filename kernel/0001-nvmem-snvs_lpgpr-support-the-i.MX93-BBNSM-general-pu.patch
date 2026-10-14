@@ -1,0 +1,187 @@
+From 8058a660bcfb6258c95562911d3be4aa50521137 Mon Sep 17 00:00:00 2001
+From: gitman-101111 <development@spamfolder.xyz>
+Date: Mon, 12 Oct 2026 10:23:07 -0600
+Subject: [PATCH] nvmem: snvs_lpgpr: support the i.MX93 BBNSM general purpose
+ registers
+
+The i.MX93 keeps its battery-backed general purpose registers in the
+BBNSM block at offset 0x300, with no SNVS-style lock bits. Add a
+compatible entry for "fsl,imx93-bbnsm-gpr" (the child node of the
+"nxp,imx93-bbnsm" syscon) covering the eight registers. reMarkable's
+U-Boot stores the A/B root slot selection and per-slot boot error
+counters there.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/nvmem/Kconfig      |  3 +-
+ drivers/nvmem/snvs_lpgpr.c | 97 ++++++++++++++++++++++++++++++++------
+ 2 files changed, 84 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/nvmem/Kconfig b/drivers/nvmem/Kconfig
+index 74ddbd0f7..24defc62b 100644
+--- a/drivers/nvmem/Kconfig
++++ b/drivers/nvmem/Kconfig
+@@ -360,7 +360,8 @@ config NVMEM_SNVS_LPGPR
+ 	depends on ARCH_MXC || COMPILE_TEST
+ 	help
+ 	  This is a driver for Low Power General Purpose Register (LPGPR) available on
+-	  i.MX6 and i.MX7 SoCs in Secure Non-Volatile Storage (SNVS) of this chip.
++	  i.MX6 and i.MX7 SoCs in Secure Non-Volatile Storage (SNVS) of this chip,
++	  and the equivalent BBNSM general purpose registers on i.MX93.
+ 
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called nvmem-snvs-lpgpr.
+diff --git a/drivers/nvmem/snvs_lpgpr.c b/drivers/nvmem/snvs_lpgpr.c
+index 89c271123..6fa9e3495 100644
+--- a/drivers/nvmem/snvs_lpgpr.c
++++ b/drivers/nvmem/snvs_lpgpr.c
+@@ -19,6 +19,8 @@
+ #define IMX7D_SNVS_LPLR		0x34
+ #define IMX7D_SNVS_LPGPR	0x90
+ 
++#define IMX93_BBNSM_GPR		0x300
++
+ #define IMX_GPR_SL		BIT(5)
+ #define IMX_GPR_HL		BIT(5)
+ 
+@@ -27,6 +29,7 @@ struct snvs_lpgpr_cfg {
+ 	int offset_hplr;
+ 	int offset_lplr;
+ 	int size;
++	bool no_lock;
+ };
+ 
+ struct snvs_lpgpr_priv {
+@@ -50,6 +53,49 @@ static const struct snvs_lpgpr_cfg snvs_lpgpr_cfg_imx7d = {
+ 	.size		= 16,
+ };
+ 
++static const struct snvs_lpgpr_cfg snvs_lpgpr_cfg_imx93 = {
++	.offset		= IMX93_BBNSM_GPR,
++	.size		= 32,
++	.no_lock	= true,
++};
++
++/*
++ * The nvmem core reads and writes bit-field cells one byte at a time, so
++ * sub-word accesses have to be assembled from whole 32-bit registers.
++ */
++static int snvs_lpgpr_rmw(struct snvs_lpgpr_priv *priv, unsigned int offset,
++			  const void *val, size_t bytes)
++{
++	const struct snvs_lpgpr_cfg *dcfg = priv->dcfg;
++	unsigned int reg = dcfg->offset + ALIGN_DOWN(offset, 4);
++	unsigned int skip = offset % 4;
++	const u8 *src = val;
++
++	while (bytes) {
++		size_t n = min_t(size_t, bytes, 4 - skip);
++		u32 word = 0;
++		int ret;
++
++		if (n < 4) {
++			ret = regmap_read(priv->regmap, reg, &word);
++			if (ret)
++				return ret;
++		}
++
++		memcpy((u8 *)&word + skip, src, n);
++		ret = regmap_write(priv->regmap, reg, word);
++		if (ret)
++			return ret;
++
++		src += n;
++		bytes -= n;
++		skip = 0;
++		reg += 4;
++	}
++
++	return 0;
++}
++
+ static int snvs_lpgpr_write(void *context, unsigned int offset, void *val,
+ 			    size_t bytes)
+ {
+@@ -58,22 +104,23 @@ static int snvs_lpgpr_write(void *context, unsigned int offset, void *val,
+ 	unsigned int lock_reg;
+ 	int ret;
+ 
+-	ret = regmap_read(priv->regmap, dcfg->offset_hplr, &lock_reg);
+-	if (ret < 0)
+-		return ret;
++	if (!dcfg->no_lock) {
++		ret = regmap_read(priv->regmap, dcfg->offset_hplr, &lock_reg);
++		if (ret < 0)
++			return ret;
+ 
+-	if (lock_reg & IMX_GPR_SL)
+-		return -EPERM;
++		if (lock_reg & IMX_GPR_SL)
++			return -EPERM;
+ 
+-	ret = regmap_read(priv->regmap, dcfg->offset_lplr, &lock_reg);
+-	if (ret < 0)
+-		return ret;
++		ret = regmap_read(priv->regmap, dcfg->offset_lplr, &lock_reg);
++		if (ret < 0)
++			return ret;
+ 
+-	if (lock_reg & IMX_GPR_HL)
+-		return -EPERM;
++		if (lock_reg & IMX_GPR_HL)
++			return -EPERM;
++	}
+ 
+-	return regmap_bulk_write(priv->regmap, dcfg->offset + offset, val,
+-				bytes / 4);
++	return snvs_lpgpr_rmw(priv, offset, val, bytes);
+ }
+ 
+ static int snvs_lpgpr_read(void *context, unsigned int offset, void *val,
+@@ -81,9 +128,27 @@ static int snvs_lpgpr_read(void *context, unsigned int offset, void *val,
+ {
+ 	struct snvs_lpgpr_priv *priv = context;
+ 	const struct snvs_lpgpr_cfg *dcfg = priv->dcfg;
+-
+-	return regmap_bulk_read(priv->regmap, dcfg->offset + offset,
+-			       val, bytes / 4);
++	unsigned int reg = dcfg->offset + ALIGN_DOWN(offset, 4);
++	unsigned int skip = offset % 4;
++	u8 *dst = val;
++
++	while (bytes) {
++		size_t n = min_t(size_t, bytes, 4 - skip);
++		u32 word;
++		int ret;
++
++		ret = regmap_read(priv->regmap, reg, &word);
++		if (ret)
++			return ret;
++
++		memcpy(dst, (u8 *)&word + skip, n);
++		dst += n;
++		bytes -= n;
++		skip = 0;
++		reg += 4;
++	}
++
++	return 0;
+ }
+ 
+ static int snvs_lpgpr_probe(struct platform_device *pdev)
+@@ -128,6 +193,7 @@ static int snvs_lpgpr_probe(struct platform_device *pdev)
+ 	cfg->owner = THIS_MODULE;
+ 	cfg->reg_read  = snvs_lpgpr_read;
+ 	cfg->reg_write = snvs_lpgpr_write;
++	cfg->add_legacy_fixed_of_cells = true;
+ 
+ 	nvmem = devm_nvmem_register(dev, cfg);
+ 
+@@ -139,6 +205,7 @@ static const struct of_device_id snvs_lpgpr_dt_ids[] = {
+ 	{ .compatible = "fsl,imx6ul-snvs-lpgpr",
+ 	  .data = &snvs_lpgpr_cfg_imx6q },
+ 	{ .compatible = "fsl,imx7d-snvs-lpgpr",	.data = &snvs_lpgpr_cfg_imx7d },
++	{ .compatible = "fsl,imx93-bbnsm-gpr",	.data = &snvs_lpgpr_cfg_imx93 },
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(of, snvs_lpgpr_dt_ids);

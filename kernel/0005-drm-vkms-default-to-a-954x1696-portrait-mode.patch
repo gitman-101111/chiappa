@@ -1,0 +1,78 @@
+From c5e4566a68a2d7ac1b723a25edd35665baf62e12 Mon Sep 17 00:00:00 2001
+From: gitman-101111 <development@spamfolder.xyz>
+Date: Mon, 12 Oct 2026 10:23:07 -0600
+Subject: [PATCH] drm/vkms: default to a 954x1696 portrait mode
+
+The Wayland-on-e-ink pipeline renders compositors into VKMS and forwards
+the writeback output to the panel. drm_add_modes_noedid() only knows
+landscape VESA modes, so inject the panel's native portrait resolution
+with exact dimensions and make it the preferred mode.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/vkms/vkms_connector.c | 25 +++++++++++++++++++++++++
+ drivers/gpu/drm/vkms/vkms_drv.h       |  4 ++--
+ 2 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/vkms/vkms_connector.c b/drivers/gpu/drm/vkms/vkms_connector.c
+index b0a6b212d..cfc572935 100644
+--- a/drivers/gpu/drm/vkms/vkms_connector.c
++++ b/drivers/gpu/drm/vkms/vkms_connector.c
+@@ -3,6 +3,7 @@
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_edid.h>
+ #include <drm/drm_managed.h>
++#include <drm/drm_modes.h>
+ #include <drm/drm_probe_helper.h>
+ 
+ #include "vkms_config.h"
+@@ -44,10 +45,34 @@ static const struct drm_connector_funcs vkms_connector_funcs = {
+ 
+ static int vkms_conn_get_modes(struct drm_connector *connector)
+ {
++	struct drm_display_mode *mode;
+ 	int count;
+ 
+ 	/* Use the default modes list from DRM */
+ 	count = drm_add_modes_noedid(connector, XRES_MAX, YRES_MAX);
++
++	/*
++	 * drm_add_modes_noedid() only knows standard landscape modes; add the
++	 * default portrait resolution explicitly, with exact dimensions
++	 * (drm_cvt_mode() would round hdisplay to a multiple of 8 and
++	 * drm_set_preferred_mode() would then find nothing to mark).
++	 */
++	mode = drm_mode_create(connector->dev);
++	if (mode) {
++		mode->hdisplay = XRES_DEF;
++		mode->hsync_start = XRES_DEF + 24;
++		mode->hsync_end = XRES_DEF + 56;
++		mode->htotal = XRES_DEF + 104;
++		mode->vdisplay = YRES_DEF;
++		mode->vsync_start = YRES_DEF + 4;
++		mode->vsync_end = YRES_DEF + 9;
++		mode->vtotal = YRES_DEF + 45;
++		mode->clock = 110500;
++		mode->type = DRM_MODE_TYPE_DRIVER;
++		drm_mode_set_name(mode);
++		drm_mode_probed_add(connector, mode);
++		count++;
++	}
+ 	drm_set_preferred_mode(connector, XRES_DEF, YRES_DEF);
+ 
+ 	return count;
+diff --git a/drivers/gpu/drm/vkms/vkms_drv.h b/drivers/gpu/drm/vkms/vkms_drv.h
+index 0933e4ce0..ca8db72bc 100644
+--- a/drivers/gpu/drm/vkms/vkms_drv.h
++++ b/drivers/gpu/drm/vkms/vkms_drv.h
+@@ -17,8 +17,8 @@
+ #define XRES_MIN    10
+ #define YRES_MIN    10
+ 
+-#define XRES_DEF  1024
+-#define YRES_DEF   768
++#define XRES_DEF   954
++#define YRES_DEF  1696
+ 
+ #define XRES_MAX  8192
+ #define YRES_MAX  8192

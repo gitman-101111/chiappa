@@ -29,8 +29,10 @@ dumpimage -l vendor-fit.itb
 dumpimage -T flat_dt -p <fdt-image-index> -o vendor.dtb vendor-fit.itb
 ```
 
-The vendor DTB matters: the kernel-tree chiappa DTB has hung this device early
-in boot; every boot known to work used the vendor one.
+With the mainline kernel the FIT carries the kernel-tree
+`freescale/imx93-remarkable-chiappa.dtb`; the vendor DTB describes vendor
+bindings and only boots the vendor kernel. The extraction is still useful as
+hardware documentation (decompile it with `dtc`).
 
 FIT contents (from `dumpimage -l`):
 
@@ -66,17 +68,20 @@ is skipped, so an **unsigned** FIT image will boot fine.
 ### 1. Build the kernel
 
 ```sh
-# Extract vendor source
-tar -xzf linux-imx-rel-5.6-vc-3.26.0.68-122eda1b63d9.tar.gz
-cd linux-imx-rel-5.6-vc-3.26.0.68-122eda1b63d9
+# Mainline tarball (the version the series in kernel/ is pinned to)
+tar -xf linux-7.2.10.tar.xz && cd linux-7.2.10
+git init -q && git add -A && git commit -qm pristine
+git am /path/to/chiappa/kernel/0*.patch
 
-# Start from vendor defconfig, then merge your distro's config fragment
-make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- chiappa_defconfig
-scripts/kconfig/merge_config.sh .config /path/to/config-remarkable-chiappa.aarch64
-make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image dtbs modules
+# The complete config is used as-is
+cp /path/to/chiappa/kernel/config-chiappa-mainline.aarch64 .config
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j100 1 17 21 100 131 174 983nproc) Image dtbs modules
 ```
 
-Output kernel: `arch/arm64/boot/Image` (uncompressed, ~13 MiB)
+Output kernel: `arch/arm64/boot/Image`; DTB:
+`arch/arm64/boot/dts/freescale/imx93-remarkable-chiappa.dtb`. The out-of-tree
+WiFi driver (`kernel/README.md`) is built separately against this tree.
 
 ### 2. Build the FIT image (ITS template)
 
@@ -100,7 +105,7 @@ Output kernel: `arch/arm64/boot/Image` (uncompressed, ~13 MiB)
         };
         fdt-chiappa-rev-h {
             description = "Chiappa rev H DTB";
-            data = /incbin/("arch/arm64/boot/dts/freescale/chiappa-rev-h.dtb");
+            data = /incbin/("arch/arm64/boot/dts/freescale/imx93-remarkable-chiappa.dtb");
             type = "flat_dt";
             arch = "arm64";
             compression = "none";
