@@ -66,14 +66,10 @@ that used them compile them out).
   rates; the vendor touch/EPD drivers' "boost for one second" calls are gone.
   Expect different (likely higher) idle power until an equivalent exists.
 - **Suspend.** Mainline suspend goes through PSCI to the vendor TF-A without
-  the vendor `lpm`/`sleep-monitor` plumbing. Deep sleep and power-key wake
-  work. Measured 2026-10-14 from the fuel gauge's coulomb counter over an
-  11.5 h deep sleep (WiFi unloaded, NFC charger unbound): **13 mA**; awake
-  and idle on a static page with WiFi associated: about 160 mA. The vendor
-  kernel has no measurement on record; the figures recorded while tuning its
-  sleep hooks imply roughly 8-9 mA with the same mitigations, so expect mainline standby
-  to be somewhat higher until the vendor low-power-mode plumbing has an
-  equivalent. A raw `echo mem > /sys/power/state` is
+  the vendor `lpm`/`sleep-monitor` plumbing. Deep sleep, power-key wake and
+  RTC-alarm wake work. Standby draw, from the fuel gauge's coulomb counter: 
+  **13.7 mA** over a 9 h deep sleep; about 15 mA in 1 h cycles,
+  which carry the entry/exit cost. A raw `echo mem > /sys/power/state` is
   refused with `-EAGAIN` while the g2194 VPDD hold-off timer runs — suspend
   through systemd so the e-ink sleep screen powers the panel down first.
 - **Accelerometer.** The driver is `st-accel-i2c` (vendor: `st_lis2dw12_i2c`)
